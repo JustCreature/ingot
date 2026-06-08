@@ -1,0 +1,112 @@
+[
+  {
+    "file": "wall_01.png",
+    "cluster": "wall",
+    "clusterName": "Old town wall"
+  },
+  {
+    "file": "wall_02.png",
+    "cluster": "wall",
+    "clusterName": "Old town wall"
+  },
+  {
+    "file": "wall_03.png",
+    "cluster": "wall",
+    "clusterName": "Old town wall"
+  },
+  {
+    "file": "wall_04.png",
+    "cluster": "wall",
+    "clusterName": "Old town wall"
+  },
+  {
+    "file": "wall_05.png",
+    "cluster": "wall",
+    "clusterName": "Old town wall"
+  },
+  {
+    "file": "wall_06.png",
+    "cluster": "wall",
+    "clusterName": "Old town wall"
+  },
+  {
+    "file": "wall_07.png",
+    "cluster": "wall",
+    "clusterName": "Old town wall"
+  },
+  {
+    "file": "wall_08.png",
+    "cluster": "wall",
+    "clusterName": "Old town wall"
+  },
+  {
+    "file": "tower_01.png",
+    "cluster": "tower",
+    "clusterName": "Glass tower"
+  },
+  {
+    "file": "tower_02.png",
+    "cluster": "tower",
+    "clusterName": "Glass tower"
+  },
+  {
+    "file": "tower_03.png",
+    "cluster": "tower",
+    "clusterName": "Glass tower"
+  },
+  {
+    "file": "tower_04.png",
+    "cluster": "tower",
+    "clusterName": "Glass tower"
+  },
+  {
+    "file": "tower_05.png",
+    "cluster": "tower",
+    "clusterName": "Glass tower"
+  },
+  {
+    "file": "tower_06.png",
+    "cluster": "tower",
+    "clusterName": "Glass tower"
+  },
+  {
+    "file": "tower_07.png",
+    "cluster": "tower",
+    "clusterName": "Glass tower"
+  },
+  {
+    "file": "oak_01.png",
+    "cluster": "oak",
+    "clusterName": "The big oak"
+  },
+  {
+    "file": "oak_02.png",
+    "cluster": "oak",
+    "clusterName": "The big oak"
+  },
+  {
+    "file": "oak_03.png",
+    "cluster": "oak",
+    "clusterName": "The big oak"
+  },
+  {
+    "file": "oak_04.png",
+    "cluster": "oak",
+    "clusterName": "The big oak"
+  },
+  {
+    "file": "oak_05.png",
+    "cluster": "oak",
+    "clusterName": "The big oak"
+  },
+  {
+    "file": "oak_06.png",
+    "cluster": "oak",
+    "clusterName": "The big oak"
+  },
+  {
+    "file": "oak_07.png",
+    "cluster": "oak",
+    "clusterName": "The big oak"
+  }
+]

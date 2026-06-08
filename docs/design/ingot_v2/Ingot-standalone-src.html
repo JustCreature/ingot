@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ingot — RAW+JPEG ingest & cull</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+  <meta name="ext-resource-dependency" content="images/wall_01.png" data-resource-id="wall_01" />
+  <meta name="ext-resource-dependency" content="images/wall_02.png" data-resource-id="wall_02" />
+  <meta name="ext-resource-dependency" content="images/wall_03.png" data-resource-id="wall_03" />
+  <meta name="ext-resource-dependency" content="images/wall_04.png" data-resource-id="wall_04" />
+  <meta name="ext-resource-dependency" content="images/wall_05.png" data-resource-id="wall_05" />
+  <meta name="ext-resource-dependency" content="images/wall_06.png" data-resource-id="wall_06" />
+  <meta name="ext-resource-dependency" content="images/wall_07.png" data-resource-id="wall_07" />
+  <meta name="ext-resource-dependency" content="images/wall_08.png" data-resource-id="wall_08" />
+  <meta name="ext-resource-dependency" content="images/tower_01.png" data-resource-id="tower_01" />
+  <meta name="ext-resource-dependency" content="images/tower_02.png" data-resource-id="tower_02" />
+  <meta name="ext-resource-dependency" content="images/tower_03.png" data-resource-id="tower_03" />
+  <meta name="ext-resource-dependency" content="images/tower_04.png" data-resource-id="tower_04" />
+  <meta name="ext-resource-dependency" content="images/tower_05.png" data-resource-id="tower_05" />
+  <meta name="ext-resource-dependency" content="images/tower_06.png" data-resource-id="tower_06" />
+  <meta name="ext-resource-dependency" content="images/tower_07.png" data-resource-id="tower_07" />
+  <meta name="ext-resource-dependency" content="images/oak_01.png" data-resource-id="oak_01" />
+  <meta name="ext-resource-dependency" content="images/oak_02.png" data-resource-id="oak_02" />
+  <meta name="ext-resource-dependency" content="images/oak_03.png" data-resource-id="oak_03" />
+  <meta name="ext-resource-dependency" content="images/oak_04.png" data-resource-id="oak_04" />
+  <meta name="ext-resource-dependency" content="images/oak_05.png" data-resource-id="oak_05" />
+  <meta name="ext-resource-dependency" content="images/oak_06.png" data-resource-id="oak_06" />
+  <meta name="ext-resource-dependency" content="images/oak_07.png" data-resource-id="oak_07" />
+  <meta name="ext-resource-dependency" content="images/harbor_01.png" data-resource-id="harbor_01" />
+  <meta name="ext-resource-dependency" content="images/harbor_02.png" data-resource-id="harbor_02" />
+  <meta name="ext-resource-dependency" content="images/harbor_03.png" data-resource-id="harbor_03" />
+  <meta name="ext-resource-dependency" content="images/harbor_04.png" data-resource-id="harbor_04" />
+  <meta name="ext-resource-dependency" content="images/harbor_05.png" data-resource-id="harbor_05" />
+  <meta name="ext-resource-dependency" content="images/harbor_06.png" data-resource-id="harbor_06" />
+  <meta name="ext-resource-dependency" content="images/cafe_01.png" data-resource-id="cafe_01" />
+  <meta name="ext-resource-dependency" content="images/cafe_02.png" data-resource-id="cafe_02" />
+  <meta name="ext-resource-dependency" content="images/cafe_03.png" data-resource-id="cafe_03" />
+  <meta name="ext-resource-dependency" content="images/cafe_04.png" data-resource-id="cafe_04" />
+  <meta name="ext-resource-dependency" content="images/cafe_05.png" data-resource-id="cafe_05" />
+  <meta name="ext-resource-dependency" content="images/cafe_06.png" data-resource-id="cafe_06" />
+  <meta name="ext-resource-dependency" content="images/street_01.png" data-resource-id="street_01" />
+  <meta name="ext-resource-dependency" content="images/street_02.png" data-resource-id="street_02" />
+  <meta name="ext-resource-dependency" content="images/street_03.png" data-resource-id="street_03" />
+  <meta name="ext-resource-dependency" content="images/street_04.png" data-resource-id="street_04" />
+  <meta name="ext-resource-dependency" content="images/street_05.png" data-resource-id="street_05" />
+  <meta name="ext-resource-dependency" content="images/street_06.png" data-resource-id="street_06" />
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script src="data.js"></script>
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+  <script type="text/babel" src="ui.jsx"></script>
+  <script type="text/babel" src="launchpad.jsx"></script>
+  <script type="text/babel" src="panels.jsx"></script>
+  <script type="text/babel" src="views.jsx"></script>
+  <script type="text/babel" src="clusters.jsx"></script>
+  <script type="text/babel" src="modals.jsx"></script>
+  <script type="text/babel" src="app.jsx"></script>
+  <template id="__bundler_thumbnail" data-bg-color="#0d0d0f">
+    <svg viewBox="0 0 1200 800" xmlns="http://www.w3.org/2000/svg">
+      <rect width="1200" height="800" fill="#0d0d0f"/>
+      <g transform="translate(600 400)">
+        <rect x="-150" y="-150" width="300" height="300" rx="56" fill="#3b82f6"/>
+        <path d="M 40 -120 L -70 30 L -8 30 L -40 120 L 70 -30 L 8 -30 Z" fill="#ffffff"/>
+      </g>
+      <text x="600" y="640" font-family="Hanken Grotesk, system-ui, sans-serif" font-size="62" font-weight="800" letter-spacing="6" fill="#ecedf0" text-anchor="middle">INGOT</text>
+    </svg>
+  </template>
+</body>
+</html>

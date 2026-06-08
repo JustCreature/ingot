@@ -1,0 +1,92 @@
+[
+  {
+    "file": "harbor_01.png",
+    "cluster": "harbor",
+    "clusterName": "Harbor sunset"
+  },
+  {
+    "file": "harbor_02.png",
+    "cluster": "harbor",
+    "clusterName": "Harbor sunset"
+  },
+  {
+    "file": "harbor_03.png",
+    "cluster": "harbor",
+    "clusterName": "Harbor sunset"
+  },
+  {
+    "file": "harbor_04.png",
+    "cluster": "harbor",
+    "clusterName": "Harbor sunset"
+  },
+  {
+    "file": "harbor_05.png",
+    "cluster": "harbor",
+    "clusterName": "Harbor sunset"
+  },
+  {
+    "file": "harbor_06.png",
+    "cluster": "harbor",
+    "clusterName": "Harbor sunset"
+  },
+  {
+    "file": "cafe_01.png",
+    "cluster": "cafe",
+    "clusterName": "Cafe interior"
+  },
+  {
+    "file": "cafe_02.png",
+    "cluster": "cafe",
+    "clusterName": "Cafe interior"
+  },
+  {
+    "file": "cafe_03.png",
+    "cluster": "cafe",
+    "clusterName": "Cafe interior"
+  },
+  {
+    "file": "cafe_04.png",
+    "cluster": "cafe",
+    "clusterName": "Cafe interior"
+  },
+  {
+    "file": "cafe_05.png",
+    "cluster": "cafe",
+    "clusterName": "Cafe interior"
+  },
+  {
+    "file": "cafe_06.png",
+    "cluster": "cafe",
+    "clusterName": "Cafe interior"
+  },
+  {
+    "file": "street_01.png",
+    "cluster": "street",
+    "clusterName": "Street candids"
+  },
+  {
+    "file": "street_02.png",
+    "cluster": "street",
+    "clusterName": "Street candids"
+  },
+  {
+    "file": "street_03.png",
+    "cluster": "street",
+    "clusterName": "Street candids"
+  },
+  {
+    "file": "street_04.png",
+    "cluster": "street",
+    "clusterName": "Street candids"
+  },
+  {
+    "file": "street_05.png",
+    "cluster": "street",
+    "clusterName": "Street candids"
+  },
+  {
+    "file": "street_06.png",
+    "cluster": "street",
+    "clusterName": "Street candids"
+  }
+]
