@@ -18,3 +18,8 @@ target
 .forge.toml
 
 photodata/
+
+
+# Added by cargo
+
+/target

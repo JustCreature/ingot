@@ -45,28 +45,62 @@ These are deliberate design decisions, not suggestions. When discussing implemen
 
 ## Status
 
-**Current phase:** Phase 1 — Asset Pairing & Core Data Structures (in progress; started 2026-06-08)
+**Current phase:** Phase 2 — CPU-Bound Processing & Streaming (step 1 ✅ done; step 2 previews next)
 
-**Learning objectives:**
-- Why `(dir, stem)` case-normalized is the only safe asset key (filename rollover, multi-folder DCIM, multi-card collisions)
-- Modeling RAW/JPEG presence so the empty asset is unrepresentable, with RAW-only as a first-class asset
-- A pure, I/O-free date-based ISO routing function
+**Last session:** 2026-06-11 — Phase 2 step 1: `captured_at` EXIF enrichment + cross-device read-concurrency measurement (SD vs SSD). Kept serial; all green.
 
-**Asset model — decided:** key on `(dir, stem)` case-normalized; files held in a **non-empty map keyed by `FileKind`** (extensible enum: `Raw`, `Jpeg`, …). Born from first file (`new`), grows via `insert`; no empty constructor, no `Default`. `insert` must surface duplicate-kind collisions, never silently overwrite.
+---
 
-**Test tree:** `photodata/testing/source/` — 11 true assets (7 paired, 2 RAW-only, 2 JPEG-only) across `100CANON`/`101CANON`, plus `.DS_Store` + `EOSMISC/M2100.CTG` noise that must classify to skip.
+### Phase 1 — Asset Pairing & Core Data Structures — ✅ COMPLETE (2026-06-11)
 
-**Artifacts:** none yet (design only). Session log: `docs/sessions/phase-1/main-session.md`
+**Learning objectives (met):**
+- Why `(dir, stem)` case-normalized is the only safe asset key (filename rollover, multi-folder DCIM, multi-card collisions).
+- Modeling RAW/JPEG presence so the empty asset is unrepresentable, with RAW-only as a first-class asset.
+- A pure, I/O-free date-based ISO routing function.
 
-**Key numbers (predicted, not yet run):** true assets 11 | naive stem-key 8 | files silently lost under naive key 4.
+**Artifacts:**
+- `src/lib.rs` — asset model + scanner + routing. Public API: `scan_source_dir -> ScanResponse { assets, collisions, errors }`; `build_destination_path(&Target, NaiveDate, &Path) -> Option<PathBuf>`; types `FileKind`, `AssetKey {dir, stem}`, `AssetFiles` (non-empty, `new`/`insert`/`get`), `PhotoAsset`, `TriageState`, `Collision`, `Target`/`TargetKind`.
+- `docs/sessions/phase-1/main-session.md` — session log (3 sessions).
+- Deps: `walkdir`, `chrono`; dev: `tempfile`. On-disk fixture `photodata/testing/source/` retained but tests use programmatic tempdir fixtures.
 
-**Open items:**
-- Implement `FileKind` + `classify(ext) -> Option<FileKind>` (allowlist: `cr2→Raw`, `jpg|jpeg→Jpeg`, else `None`)
-- Implement the non-empty files type (`Vec`-backed, `new`/`insert`/accessors, no `Default`, collision-surfacing `insert`)
-- Implement `AssetKey` + `PhotoAsset` + the `walkdir` scanner with `HashMap::entry` merge
-- Run scanner on test tree: confirm 11 assets, 4 files the naive key would lose, zero panics on `.CTG`/`.DS_Store`
-- Phase 1 Step 3: pure date-based ISO routing function (no I/O)
+**Key numbers (measured):** assets 11 (7 paired / 2 RAW-only / 2 JPEG-only) ✓ | same-kind collisions surfaced 1 ✓ | routing path exact-match ✓ | `cargo test` **3 passing** | `cargo clippy` clean | naive stem-key counterfactual = 8 (cross-folder dups proven distinct, 11≠8).
 
-**Last session:** 2026-06-08 — scoping decisions resolved; asset model designed (non-empty map keyed by `FileKind`).
+**Lessons:**
+- The asset *identity* is fully recoverable from the path (`(dir, stem)`), case-normalized — no need to read file contents; a timestamp key is both unavailable at scan time and non-unique (1s EXIF resolution merges bursts).
+- Making illegal states unrepresentable (non-empty `AssetFiles`, no `Default`; `_opt` date constructor) beats runtime validation, and is consistent with Phase 3's planned `VerifiedReplica`.
+- Batch anomalies (duplicate-kind collisions, walkdir errors) are *data to collect and return*, not errors that abort the scan — one bad frame must never kill a 10k-card ingest.
+- Pure functions (`build_destination_path`) decouple cleanly: take the date as a param now, let Phase 2 supply `DateTimeOriginal`.
 
-**Next step:** implement the asset model sketch — `FileKind` + classifier, then the non-empty files type.
+**Known open items carried forward:**
+- `expect("path stem error")` on `file_stem()` is the lone remaining panic in the scan path (defensible; could route to `errors` for full resilience).
+- `AssetFiles` backed by `Vec` linear scan — fine at current N; interface (`get`/`insert`) hides it so it stays swappable/measurable.
+
+---
+
+### Phase 2 — CPU-Bound Processing & Streaming (in progress)
+
+Per `docs/planning/global-plan.md`: read `DateTimeOriginal` with `kamadak-exif` (read-only, date-only) to populate `PhotoAsset.captured_at` (feeds `build_destination_path`); decode parallel `.JPG` / extract full-size embedded preview for RAW-only (needs `rawler`/`rawloader` or `libraw`, per resolved scoping decision #1); downsample to ~1920px **compressed JPEG bytes in memory**; stream processed assets to the UI over an mpsc/crossbeam channel.
+
+#### Step 1 — capture-time enrichment — ✅ DONE (2026-06-11)
+
+**Artifacts:**
+- `src/lib.rs` — `captured_at: Option<NaiveDateTime>`; `read_capture_time(&PhotoAsset) -> Option<NaiveDateTime>` (private, JPEG-preferred/RAW-fallback, all-`?`/`.ok()?` failure funnel); `enrich_captured_at(&mut HashMap<…>)` (public, compute-then-apply, **serial**).
+- `examples/bench_enrich.rs` — release-only timing harness (scan + 3× enrich, cold run 1 / warm 2–3, frames/s).
+- `testdata/test_exif_read/` — real-EXIF fixture (incl. a CR2-only frame exercising the RAW fallback).
+- Deps: `kamadak-exif` (imports as `exif`). `rayon` present but unused (reserved for step 2).
+- `docs/sessions/phase-2/main-session.md` — session log.
+
+**Key numbers (measured, 879-asset Canon set; cold = first read):**
+- SD card (USB): serial cold **4.85 s** (181 fps) vs parallel cold **6.20 s** (142 fps) → parallel **−28%, hurts**.
+- SSD (`GenericSSD`): serial cold **0.61 s** (1432 fps) vs parallel cold **0.17 s** (5256 fps) → parallel **+3.7×, helps**.
+- Cold/warm gap: SD ≈120×, SSD ≈13×. 879/879 parsed, 0 collisions/errors. `cargo test` **5 passing** · clippy clean.
+- **Lesson:** optimal source-read concurrency is a *device property*, not a constant — empirical proof of the plan's source-read semaphore tier. Default serial (1–2 permits) for cards; higher for SSD/NVMe. Hardcoding either way is wrong. File I/O concurrency = bounded threads (files don't fit kqueue readiness; io_uring is Linux-only).
+
+**Known open items from step 1:**
+- `SubSecTimeOriginal` deliberately deferred (its only consumer, burst-grouping, doesn't exist yet).
+- Enrichment kept serial as the default; making read-concurrency a device-tuned permit count is Phase 3 semaphore-tier work.
+- Undated frames (`captured_at == None`) not yet routed — routing fallback (mtime? `unsorted/`?) still open.
+
+#### Step 2 — previews (next)
+
+Decode parallel `.JPG` / extract embedded full-size preview for RAW-only (`rawler`/`rawloader`/`libraw`); downsample to ~1920px compressed JPEG bytes in memory; stream over a channel. First **CPU-bound** work where parallelism pays — where the deferred Rayon budget gets spent.

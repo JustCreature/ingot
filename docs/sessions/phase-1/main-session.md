@@ -60,3 +60,91 @@ Target to validate: scanner produces **11 assets**, demonstrates **4 file paths 
 | Files silently lost under naive key | 4 (predicted) | to be confirmed by running the scanner |
 
 *(Predicted numbers — not yet measured by running code. Confirm once the scanner exists.)*
+
+---
+
+## Session 2 — 2026-06-08 → 2026-06-10 — Implementing the scanner (Code Exception Mode)
+
+### What was built / explored
+
+All in `src/lib.rs` (the user wrote it; guide reviewed iteratively). `cargo init --lib`; library-only crate, driven by `cargo test`. Final state: **2 tests passing, `cargo clippy` clean.**
+
+- **Types implemented** exactly as designed:
+  - `enum FileKind { Raw, Jpeg }` — `#[derive(PartialEq, Eq, Clone, Copy, Debug)]`.
+  - `struct AssetKey { dir: PathBuf, stem: String }` — `#[derive(PartialEq, Eq, Hash, Clone, Debug)]`; stem **lowercased** when built (case-normalization).
+  - `struct AssetFiles { files: Vec<(FileKind, PathBuf)> }` — the non-empty type. `new(kind, path)` (born from one file), `insert` returns `Result<(), PathBuf>` (Err carries the **displaced** path; collision = same kind already present), `get(kind) -> Option<&Path>` (linear scan, n tiny). No `Default`.
+  - `enum TriageState { Pending, Accepted, Rejected }`; `struct PhotoAsset { files, state, rating: u8, captured_at: Option<String> }` (captured_at deferred to Phase 2, stays `None`).
+  - `struct Collision { key, kind, kept, displaced }`; `struct ScanResponse { assets: HashMap<AssetKey, PhotoAsset>, collisions: Vec<Collision>, errors: Vec<walkdir::Error> }`.
+- **`scan_source_dir`**: `walkdir` → skip non-files/no-ext (`let-else`), `classify` extension (lowercased allowlist `cr2→Raw`, `jpg|jpeg→Jpeg`), build `(dir, stem)` key, `HashMap::entry` merge via explicit `match Entry::{Occupied, Vacant}`. Walkdir errors collected into `errors` (not swallowed).
+- **Collision handling (the safety keystone), final correct form:** in the Occupied arm, `insert` **first**; only `if let Err(displaced)` fetch `kept` via `if let Some(... = o.get().files.get(kind))` — no panic, and crucially fetched *after* insert so the normal pairing path (kind absent → Ok) is never skipped.
+- **Public API:** engine types + `scan_source_dir` are `pub`; `AssetFiles::{new,insert,get}` made `pub` (closed the "opaque AssetFiles" gap so consumers can introspect an asset's files).
+- **Tests (programmatic fixtures in tempdirs):**
+  - `build_tree(root, &[files])` helper — `create_dir_all` + `File::create(root.join(file))` (empty files; scanner is content-agnostic in Phase 1).
+  - `scans_test_tree_into_11_assets` — full tree → asserts 11 assets, 0 collisions, 0 errors, **and breakdown 7 paired / 2 JPEG-only / 2 RAW-only** (composition proves no-loss).
+  - `scans_test_tree_spot_collision` — `IMG_1800.jpg` + `IMG_1800.JPEG` → asserts 2 assets, 1 collision, kind `Jpeg`, and the `{kept, displaced}` **set** (order-independent).
+- **Dev dependency added:** `tempfile` (`[dev-dependencies]`), RAII auto-cleanup.
+
+### Errors and fixes (best learning)
+
+- `for x in self.files` behind `&self` → "cannot move out of shared reference"; `Vec` isn't `Copy`. Fix: `&self.files` (`iter()` borrows vs `into_iter()` consumes).
+- `match` on `String` vs `&str` literals → `match ext.as_str()`.
+- `e.file_type()` (FileType) ≠ extension → `e.path().extension()`.
+- `AssetKey` used as HashMap key without `Hash`/`Eq` → derive them; `Eq` (total, reflexive) vs `PartialEq` (why `f64` can't be a key).
+- `Debug` cascade: deriving on a struct requires `Debug` on every field type, recursively.
+- `cargo test` swallows stdout for passing tests → `-- --nocapture` / `--show-output`.
+- **Test fixture wrote files to CWD** (`File::create(file)` not `root.join(file)`) → 0 assets + 14 stray files polluting repo root (cleaned). The ENOENT in the debug loop = `WalkDir::new(tmp_dir)` *moved+dropped the `TempDir`* (RAII delete) before walking → use `tmp_dir.path()`.
+- **Walkdir ordering trap:** asserting `[kept, displaced]` as an ordered pair failed (walkdir order not guaranteed) → assert the **set**.
+- **Collision-fetch ordering bug:** extracting `kept` *before* insert both caused a borrow conflict (immutable `kept` borrow overlapping `get_mut`) **and** a logic inversion (Occupied + `get(kind)==None` is the *normal pairing* case; `else continue` would drop legitimate JPEGs). Fix: fetch `kept` inside the `Err` branch, after insert.
+- 11 clippy dead-code warnings = library had **no `pub` API** (`cargo clippy` checks lib without test cfg). Fixed by marking the real public surface `pub`, not `#[allow]`.
+
+### Key discussion points
+
+- Ownership: `into_iter` (consume) vs `iter` (borrow) vs `iter_mut`; can't move out from behind `&self`; `Vec` non-`Copy` because it owns a heap alloc (double-free).
+- `let-else` = "happy value or **diverge**", never a two-way branch; `if let Err(x)` = "do something only on error". Combinators (`and_modify`/`or_insert_with`) can't express side-outputs/`?` → drop to `match Entry`.
+- HashMap internals: `Hash` picks the bucket, `Eq` disambiguates within it; invariant `a==b ⟹ hash(a)==hash(b)`.
+- `collect` = generic `FromIterator` builder (needs target-type annotation); `into_iter` turns an array into an iterator yielding owned values; `BTreeSet::from([...])` is the tidier fixed-set constructor.
+- `expect`/panic couples to another method's invariant and **aborts the whole batch** — inconsistent with "anomalies are data" (collect into report), so prefer `if let Some` / push-to-errors.
+- Lib vs bin: Phase 1 has nothing to *run*, only to *test*; `examples/scan.rs` for visual output later, defer `main.rs`.
+
+### Next step (where we left off)
+
+Phase 1 **Steps 1 & 2 complete** (asset model + scanning/pairing, fully tested). Remaining: **Step 3 — multi-target routing**, a pure I/O-free `destination_path(target, <date>, file) -> PathBuf` building ISO folders `root/2026/2026-05-12/IMG_0001.CR2`, plus `enum TargetKind { LocalNvme, LocalSpinning, Network }` and `struct Target { root, kind, write_permits }` (kind/permits are seeds for Phase 3 semaphores, unused in routing).
+
+**Open decision before writing it:** date representation —
+- pull in **`chrono::NaiveDate`** now (type-safe, ISO formatting, makes invalid dates unrepresentable, reused in Phase 2 EXIF) — *guide's lean*; or
+- keep Step 3 dependency-free with pre-formatted string/component inputs, introduce the date type in Phase 2 when EXIF lands.
+
+Design notes for Step 3: take the **date as a parameter** (decouple from EXIF/Phase 2); build the filename from the **original-case** `file.file_name()`, never the lowercased `key.stem`; keep it pure (compute a path, create no dirs) so it's `assert_eq!`-testable with a hardcoded date.
+
+---
+
+## Session 3 — 2026-06-11 — Step 3 routing (Code Exception Mode)
+
+### What was built / explored
+
+- **`chrono` added** (`cargo add chrono`). Date type decision resolved: `chrono::NaiveDate` (type-safe — `from_ymd_opt` validates, so invalid dates are unconstructable; ISO `Display`; reused by Phase 2 EXIF).
+- **Types:** `enum TargetKind { LocalNvme, LocalSpinning, Network }`, `struct Target { root: PathBuf, kind: TargetKind, write_permits: usize }` (both `#[derive(Clone, Debug)]`). `kind`/`write_permits` are seeds for Phase 3 semaphores — unused by routing.
+- **`build_destination_path(target: &Target, captured: NaiveDate, file: &Path) -> Option<PathBuf>`** — pure, no I/O. Year via `captured.year()` (`Datelike`), date dir via ISO format, filename via `file.file_name()?` (original case, **not** the lowercased key stem). Returns `Option` to honestly handle `file_name() == None`. Builds `root/2026/2026-05-12/IMG_0001.CR2`.
+- **Test `build_target_dir_works`** — hardcoded `NaiveDate::from_ymd_opt(2026,5,22)`, asserts exact `PathBuf`. No tempdir (pure computation).
+
+### Errors and fixes
+
+- clippy: `let Some(x) = ... else { return None }` in an `Option`-returning fn → use the **`?` operator** (`?` works on `Option`, not just `Result`, when the fn returns `Option`). Also dropped a redundant `Path::new(file_name)` — `&OsStr: AsRef<Path>`, so `.join(file_name)` works directly.
+
+### Key discussion points
+
+- Decouple path-building from the date *source*: take the date as a parameter so the function is pure/testable now; Phase 2 supplies the real `DateTimeOriginal`.
+- `NaiveDate` is a plain calendar date (no clock/zone); `Display` is already ISO 8601. Constructor `_opt` validation = "invalid dates unrepresentable", consistent with the rest of the model.
+
+---
+
+## Final Numbers
+
+| Metric | Value | Notes |
+|---|---|---|
+| True assets in test tree | 11 (measured ✓) | 7 paired, 2 RAW-only, 2 JPEG-only — asserted |
+| Same-kind collisions surfaced | 1 (measured ✓) | `.jpg`/`.jpeg` → both `Jpeg`, kept+displaced asserted |
+| Routing path | exact match ✓ | `root/2026/2026-05-22/IMG_001.CR2` asserted |
+| Tests | 3 passing | + `build_target_dir_works` |
+| clippy | clean | no warnings |
+| Naive stem-key (counterfactual) | 8 | demonstrated by reasoning; cross-folder dups proven distinct (11≠8) |
