@@ -21,7 +21,7 @@ fn main() {
     //     .unwrap_or_else(|| "/Volumes/GenericSSD/photodata/original".to_string());
     let path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "testdata/test_exif_read".to_string());
+        .unwrap_or_else(|| "crates/ingot_core/testdata/test_exif_read".to_string());
 
     let source = Path::new(&path);
 

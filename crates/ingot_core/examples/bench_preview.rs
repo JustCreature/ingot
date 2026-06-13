@@ -4,7 +4,8 @@ use ingot_core::preview::make_preview_from_jpeg_bytes;
 // use rayon::prelude::*;
 
 fn main() {
-    let Some(src) = std::fs::read("testdata/test_exif_read/IMG_1800.JPG").ok() else {
+    let Some(src) = std::fs::read("crates/ingot_core/testdata/test_exif_read/IMG_1800.JPG").ok()
+    else {
         panic!("lol")
     };
     let Some(new_image) = make_preview_from_jpeg_bytes(&src) else {
