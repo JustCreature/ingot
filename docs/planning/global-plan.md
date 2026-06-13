@@ -20,7 +20,7 @@
 
 ### Open scoping decisions — RESOLVED 2026-06-08
 
-1. **RAW-only frames (no parallel JPEG): in scope?** **RESOLVED: IN SCOPE.** A `PhotoAsset` with only a RAW is a first-class asset, not an edge case. *Consequence:* requires a RAW-aware crate (`rawler`/`rawloader` or `libraw`) to pull the *full-size* embedded preview out of the CR2 in Phase 2 (`kamadak-exif` only exposes the tiny ~160px thumbnail).
+1. **RAW-only frames (no parallel JPEG): in scope?** **RESOLVED: IN SCOPE**, and the *primary* case — most pros shoot RAW-only. A `PhotoAsset` with only a RAW is a first-class asset, not an edge case. *Consequence:* the full-size embedded preview must be pulled out of the CR2 in Phase 2. **Update (2026-06-13):** `kamadak-exif` *can* reach the full-size IFD0 embedded JPEG for CR2 by slicing `StripOffsets`/`StripByteCounts` (not just the 160×120 IFD1 thumb) — so no RAW crate is needed for Canon. A RAW-aware crate (`rawler`/`rawloader` or `libraw`) becomes necessary only when adding **other formats** (Nikon NEF SubIFD, Sony ARW/Fuji RAF maker tags, DNG preview IFD), which hide the embedded preview elsewhere. The seek *mechanism* (parse header → strip offset → `pread`) is shared; only the offset *source* is per-format.
 2. **Do we ever delete from the card at all?** **RESOLVED: source-card deletion OUT OF SCOPE for v1**, to be exposed later as a separate, explicitly-warned button. The normal delete function must never touch the source card — it operates only on *copied targets*, gated on `VerifiedReplica` + rejected-state.
 
 ---
@@ -107,15 +107,43 @@ rayon::ThreadPoolBuilder::new().num_threads(threads).build_global()?;
 For each asset, on the pool:
 
 - **Capture date:** read `DateTimeOriginal` with `kamadak-exif`. This crate is a *read-only metadata parser* — it is used **only** for reading the date here, nothing else. Also read `SubSecTimeOriginal` as a burst-ordering tiebreak, since EXIF time is 1-second resolution and bursts will tie.
-- **Preview source:**
-  - RAW + JPEG (v1): decode the parallel `.JPG`.
-  - RAW only (if in scope): extract the full-size embedded preview via the RAW crate from decision (1) — *not* the EXIF thumbnail IFD.
-- **Downsample immediately** to screen resolution (≈1920px long edge) for the grid. **Keep this preview as compressed JPEG bytes in memory, not decoded RGBA** (see Phase 4 — RAM scaling).
-- **Retain access to the full-size JPEG on demand** for 1:1 loupe view (see Phase 4 — this is the single most important culling feature).
+- **Downsample** to screen resolution (≈1920px long edge) for the loupe and ≈512px for the grid thumb. **Keep previews as compressed JPEG bytes in memory, not decoded RGBA** (see Phase 4 — RAM scaling).
+- **Retain access to the full-size embedded/parallel JPEG on demand** for 1:1 loupe view (see Phase 4 — the single most important culling feature). For Canon CR2 the IFD0 embedded preview is *full sensor resolution*, so genuine 1:1 focus checking needs **zero RAW decode** — but some formats embed a reduced preview, so "full res" is only guaranteed up to the largest embedded preview the format provides.
 
-### Step 3 — Streaming channel
+#### The three read stages (Lightroom's "instant import" model)
 
-A multi-producer, single-consumer channel (`std::sync::mpsc` or `crossbeam-channel`). The instant a worker finishes one photo, it sends the processed struct (with the compressed preview) to the UI thread. The grid fills incrementally; the user starts triaging before the scan completes.
+The card is the bottleneck, so the engine reads it as little as possible and as late as possible. Three distinct read strategies, chosen so triage starts in seconds while replication runs in the background. **Note:** these *read stages* are a different axis from the *concurrency tiers* of Phase 3 (read-permits vs write-permits) — don't conflate the two.
+
+| Stage | Read | Who runs it | Feeds |
+|---|---|---|---|
+| **1 — skeleton** | **header-only**, tiny (seek machinery) | **every** asset | `DateTimeOriginal` → greyed target-folder tree; embedded 160×120 IFD1 thumb → instant grid placeholder |
+| **2 — embedded seek** | `pread` just the embedded-JPEG strip (~2–3 MB) | assets **with a RAW** (RAW-only always; pair only if measurement favours it) | the good 512 grid thumb + 1920 loupe preview |
+| **3 — full read + fan-out** | whole file, **once** | **replication** (every kept file) | the targets; **and** previews for JPEG-source assets (the copy read tees into the decode) |
+
+Key facts driving this:
+
+- **Two embedded images, not one.** A camera writes a tiny ~160×120 IFD1 thumbnail (placeholder, header-only) **and** a large full-res IFD0 embedded JPEG (the *good* preview source). The grid thumb is downscaled from the *large* one — never from the 160×120.
+- **Seek machinery is mandatory, not an optimization.** `kamadak-exif` slurps the **entire** file into `buf()` for a TIFF-like CR2 (measured: 36 MB resident to extract a ~2 MB strip). For RAW-only — the *most common* real case (most pros shoot RAW-only) — reading the embedded preview must be a **targeted `pread`** (parse header → `StripOffsets`/`StripByteCounts` from IFD0 → read only that strip), turning 36 MB into ~3 MB (~12×). Stage 1 should **cache the IFD0 strip offset** it already parsed, so stage 2 is a pure `pread` with no second header parse — keeping the skeleton sweep fast *and* read-once.
+- **The embedded preview is smaller than the standalone JPEG at the same resolution** because it is a deliberately throwaway, harder-compressed JPEG (lower quality factor, 4:2:0 chroma, coarser quantization) — the RAW is the master. So the standalone `.JPG` is *higher quality*; prefer it when fidelity matters (1:1 focus), and only the byte-count argues for the embedded path.
+- **Preview-source choice per asset type:**
+  - **RAW-only** → stage 2 seek-extract (no choice; the only viable preview is the embedded JPEG). Top-priority fast path.
+  - **JPEG-only** → stage 3. A JPEG is a monolithic stream (no targeted shortcut to a small preview), but its full read is the **same read replication owes** — fan it out (read once → decode previews **and** write to targets). It is *not* an extra "scan for previews."
+  - **Pair (RAW+JPEG)** → **measurement decides**: seek the ~3 MB embedded strip (half the bytes, lower quality, non-contiguous read) vs sequentially read the ~6 MB JPEG (higher quality, readahead-friendly). Half the bytes does *not* guarantee half the time on flash; and both files get copied regardless. Measure bytes + wall time on a real card and eyeball the embedded 1:1 quality before locking.
+- **Two subsystems, not three peers.** A *preview subsystem* (stage 1 skeleton + stage 2/3 good-preview) tuned for triage latency, and a *replication subsystem* (stage 3) that copies everything and lends its read to previews when the file being copied is itself a JPEG. RAW-only frames still hit stage 3 — for copying, not previewing.
+
+### Step 3 — Streaming channel (two-pass)
+
+A multi-producer channel (`crossbeam-channel`; prefer it over `std::sync::mpsc` so the read/CPU stages can be MPMC without a rewrite). The stream is **two-pass**, matching the read stages:
+
+```rust
+// Pass A — skeleton sweep across ALL assets first (header-only, fast):
+//   the date-folder tree + placeholder grid fill before any heavy preview renders.
+SkeletonReady { key, captured_at, thumb_jpeg /* 160×120 */, raw_strip_offset }
+// Pass B — good previews stream in behind the skeleton (stage 2 seek / stage 3 read):
+PreviewReady  { key, thumb_jpeg /* 512 */, preview_jpeg /* 1920 */ }
+```
+
+The skeleton sweep runs across *all* assets before pass B does heavy work on any single one — otherwise asset 1's 1920 encode blocks asset 50's date, and the tree fills slowly. The consumer owns the single asset store (from `scan()`); it applies `captured_at` from pass A (lights up the tree), paints placeholders, then upgrades cells as pass B arrives. The engine stays stateless about the store — the message carries the deltas, not a duplicate store.
 
 ---
 

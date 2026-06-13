@@ -293,3 +293,64 @@ IFD1 thumb; (3) RAW-only CR2 IFD0 path; (4) `ProcessedPreview` channel streaming
 - `get_embedded_preview_from_tiff_like` is `pub`; tighten to `pub(crate)`/private once step 4 shows where the
   caller lives.
 - Phase 2 extraction surface complete (steps 1–3). **Step 4 (streaming + two-tier concurrency) is the last.**
+
+---
+
+## Session 5 — Engine refactor → `ingot_core` + workspace; step 4 design (2026-06-13)
+
+### What was built / explored (Code Exception — structural refactor)
+
+- **Cargo workspace, root-package + member layout:**
+  - `/Cargo.toml` = workspace root **and** the `ingot` binary package (`[package]` + `[workspace]` + dep on
+    `ingot_core`); `/src/main.rs` constructs `Engine::new(EngineConfig::default())`.
+  - `crates/ingot_core/` = the engine library (no UI deps; the binary's future GUI deps attach to the root
+    package, keeping the engine clean). Chose root `src/main.rs` over a `crates/ingot_app` member so the
+    binary sits at the conventional repo root while staying a *separate package* (isolation preserved).
+- **`lib.rs` (565 lines) split into focused modules, each with its own `#[cfg(test)]`:**
+  `asset` (model) · `scan` (walk+pair, `Collision`, `ScanResponse`) · `metadata` (EXIF extractors +
+  `enrich_assets`) · `preview` (JPEG pipeline, moved) · `route` (`build_destination_path`, `Target`) ·
+  `engine` (`Engine`, `EngineConfig`, `ProcessedPreview`) · `test_support` (shared cfg(test) fixtures).
+  `lib.rs` is now mod-decls + curated `pub use`.
+- **Engine skeleton (the headline):** `EngineConfig` = struct+`Default` with Phase-2-locked values
+  (`preview_long_edge 1920`, `thumb_long_edge 512`, `jpeg_quality 85`, `card_read_permits 2`,
+  `cpu_threads = available_parallelism()`); override via `..Default::default()`. `Engine::new/config/scan`
+  implemented; `ingest` marked as the step-4 slot. `ProcessedPreview { key, thumb_jpeg, preview_jpeg }`
+  defined (v1 single-message shape).
+- **Visibility tightened by the crate boundary:** `PhotoAsset::new` + metadata internals → `pub(crate)`;
+  public surface = `Engine`/`EngineConfig`/`ProcessedPreview`/`ScanResponse`/`PhotoAsset`/`AssetKey`/
+  `TriageState`/`Target`/`TargetKind` + `scan_source_dir`/`enrich_assets`/`get_embedded_preview_from_tiff_like`/
+  `build_destination_path`. (Resolves the `pub` open item.)
+- **Cleanup folded in:** `git rm` the `test_thumb/` junk (~42 MB dup CR2 + debug leftovers) + tracked
+  `example.JPG`; benches repointed (enrich default → `test_exif_read`, preview output → temp dir; user later
+  switched fixture paths to `CARGO_MANIFEST_DIR`-based to fix example cwd-dependence). `.DS_Store` added to
+  `.gitignore`. Used `git mv` throughout to preserve history.
+- **Verified green:** `cargo test --workspace` **9 passing** (3 suites; added 2 `EngineConfig` tests) ·
+  `cargo clippy --workspace --all-targets` clean · `cargo run` prints the config.
+
+### Errors and fixes
+
+- **`cargo run --example` cwd ≠ `cargo test` cwd.** Examples run with cwd = the shell's dir (workspace root);
+  tests run with cwd = the package dir (`crates/ingot_core`). So example relative paths broke. Durable fix =
+  `env!("CARGO_MANIFEST_DIR")` (compile-time crate root, cwd-independent). Also `fs::write` to
+  `temp_dir().join("testdata/...")` failed ENOENT — `write` doesn't create parent dirs.
+- Moved-file Edits required a fresh `Read` at the new path first (harness file-state tracking).
+
+### Step 4 design (discussed, guide mode — not yet built)
+
+- **Two decoupled stages, not one pool:** READ stage (`card_read_permits` threads) → bounded channel →
+  CPU stage (`cpu_threads` workers) → bounded channel → `IngestHandle { previews: Receiver<ProcessedPreview> }`.
+- **Why separate pools (hardware argument):** a Rayon worker blocked on `read()` still occupies a pool slot →
+  8 workers − 2 in-flight reads = 6 effective CPU threads, and slow reads stall the work-stealer. Dedicated
+  reader threads live *outside* the CPU pool (I/O-blocked ≈ 0 CPU), keeping all cores on decode/resize/encode.
+- **Backpressure = memory governor:** bounded channels mean only `cap + in-flight` CR2 buffers are alive
+  (e.g. cap 4 + 2 readers ≈ 6 × 36 MB ≈ 216 MB), not 5000 × 36 MB. The channel cap is the step-3 knob.
+- **One read per asset:** read `.JPG` once → parse EXIF *and* use as preview source from the same bytes;
+  RAW-only → kamadak-exif whole-CR2 `buf()` yields date + IFD1 thumb + IFD0 preview from one read.
+- **The measurement step 4 delivers:** the 999× bench measured CPU with data already in RAM; the live pipeline
+  adds the *full-file* read (step 1 only measured tiny EXIF headers). A 6 MB JPG off USB (~7–14 reads/s) vs
+  CPU ~56 previews/s ⇒ pipeline is likely **read-bound** — the finding that justifies separate read/CPU widths
+  (device-dependent, flips on SSD like step 1).
+- **Decisions:** crossbeam-channel (bounded MPMC); single `ProcessedPreview` for v1 (defer 160×120
+  placeholder-first split until UI exists); **open** — lean message + engine-owned enriched asset store vs
+  fat self-contained message (#3). Recommended build order: serial (`P_read=1, P_cpu=1`) baseline first, then
+  layer the two pools onto a working, measurable stream.

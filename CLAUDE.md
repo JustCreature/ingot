@@ -47,7 +47,9 @@ These are deliberate design decisions, not suggestions. When discussing implemen
 
 **Current phase:** Phase 2 — CPU-Bound Processing & Streaming (steps 1–3 ✅: capture-time, IFD1 thumb + composed `make_preview`/`make_thumbnail`, RAW-only IFD0 preview; **step 4 streaming + two-tier concurrency is the last**)
 
-**Last session:** 2026-06-13 — RAW-only full-res preview: `get_embedded_preview_from_tiff_like(&Exif)` slices the IFD0 single-strip (`StripOffsets`/`StripByteCounts`, `In::PRIMARY`) embedded JPEG (~1.95 MB) → feeds `make_*`; turbojpeg decodes it, RAW path proven end-to-end (zero RAW decode). Probed: kamadak-exif holds the whole 36 MB CR2 in `buf()` → slice (not seek-read) is the right extraction. Also generalized preview core to `get_resized_from_jpeg_bytes(src, target_long_dim)`.
+**Last session:** 2026-06-13 — **Engine refactor**: restructured into a Cargo workspace — `crates/ingot_core` (engine lib) + root `ingot` binary package (`/src/main.rs`). Split `lib.rs` into `asset`/`scan`/`metadata`/`preview`/`route`/`engine`/`test_support` modules. Added `Engine` + `EngineConfig` (struct+`Default`, Phase-2-locked values) + `ProcessedPreview`; `scan` wired, `ingest` is the step-4 slot. Tightened visibility, removed `test_thumb/` junk, `.DS_Store` ignored. `cargo test --workspace` 9 green, clippy clean. Then designed step 4 (two-tier pipeline) in guide mode.
+
+**Project layout:** Cargo workspace. `/Cargo.toml` = workspace root **and** the `ingot` binary package; `/src/main.rs` = the app (constructs an `Engine`). `crates/ingot_core/` = the engine library (kept UI-dep-free). Public API: `Engine`/`EngineConfig`/`ProcessedPreview` + `scan_source_dir`/`enrich_assets`/`get_embedded_preview_from_tiff_like`/`build_destination_path` + model types. Run app: `cargo run`; tests: `cargo test --workspace`; benches: `cargo run --release -p ingot_core --example bench_{enrich,preview}`.
 
 ---
 
@@ -124,14 +126,28 @@ Two compressed-JPEG outputs per asset, streamed (not stored on `PhotoAsset`): fr
 - **Probe numbers (`IMG_1939.CR2`):** `buf().len()` = 36,599,837 B (whole file — kamadak-exif holds the entire CR2) · `StripByteCounts` = 2,039,424 B (single-strip full-res ~1.95 MB) · turbojpeg decoded it → 1920px output visually verified. → slice-from-`buf()` is the correct extraction (seek-read would re-read; file already resident); 36 MB/CR2 resident is bounded by step-4 read-permit tier (~1–2 alive).
 - **Three preview tiers:** IFD1 160×120 placeholder → generated 512 grid thumb → generated 1920 loupe preview (also the streaming order).
 
-**Remaining (next):** (4) **the only step left** — `ProcessedPreview { key, thumb_jpeg, preview_jpeg }` channel streaming + the processing unit (per asset: open → parse EXIF → preview-source branch [paired → read `.JPG`; RAW-only → `get_embedded_preview_from_tiff_like`] → `make_thumbnail` + `make_preview` → emit) + two-tier concurrency (bounded card reads, 1–2 permits, feeding the CPU pool / Rayon).
+**Remaining (next): step 4 — streaming ingest.** Designed in guide mode 2026-06-13 (see global-plan Phase 2 §"three read stages" + §"Streaming channel (two-pass)"). The card is the bottleneck → read as little/late as possible. **Three read stages** (a different axis from Phase 3's concurrency tiers):
+- **Stage 1 — skeleton** (header-only, *seek machinery*, every asset): `DateTimeOriginal` → greyed target tree; 160×120 IFD1 thumb → instant grid placeholder. **Caches the IFD0 strip offset** it parses, so stage 2 needs no second header read.
+- **Stage 2 — embedded seek** (assets *with a RAW*): `pread` only the embedded-JPEG strip (~2–3 MB) using the cached offset → 512 + 1920 previews. **Mandatory, not an optimization:** kamadak slurps the *whole* 36 MB CR2 for `buf()`; targeted `pread` = ~12× less I/O on the primary (RAW-only) path.
+- **Stage 3 — full read + fan-out** (replication; every kept file): read whole file once → write all targets; **also previews JPEG-source assets** (the copy read tees into decode — not an extra scan).
+
+**Preview-source by type:** RAW-only → stage 2 (only viable source); JPEG-only → stage 3 (full read = the replication read, fan out); pair → **measurement decides** (seek ~3 MB embedded, lower-quality/non-contiguous, vs sequential ~6 MB JPEG, higher-quality/readahead). Two subsystems: *preview* (stages 1+2/3, triage-latency) + *replication* (stage 3, copies everything, lends its read to JPEG previews).
+
+**Two-pass stream:** `SkeletonReady { key, captured_at, thumb_jpeg/160, raw_strip_offset }` (pass A, sweep ALL assets first → tree+placeholders) → `PreviewReady { key, thumb_jpeg/512, preview_jpeg/1920 }` (pass B). Consumer owns the asset store (from `scan()`); engine stateless, messages carry deltas. `captured_at` moves to pass A (was in `ProcessedPreview`).
+
+**Why embedded < standalone JPEG at same res:** harder-compressed throwaway (low quality factor, 4:2:0, coarse quant) — RAW is the master. Standalone `.JPG` is higher quality → prefer for 1:1 focus; only byte-count favours embedded.
+
+**Next concrete step — the spike** (before serial baseline): on one frame each of {RAW-only CR2, JPEG-only, pair} measure **bytes read + wall time** for slurp-vs-seek (CR2) and sequential-JPEG-vs-seek-embedded (pair), find the header-prefix size that captures the IFD0 offset, and eyeball embedded 1:1 quality. Settles the pair decision + stage-1/2 fusion. Then build the serial baseline (one worker, one channel) before layering the two pools.
 
 **Known open items from step 2:**
 - Per-frame `Decompressor` (per-thread reuse = later optimization to measure).
 - Bench iterates one image 999× (CPU throughput proxy); real two-tier read+CPU measurement deferred to the streaming step.
 - Previews-to-disk (SQLite blob path) vs held-in-RAM — decided at step 4 (channel consumer).
 - EXIF `Orientation` (portrait frames stored landscape + tag) — display-time handling, parked.
-- `get_embedded_preview_from_tiff_like` is `pub`; tighten once step 4 shows the caller's module.
-- Repo junk cleanup (not done): `testdata/test_thumb/` (git-tracked) is now unused by tests but holds a 34.9 MB dup CR2 + dup JPG + 2 `example_thumb*.JPG` debug-write leftovers (~42 MB). `git rm` it — but first repoint `examples/bench_enrich.rs` default path (still `testdata/test_thumb`) → `testdata/test_exif_read`. Also `testdata/test_exif_read/example.JPG` (284 KB, git-tracked) is a `bench_preview` output artifact → gitignore the bench output / write to an ignored path.
+- Step-4 message contract — **RESOLVED 2026-06-13:** two-pass, **consumer owns the store**, engine stateless, messages carry deltas. `SkeletonReady {key, captured_at, thumb_jpeg/160, raw_strip_offset}` → `PreviewReady {key, thumb_jpeg/512, preview_jpeg/1920}`. `captured_at` belongs to pass A (skeleton), not the preview message.
+- Step-4 **pair preview-source** — OPEN, resolved by spike: seek embedded (~3 MB) vs read standalone JPEG (~6 MB). Decided by measured bytes+time on a real card + embedded 1:1 quality eyeball.
+- Step-4 build order: spike (3 read strategies on {RAW-only, JPEG-only, pair}) → serial `P_read=1/P_cpu=1` baseline (one worker, one `crossbeam-channel`) → layer the two pools.
+- `get_embedded_preview_from_tiff_like` currently slices from kamadak's full `buf()` (36 MB resident). Step-4 stage 2 replaces this with targeted `pread` of the cached IFD0 strip offset (~3 MB). Multi-format extraction (NEF/ARW/RAF/DNG) → `rawler`/`libraw` later.
+- Nothing committed yet — the workspace refactor (staged renames + new module files) awaits review/commit.
 
-**Resolved (was open, now done):** `println!` removed from `get_embedded_preview_from_tiff_like`; preview test repointed to `testdata/test_exif_read/IMG_1939.CR2`; CR2-only (`img_1939`) thumb marker assertion added; `resize` threads `target_long_dim` (no hardcoded 1920); redundant casts dropped.
+**Resolved (was open, now done):** repo junk cleanup (`test_thumb/` + `example.JPG` git-removed, benches repointed/`CARGO_MANIFEST_DIR`, `.DS_Store` gitignored); `pub` visibility (crate boundary forced the audit → internals `pub(crate)`); `println!` removed; preview test repointed; CR2-only thumb marker added; `resize` threads `target_long_dim`; redundant casts dropped.
