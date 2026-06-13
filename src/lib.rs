@@ -116,6 +116,26 @@ pub struct Target {
     pub write_permits: usize,
 }
 
+pub fn get_embedded_preview_from_tiff_like(exif: &exif::Exif) -> Option<Vec<u8>> {
+    let preview_offset_field = exif.get_field(exif::Tag::StripOffsets, exif::In::PRIMARY)?;
+    let preview_len_field = exif.get_field(exif::Tag::StripByteCounts, exif::In::PRIMARY)?;
+
+    let preview_offset = match preview_offset_field.value {
+        exif::Value::Long(ref v) => *v.first()? as usize,
+        _ => return None,
+    };
+
+    let preview_len = match preview_len_field.value {
+        exif::Value::Long(ref v) => *v.first()? as usize,
+        _ => return None,
+    };
+
+    let buf = exif.buf();
+    let preview = buf.get(preview_offset..preview_offset + preview_len)?;
+
+    Some(preview.to_vec())
+}
+
 fn get_thumbnail(exif: &exif::Exif) -> Option<Vec<u8>> {
     let thumb_offset_field =
         exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)?;
@@ -338,6 +358,29 @@ mod tests {
             assert!(asset.exif_data.captured_at.is_none());
             assert!(asset.exif_data.thumbnail.is_none());
         }
+    }
+
+    #[test]
+    fn get_embedded_preview_from_tiff_like_test_preview_extracted_successfully() {
+        let file = std::fs::File::open(Path::new("testdata/test_exif_read/IMG_1939.CR2"))
+            .ok()
+            .unwrap();
+
+        let mut bufreader = std::io::BufReader::new(file);
+
+        let exif_container = exif::Reader::new()
+            .read_from_container(&mut bufreader)
+            .ok()
+            .unwrap();
+        let preview =
+            get_embedded_preview_from_tiff_like(&exif_container).expect("no preview extracted");
+        assert!(preview.starts_with(&[0xFF, 0xD8]));
+        assert!(preview.ends_with(&[0xFF, 0xD9]));
+        assert!(
+            (500_000..6_000_000).contains(&preview.len()),
+            "preview size out of expected band: {} bytes",
+            preview.len()
+        );
     }
 
     #[test]

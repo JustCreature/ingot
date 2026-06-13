@@ -13,7 +13,6 @@ fn main() {
     let Some(_) = std::fs::write("testdata/test_exif_read/example.JPG", new_image).ok() else {
         panic!("lol4")
     };
-
     // let t = Instant::now();
     // (1..1000).into_par_iter().for_each(|_| {
     //     let Some(decompressed_image) = preview_from_jpeg_bytes(&src) else {
