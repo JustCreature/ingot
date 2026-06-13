@@ -45,9 +45,9 @@ These are deliberate design decisions, not suggestions. When discussing implemen
 
 ## Status
 
-**Current phase:** Phase 2 — CPU-Bound Processing & Streaming (step 1 ✅; step 2 CPU core ✅; step 2 `make_preview` compose + IFD1 thumb ✅; RAW-only IFD0 preview + streaming next)
+**Current phase:** Phase 2 — CPU-Bound Processing & Streaming (steps 1–3 ✅: capture-time, IFD1 thumb + composed `make_preview`/`make_thumbnail`, RAW-only IFD0 preview; **step 4 streaming + two-tier concurrency is the last**)
 
-**Last session:** 2026-06-13 — Composed `make_preview_from_jpeg_bytes` (decode→resize→encode, `?`-funnelled) + rule-based `pick_scaling_factor` (re-derives 3/8 by long edge) + orientation-aware resize; IFD1 thumb extraction (`get_thumbnail(&Exif)`, free byte-slice); refactored EXIF reads to one open/parse + `extract_exif_data` builder + single-pass `enrich_assets`.
+**Last session:** 2026-06-13 — RAW-only full-res preview: `get_embedded_preview_from_tiff_like(&Exif)` slices the IFD0 single-strip (`StripOffsets`/`StripByteCounts`, `In::PRIMARY`) embedded JPEG (~1.95 MB) → feeds `make_*`; turbojpeg decodes it, RAW path proven end-to-end (zero RAW decode). Probed: kamadak-exif holds the whole 36 MB CR2 in `buf()` → slice (not seek-read) is the right extraction. Also generalized preview core to `get_resized_from_jpeg_bytes(src, target_long_dim)`.
 
 ---
 
@@ -118,11 +118,20 @@ Two compressed-JPEG outputs per asset, streamed (not stored on `PhotoAsset`): fr
 - Test: `enrich_assets_test_thumbnail_filled_successfully` asserts SOI `FF D8` / EOI `FF D9` + size band (proves a complete JPEG carved at correct boundaries).
 - **Memory model (5000 frames):** thumbs ~65 MB resident · compressed previews ~0.75–2.4 GB (~1.5 GB typical, persist-to-disk per plan) · decoded RGBA **~47 GB** (never resident → virtualized grid + LRU texture cache; ~64× compressed→decoded blow-up is why tier 3 must be LRU).
 
-**Remaining (next):** (3) RAW-only CR2 IFD0 full-res preview path (`In::PRIMARY` Strip tags → embedded 6240×4160 JPEG → feeds `make_preview`; zero RAW decode); (4) `ProcessedPreview { key, thumb_jpeg, preview_jpeg }` channel streaming + two-tier concurrency (bounded card reads feeding CPU pool).
+**RAW-only IFD0 preview (step 3) — ✅ DONE (2026-06-13):**
+- `src/preview.rs` — preview core generalized to `get_resized_from_jpeg_bytes(src, target_long_dim)` (decode→resize→encode); `make_preview_from_jpeg_bytes` (1920) / `make_thumbnail_from_jpeg_bytes` (512) are thin wrappers. Target now threads into `pick_scaling_factor` *and* `resize` (no hardcoded 1920); smaller targets get smaller scaled decode (512 ⇒ 1/8 ⇒ thumbnails cheaper than previews).
+- `src/lib.rs` — `get_embedded_preview_from_tiff_like(&Exif) -> Option<Vec<u8>>`: IFD0 single-strip embedded JPEG via `StripOffsets`/`StripByteCounts` at `In::PRIMARY`, fallible `buf.get(..)?` slice → `to_vec`. Feeds the same `make_*` pipeline; RAW-only path converges, zero RAW decode. Test asserts SOI/EOI + 0.5–6 MB band.
+- **Probe numbers (`IMG_1939.CR2`):** `buf().len()` = 36,599,837 B (whole file — kamadak-exif holds the entire CR2) · `StripByteCounts` = 2,039,424 B (single-strip full-res ~1.95 MB) · turbojpeg decoded it → 1920px output visually verified. → slice-from-`buf()` is the correct extraction (seek-read would re-read; file already resident); 36 MB/CR2 resident is bounded by step-4 read-permit tier (~1–2 alive).
+- **Three preview tiers:** IFD1 160×120 placeholder → generated 512 grid thumb → generated 1920 loupe preview (also the streaming order).
+
+**Remaining (next):** (4) **the only step left** — `ProcessedPreview { key, thumb_jpeg, preview_jpeg }` channel streaming + the processing unit (per asset: open → parse EXIF → preview-source branch [paired → read `.JPG`; RAW-only → `get_embedded_preview_from_tiff_like`] → `make_thumbnail` + `make_preview` → emit) + two-tier concurrency (bounded card reads, 1–2 permits, feeding the CPU pool / Rayon).
 
 **Known open items from step 2:**
 - Per-frame `Decompressor` (per-thread reuse = later optimization to measure).
 - Bench iterates one image 999× (CPU throughput proxy); real two-tier read+CPU measurement deferred to the streaming step.
 - Previews-to-disk (SQLite blob path) vs held-in-RAM — decided at step 4 (channel consumer).
 - EXIF `Orientation` (portrait frames stored landscape + tag) — display-time handling, parked.
-- Thumb test covers JPG path; CR2-only (`img_1939`) marker assertion suggested but not yet added.
+- `get_embedded_preview_from_tiff_like` is `pub`; tighten once step 4 shows the caller's module.
+- Repo junk cleanup (not done): `testdata/test_thumb/` (git-tracked) is now unused by tests but holds a 34.9 MB dup CR2 + dup JPG + 2 `example_thumb*.JPG` debug-write leftovers (~42 MB). `git rm` it — but first repoint `examples/bench_enrich.rs` default path (still `testdata/test_thumb`) → `testdata/test_exif_read`. Also `testdata/test_exif_read/example.JPG` (284 KB, git-tracked) is a `bench_preview` output artifact → gitignore the bench output / write to an ignored path.
+
+**Resolved (was open, now done):** `println!` removed from `get_embedded_preview_from_tiff_like`; preview test repointed to `testdata/test_exif_read/IMG_1939.CR2`; CR2-only (`img_1939`) thumb marker assertion added; `resize` threads `target_long_dim` (no hardcoded 1920); redundant casts dropped.

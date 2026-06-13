@@ -275,6 +275,13 @@ dependencies = [
 name = "ingot"
 version = "0.1.0"
 dependencies = [
+ "ingot_core",
+]
+
+[[package]]
+name = "ingot_core"
+version = "0.1.0"
+dependencies = [
  "chrono",
  "fast_image_resize",
  "kamadak-exif",

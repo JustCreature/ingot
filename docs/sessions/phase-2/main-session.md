@@ -237,3 +237,59 @@ IFD1 thumb; (3) RAW-only CR2 IFD0 path; (4) `ProcessedPreview` channel streaming
 - Open question deferred to step 4: previews persisted to disk (SQLite blob path, per plan) vs held in RAM.
 - EXIF orientation (portrait frames stored landscape + `Orientation` tag) = known display-time item, parked.
 - `cargo test` green (thumbnail markers + size band); clippy expected clean after the `deref_addrof` fix.
+
+---
+
+## Session 4 — RAW-only IFD0 full-res preview (step 3) (2026-06-13)
+
+### What was built / explored
+
+- **`get_resized_from_jpeg_bytes(src, target_long_dim)` generalization** (`src/preview.rs`): the preview core
+  is now parametrized on target long edge, with `make_preview_from_jpeg_bytes` (1920) and
+  `make_thumbnail_from_jpeg_bytes` (512) as thin named wrappers. Threading the target all the way down
+  finally makes the long-dead `target_dim` param live in `pick_scaling_factor` *and* `resize` (no more
+  hardcoded 1920). Side benefit: a 512 thumbnail gets a much smaller scaled decode (6240→1/8→780→512), so
+  thumbnails are *cheaper* than previews, not equal-cost.
+- **Three preview tiers settled:** IFD1 160×120 (~13 KB, free, instant placeholder) → generated 512 "normal
+  thumbnail" (grid tile, replaces placeholder ASAP) → generated 1920 preview (loupe). This is also the
+  step-4 streaming order.
+- **`get_embedded_preview_from_tiff_like(&Exif) -> Option<Vec<u8>>`** (`src/lib.rs`): RAW-only full-res
+  preview extraction. Same EXIF-slice pattern as `get_thumbnail`, moved to **IFD0** — `Tag::StripOffsets` +
+  `Tag::StripByteCounts` at `In::PRIMARY`, fallible `buf.get(offset..offset+len)?` → `to_vec()`. Feeds the
+  same `make_*` pipeline → RAW-only path converges, **zero RAW decode**.
+- **Test:** `get_embedded_preview_from_tiff_like_test_preview_extracted_successfully` — SOI/EOI markers +
+  500 KB–6 MB size band on `IMG_1939.CR2`.
+
+### Probe results (the decision data)
+
+- `exif.buf().len()` on `IMG_1939.CR2` = **36,599,837 B ≈ 34.9 MiB = the whole file.** kamadak-exif reads
+  the entire CR2 into memory to resolve TIFF offsets and keeps it.
+- `StripByteCounts` (IFD0) = **2,039,424 B ≈ 1.95 MB**, a single value (not an array) → **single-strip,
+  full-res** embedded JPEG (a reduced preview would be ~150–300 KB; the IFD1 thumb ~13 KB).
+- Wrote the extracted bytes through `make_preview` → opened the output → clean 1920px image. **turbojpeg
+  decodes the Canon embedded JPEG; RAW-only path proven end-to-end.**
+
+### Key discussion points (mental models)
+
+- **buf()=whole-file flips the A-vs-B extraction call.** Seek+`read_exact` (read only ~2 MB) only wins if
+  you *avoid* the 36 MB read — but kamadak-exif already did it for date+thumb, so the file is resident and
+  slicing the preview is **zero marginal I/O**. Seek-read would cost 36 MB + 2 MB; bypassing kamadak-exif to
+  hand-parse TIFF IFDs isn't worth it. → **slice `buf()` (option A).**
+- **The 36 MB/CR2 resident buffer is real but bounded by step 4, not by extraction.** One-open/parse/**drop**
+  + the source-read semaphore (1–2 permits) means only ~1–2 of these buffers live at once (~37–73 MB peak),
+  not 1000×. The read-permit tier matters *more* for RAW-heavy cards.
+- **Two reaches, one slice idiom:** IFD1 `JPEGInterchangeFormat`/`In::THUMBNAIL` = 13 KB thumb; IFD0
+  `StripOffsets`/`StripByteCounts`/`In::PRIMARY` = full-res preview. Both are byte-slices out of the resident
+  TIFF buffer — extract, never generate.
+- **Heavy bytes stay out of `ExifAssetData`.** The 2 MB preview is RAW-only, CPU-feeding, sometimes-needed —
+  it belongs in the step-4 processing unit, not the cheap per-asset metadata bundle (date + 13 KB thumb).
+
+### State / cleanups pending
+
+- **Open item:** `println!("len: …")` still in `get_embedded_preview_from_tiff_like` (line ~135) — remove
+  before commit (fires per RAW-only frame; clippy won't catch it).
+- Test fixture drift: new test reads `testdata/test_thumb/IMG_1939.CR2` while all others use
+  `testdata/test_exif_read/` (duplicate CR2; `test_thumb/` is debug-leftover) — consolidate to one location.
+- `get_embedded_preview_from_tiff_like` is `pub`; tighten to `pub(crate)`/private once step 4 shows where the
+  caller lives.
+- Phase 2 extraction surface complete (steps 1–3). **Step 4 (streaming + two-tier concurrency) is the last.**
