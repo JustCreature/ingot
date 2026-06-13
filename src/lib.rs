@@ -1,3 +1,4 @@
+pub mod preview;
 use std::{
     collections::{HashMap, hash_map::Entry},
     path::{Path, PathBuf},
@@ -67,11 +68,17 @@ pub enum TriageState {
 }
 
 #[derive(Debug)]
+pub struct ExifAssetData {
+    pub captured_at: Option<NaiveDateTime>,
+    pub thumbnail: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
 pub struct PhotoAsset {
     pub files: AssetFiles,
     pub state: TriageState,
     pub rating: u8,
-    pub captured_at: Option<NaiveDateTime>,
+    pub exif_data: ExifAssetData,
 }
 
 impl PhotoAsset {
@@ -80,7 +87,10 @@ impl PhotoAsset {
             files: AssetFiles::new(kind, path),
             state: TriageState::Pending,
             rating: 0,
-            captured_at: None,
+            exif_data: ExifAssetData {
+                captured_at: None,
+                thumbnail: None,
+            },
         }
     }
 }
@@ -106,23 +116,30 @@ pub struct Target {
     pub write_permits: usize,
 }
 
-fn read_capture_time(asset: &PhotoAsset) -> Option<NaiveDateTime> {
-    let file = std::fs::File::open(
-        asset
-            .files
-            .get(FileKind::Jpeg)
-            .or_else(|| asset.files.get(FileKind::Raw))?,
-    )
-    .ok()?;
+fn get_thumbnail(exif: &exif::Exif) -> Option<Vec<u8>> {
+    let thumb_offset_field =
+        exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)?;
+    let thumb_len_field =
+        exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL)?;
 
-    let mut bufreader = std::io::BufReader::new(file);
+    let thumb_offset = match thumb_offset_field.value {
+        exif::Value::Long(ref v) => *v.first()? as usize,
+        _ => return None,
+    };
 
-    let exif_container = exif::Reader::new()
-        .read_from_container(&mut bufreader)
-        .ok()?;
+    let thumb_len = match thumb_len_field.value {
+        exif::Value::Long(ref v) => *v.first()? as usize,
+        _ => return None,
+    };
 
-    let capture_date_time_field =
-        exif_container.get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)?;
+    let buf = exif.buf();
+    let thumb = buf.get(thumb_offset..thumb_offset + thumb_len)?;
+
+    Some(thumb.to_vec())
+}
+
+fn get_capture_time(exif: &exif::Exif) -> Option<NaiveDateTime> {
+    let capture_date_time_field = exif.get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)?;
 
     let capture_date_time_val_bytes = match capture_date_time_field.value {
         exif::Value::Ascii(ref vec) => vec.first()?,
@@ -137,17 +154,45 @@ fn read_capture_time(asset: &PhotoAsset) -> Option<NaiveDateTime> {
     Some(capture_date_time)
 }
 
-pub fn enrich_captured_at(assets: &mut HashMap<AssetKey, PhotoAsset>) {
-    let asset_keys_with_date_times: Vec<(AssetKey, Option<NaiveDateTime>)> = assets
+fn read_exif_container(asset: &PhotoAsset) -> Option<exif::Exif> {
+    let file = std::fs::File::open(
+        asset
+            .files
+            .get(FileKind::Jpeg)
+            .or_else(|| asset.files.get(FileKind::Raw))?,
+    )
+    .ok()?;
+
+    let mut bufreader = std::io::BufReader::new(file);
+
+    let exif_container = exif::Reader::new()
+        .read_from_container(&mut bufreader)
+        .ok()?;
+
+    Some(exif_container)
+}
+
+fn extract_exif_data(exif: &exif::Exif) -> ExifAssetData {
+    ExifAssetData {
+        captured_at: get_capture_time(exif),
+        thumbnail: get_thumbnail(exif),
+    }
+}
+
+pub fn enrich_assets(assets: &mut HashMap<AssetKey, PhotoAsset>) {
+    let asset_keys_with_exif_data: Vec<(AssetKey, ExifAssetData)> = assets
         .iter()
-        .map(|(key, asset)| (key.clone(), read_capture_time(asset)))
+        .filter_map(|(key, asset)| {
+            read_exif_container(asset)
+                .map(|exif_container| (key.clone(), extract_exif_data(&exif_container)))
+        })
         .collect();
 
-    for (key, dt) in asset_keys_with_date_times.into_iter() {
+    for (key, exif_data) in asset_keys_with_exif_data.into_iter() {
         let Some(asset) = assets.get_mut(&key) else {
             continue;
         };
-        asset.captured_at = dt;
+        asset.exif_data = exif_data;
     }
 }
 
@@ -281,25 +326,70 @@ mod tests {
     }
 
     #[test]
-    fn enrich_captured_at_test_no_exif_data_captured_at_not_filled_no_error() {
+    fn enrich_assets_test_no_exif_container_exif_data_not_filled_no_error() {
         let tmp_dir = tempfile::tempdir().expect("error creating tmp test dir");
         build_default_dir_structure(tmp_dir.path());
 
         let mut result: ScanResponse = scan_source_dir(tmp_dir.path());
-        enrich_captured_at(&mut result.assets);
+        enrich_assets(&mut result.assets);
 
         let result_assets: Vec<PhotoAsset> = result.assets.into_values().collect();
         for asset in result_assets {
-            assert!(asset.captured_at.is_none());
+            assert!(asset.exif_data.captured_at.is_none());
+            assert!(asset.exif_data.thumbnail.is_none());
         }
     }
 
     #[test]
-    fn enrich_captured_at_test_captured_at_filled_successfully() {
+    fn enrich_assets_test_thumbnail_filled_successfully() {
         let root_dir = "testdata/test_exif_read";
         let mut result: ScanResponse = scan_source_dir(Path::new(root_dir));
 
-        enrich_captured_at(&mut result.assets);
+        enrich_assets(&mut result.assets);
+        let got_thumb_from_jpeg = &result
+            .assets
+            .get(&AssetKey {
+                dir: PathBuf::from(root_dir),
+                stem: "img_1868".to_string(),
+            })
+            .expect("no asset found")
+            .exif_data
+            .thumbnail;
+        assert!(got_thumb_from_jpeg.is_some());
+        let thumb = got_thumb_from_jpeg.as_ref().expect("thumbnail missing");
+        assert!(thumb.starts_with(&[0xFF, 0xD8]));
+        assert!(thumb.ends_with(&[0xFF, 0xD9]));
+        assert!(
+            (2_000..64_000).contains(&thumb.len()),
+            "thumb size out of expected band: {} bytes",
+            thumb.len()
+        );
+        let got_thumb_from_cr2 = &result
+            .assets
+            .get(&AssetKey {
+                dir: PathBuf::from(root_dir),
+                stem: "img_1939".to_string(),
+            })
+            .expect("no asset found")
+            .exif_data
+            .thumbnail;
+        assert!(got_thumb_from_cr2.is_some());
+        let thumb = got_thumb_from_cr2.as_ref().expect("thumbnail missing");
+        assert!(thumb.starts_with(&[0xFF, 0xD8]));
+        assert!(thumb.ends_with(&[0xFF, 0xD9]));
+        assert!(
+            (2_000..64_000).contains(&thumb.len()),
+            "thumb size out of expected band: {} bytes",
+            thumb.len()
+        );
+    }
+
+    #[test]
+    fn enrich_assets_test_captured_at_filled_successfully() {
+        let root_dir = "testdata/test_exif_read";
+        let mut result: ScanResponse = scan_source_dir(Path::new(root_dir));
+
+        enrich_assets(&mut result.assets);
         assert_eq!(
             result
                 .assets
@@ -308,6 +398,7 @@ mod tests {
                     stem: "img_1800".to_string()
                 })
                 .expect("no asset found")
+                .exif_data
                 .captured_at
                 .expect("no captured_at field value found")
                 .to_string(),
@@ -318,13 +409,14 @@ mod tests {
                 .assets
                 .get(&AssetKey {
                     dir: PathBuf::from(root_dir),
-                    stem: "img_1915".to_string()
+                    stem: "img_1868".to_string()
                 })
                 .expect("no asset found")
+                .exif_data
                 .captured_at
                 .expect("no captured_at field value found")
                 .to_string(),
-            "2026-01-10 12:53:09"
+            "2026-01-10 12:46:27"
         );
         assert_eq!(
             // CR2 only file, this case tests the fallback raw dt read after jpg not found
@@ -335,6 +427,7 @@ mod tests {
                     stem: "img_1939".to_string()
                 })
                 .expect("no asset found")
+                .exif_data
                 .captured_at
                 .expect("no captured_at field value found")
                 .to_string(),

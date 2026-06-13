@@ -45,9 +45,9 @@ These are deliberate design decisions, not suggestions. When discussing implemen
 
 ## Status
 
-**Current phase:** Phase 2 — CPU-Bound Processing & Streaming (step 1 ✅ done; step 2 previews next)
+**Current phase:** Phase 2 — CPU-Bound Processing & Streaming (step 1 ✅; step 2 CPU core ✅; step 2 `make_preview` compose + IFD1 thumb ✅; RAW-only IFD0 preview + streaming next)
 
-**Last session:** 2026-06-11 — Phase 2 step 1: `captured_at` EXIF enrichment + cross-device read-concurrency measurement (SD vs SSD). Kept serial; all green.
+**Last session:** 2026-06-13 — Composed `make_preview_from_jpeg_bytes` (decode→resize→encode, `?`-funnelled) + rule-based `pick_scaling_factor` (re-derives 3/8 by long edge) + orientation-aware resize; IFD1 thumb extraction (`get_thumbnail(&Exif)`, free byte-slice); refactored EXIF reads to one open/parse + `extract_exif_data` builder + single-pass `enrich_assets`.
 
 ---
 
@@ -101,6 +101,28 @@ Per `docs/planning/global-plan.md`: read `DateTimeOriginal` with `kamadak-exif` 
 - Enrichment kept serial as the default; making read-concurrency a device-tuned permit count is Phase 3 semaphore-tier work.
 - Undated frames (`captured_at == None`) not yet routed — routing fallback (mtime? `unsorted/`?) still open.
 
-#### Step 2 — previews (next)
+#### Step 2 — previews (in progress)
 
-Decode parallel `.JPG` / extract embedded full-size preview for RAW-only (`rawler`/`rawloader`/`libraw`); downsample to ~1920px compressed JPEG bytes in memory; stream over a channel. First **CPU-bound** work where parallelism pays — where the deferred Rayon budget gets spent.
+Two compressed-JPEG outputs per asset, streamed (not stored on `PhotoAsset`): free embedded **160×120 thumb** (always-in-RAM placeholder) + generated **~1920px preview**. Message: `ProcessedPreview { key, thumb_jpeg, preview_jpeg }`.
+
+**CPU core — ✅ DONE (2026-06-12):**
+- `src/preview.rs` — `turbojpeg` scaled-decode → `fast_image_resize` (Lanczos3 → 1920) → `turbojpeg` encode. Currently split (`preview_from_jpeg_bytes`/`resize`/`compress`); to be composed into `make_preview(&[u8]) -> Option<Vec<u8>>` + `pick_scale`.
+- `examples/bench_preview.rs` — parallel timing harness (999× one in-RAM JPEG, thread + scaling-factor sweeps).
+- Deps: `turbojpeg` (libjpeg-turbo). `fast_image_resize`.
+- **Numbers (i7-1068NG7, 4 phys / 8 logical):** parallel scaling **4.26×** (1→8 threads: 100.5→23.5 s; near-linear to 4 physical, HT ~6%) — **inverse of step 1's I/O-bound result**. Scaled decode 1/1→3/8 = **2.7×** (decode dominates; resize self-funding). Embedded (exiftool): CR2 IFD0 = full-res 6240×4160 JPEG, IFD1 = 160×120 ~13 KB; **no mid-size embedded** → grid preview must be generated.
+- **Locked:** decode **3/8** (smallest downscale-only; 1/4 upscales, rejected) · **Lanczos3** (quality call, time-neutral) · RGB/U8x3.
+
+**Compose + thumb — ✅ DONE (2026-06-13):**
+- `src/preview.rs` — `make_preview_from_jpeg_bytes(&[u8]) -> Option<Vec<u8>>` (decode→resize→encode, all `?`-funnelled) + `pick_scaling_factor(src_dim, target)` (rule: smallest supported `M/8` with scaled edge ≥ target via `min_by_key`; **no reliance on factor-list order**; re-derives 3/8 for 6240→1920 from the real header long edge; `ScalingFactor::ONE` fallback for already-small sources) + **orientation-aware** `resize` (clamp long edge to 1920, scale short proportionally, assign 1920 to width/height by orientation).
+- `src/lib.rs` — IFD1 thumb: `get_thumbnail(&Exif) -> Option<Vec<u8>>` reads `JPEGInterchangeFormat`/`JPEGInterchangeFormatLength` at `In::THUMBNAIL`, fallible slice `buf.get(offset..offset+len)?` → free standalone-JPEG `to_vec()` (~13 KB, zero transcode). EXIF reads refactored to **one open/one parse**: `read_exif_container(&PhotoAsset)` → `get_capture_time(&Exif)` + `get_thumbnail(&Exif)` via `extract_exif_data(&Exif) -> ExifAssetData {captured_at, thumbnail}` (single extension point); `enrich_assets` folded to one `filter_map` pass (container drops in-closure → bounded memory). `captured_at` moved under `exif_data`.
+- Test: `enrich_assets_test_thumbnail_filled_successfully` asserts SOI `FF D8` / EOI `FF D9` + size band (proves a complete JPEG carved at correct boundaries).
+- **Memory model (5000 frames):** thumbs ~65 MB resident · compressed previews ~0.75–2.4 GB (~1.5 GB typical, persist-to-disk per plan) · decoded RGBA **~47 GB** (never resident → virtualized grid + LRU texture cache; ~64× compressed→decoded blow-up is why tier 3 must be LRU).
+
+**Remaining (next):** (3) RAW-only CR2 IFD0 full-res preview path (`In::PRIMARY` Strip tags → embedded 6240×4160 JPEG → feeds `make_preview`; zero RAW decode); (4) `ProcessedPreview { key, thumb_jpeg, preview_jpeg }` channel streaming + two-tier concurrency (bounded card reads feeding CPU pool).
+
+**Known open items from step 2:**
+- Per-frame `Decompressor` (per-thread reuse = later optimization to measure).
+- Bench iterates one image 999× (CPU throughput proxy); real two-tier read+CPU measurement deferred to the streaming step.
+- Previews-to-disk (SQLite blob path) vs held-in-RAM — decided at step 4 (channel consumer).
+- EXIF `Orientation` (portrait frames stored landscape + tag) — display-time handling, parked.
+- Thumb test covers JPG path; CR2-only (`img_1939`) marker assertion suggested but not yet added.
