@@ -354,3 +354,40 @@ IFD1 thumb; (3) RAW-only CR2 IFD0 path; (4) `ProcessedPreview` channel streaming
   placeholder-first split until UI exists); **open** — lean message + engine-owned enriched asset store vs
   fat self-contained message (#3). Recommended build order: serial (`P_read=1, P_cpu=1`) baseline first, then
   layer the two pools onto a working, measurable stream.
+
+---
+
+## Session — 2026-06-14 — Step 4 built (streaming ingest) + Phase-2 measurement
+
+### What was built (Code Exception)
+
+- **Engine owns the data.** `Engine.scan_response: Arc<RwLock<ScanResponse>>`; `scan()` does walk + `enrich_assets` (stage-1 skeleton: date + 160×120 thumb + cached IFD0 strip ref). UI borrows to present; engine holds + processes. Decided over consumer-owns-store because later phases (clustering, replication, XMP) are engine ops over heavy owned state — cloning previews would be a memory disaster.
+- **`ingest()` spawns a background worker**, returns `crossbeam_channel::Receiver<IngestEvent>` (bounded 64). Worker: snapshot inputs under a brief read lock → **heavy work (read + decode + encode) lock-free** → brief per-asset write lock to store → `send` after lock released. This off-lock discipline is what avoids the deadlock (worker never holds a lock while blocked on a full channel).
+- **Read stages wired:** `read_source_bytes(kind, path, strip)` — RAW → seek-read embedded strip; JPEG → full read. Both `get_prioritized()` (RAW-first) so metadata and preview agree and pairs use the embedded preview.
+- **Seek machinery (stage 1):** `read_exif_header` reads a bounded **128 KiB** prefix via `Cursor` (not the 35 MB slurp) — measured 279× fewer bytes, 264× faster. **Stage 2:** `read_embedded_preview` seek-reads exactly the ~2 MB strip, bounded by file length.
+- **Error pattern adopted project-wide:** fallible fns return `Result<_, Box<dyn Error + Send + Sync>>` (preview pipeline converted from `Option`), errors recorded on `image_data.errors`, never silently dropped. Documented at top of CLAUDE.md.
+
+### Phase-2 measured numbers (879-asset Canon card, /Volumes/EOS_DIGITAL/DCIM, 8 cores)
+
+`bench_ingest` (scan+enrich, then ingest ×3) and `bench_read_threads` (read stage isolated, 2 vs 8 threads):
+
+| | cold | warm |
+|---|---|---|
+| scan + enrich (stage 1) | 14.4 s (61 fps) | 0.07 s (13 000 fps) |
+| ingest (read + decode + 2 encodes) | **154 s (6 fps)** | **~26 s (33 fps)** |
+| read-only, 2 threads | 158 s (6 fps, **20 MB/s**) | 0.59 s (1490 fps) |
+| read-only, 8 threads | 158 s (6 fps, **20 MB/s**) | 0.46 s (1900 fps) |
+
+### Lessons (measured)
+
+- **The pipeline is read-bound on the card**, confirmed three ways: cold ≫ warm (154 vs 26 s, 6×), cold-ingest ≈ cold-read-only (154 ≈ 158 s — CPU fully hidden under I/O), and **2 threads ≈ 8 threads cold** (158 ≈ 158 s).
+- **Card ceiling ≈ 20 MB/s, thread-count-independent.** You cannot parallelise past the device; concurrency on cold card reads is neutral (large reads) to harmful (step-1 small reads, −28%). → cap `card_read_permits` at 1–2; it costs zero throughput. The two-tier split's value is *freeing CPU threads parked on I/O*, not speed.
+- **CPU floor ≈ 26 s / 33 fps** (warm). On SSD/NVMe the pipeline flips to CPU-bound (step-2's 4.26× scaling regime). Device decides the regime.
+- **Only cold speed lever = fewer bytes** → validates embedded-preview-for-pairs (~3 MB vs ~6 MB JPEG ≈ halves paired read at 20 MB/s) and never slurping full RAWs.
+- **Streaming saves the UX, not raw speed:** cold *completion* 154 s, but time-to-interaction ≈ 14 s (skeleton: tree + placeholders), then previews stream at 6 fps. Photographer culls immediately.
+
+### Artifacts
+
+- `crates/ingot_core/src/engine.rs` — `Engine`/`EngineConfig`/`IngestEvent`/`IngestMessage`, `ingest` worker, `read_source_bytes`.
+- `crates/ingot_core/examples/bench_ingest.rs`, `bench_read_threads.rs` — the measurement harnesses.
+- `cargo test --workspace` 11 green · clippy clean.
