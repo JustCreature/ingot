@@ -391,3 +391,16 @@ IFD1 thumb; (3) RAW-only CR2 IFD0 path; (4) `ProcessedPreview` channel streaming
 - `crates/ingot_core/src/engine.rs` — `Engine`/`EngineConfig`/`IngestEvent`/`IngestMessage`, `ingest` worker, `read_source_bytes`.
 - `crates/ingot_core/examples/bench_ingest.rs`, `bench_read_threads.rs` — the measurement harnesses.
 - `cargo test --workspace` 11 green · clippy clean.
+
+### Same session — plan sync + new Phase 6
+
+- **Reviewed run_processing_worker** (idiomatic): extracted `read_source_bytes` helper, unified the store+send (one brief write scope, no duplicated arms), `tx.send().ok()` instead of `.expect()`. `read_embedded_preview` bound switched from a magic 64 MB cap to **file-length** (`offset+len ≤ file_len`, free fstat) — bounds allocation by a fact, never false-rejects a large legit preview.
+- **Discussed caches** (the cold→warm gap = OS page cache). Conclusion: warming *moves* the unavoidable 20 MB/s read into idle time (latency hiding), it does not beat the device; for ingot "warming" = eager `scan`+`ingest` (engine stores decoded previews, better than page-cache priming). Cross-device parallelism is the one real win.
+- **global-plan.md updated:** Phase 2 Step 3 rewritten to **engine-owns-data** (was app-owns/engine-stateless); pair preview-source marked RESOLVED (embedded); added a measured-numbers table + read-bound findings; error-handling pattern noted; "Changes from v1" items 1 (kamadak handles CR2 embedded preview) + 13–16 added; **new Phase 6: Performance & Pre-warming** (auto-detect/auto-start on card insert, per-device parallel pipelines, prioritized/cancellable loupe prefetch, with the "warming ≠ throughput" caveats).
+- CLAUDE.md: step-4 detail block replaced with ✅ DONE+MEASURED summary; open items pruned to next-phase/deferred-with-rationale.
+
+---
+
+## Phase 2 — FINALISED 2026-06-14 (`--v--FORCE`)
+
+Steps 1–4 complete and measured (full record in CLAUDE.md Phase 2 block; reports in `docs/lessons/phase-2/`). 7 items carried forward (two-tier split, previews-to-disk, EXIF orientation, Decompressor reuse, multi-format extraction, main.rs cleanups, Phase 6). Next: **Phase 3 — Asynchronous I/O Engine** (read-once fan-out replication + BLAKE3 verify + type-gated deletion), shaped by the measured ~20 MB/s card ceiling.

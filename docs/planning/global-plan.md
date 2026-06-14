@@ -117,7 +117,7 @@ The card is the bottleneck, so the engine reads it as little as possible and as 
 | Stage | Read | Who runs it | Feeds |
 |---|---|---|---|
 | **1 — skeleton** | **header-only**, tiny (seek machinery) | **every** asset | `DateTimeOriginal` → greyed target-folder tree; embedded 160×120 IFD1 thumb → instant grid placeholder |
-| **2 — embedded seek** | `pread` just the embedded-JPEG strip (~2–3 MB) | assets **with a RAW** (RAW-only always; pair only if measurement favours it) | the good 512 grid thumb + 1920 loupe preview |
+| **2 — embedded seek** | `pread` just the embedded-JPEG strip (~2–3 MB) | assets **with a RAW** (RAW-only *and* pairs — resolved: embedded over JPEG, halves per-pair read) | the good 512 grid thumb + 1920 loupe preview |
 | **3 — full read + fan-out** | whole file, **once** | **replication** (every kept file) | the targets; **and** previews for JPEG-source assets (the copy read tees into the decode) |
 
 Key facts driving this:
@@ -128,22 +128,31 @@ Key facts driving this:
 - **Preview-source choice per asset type:**
   - **RAW-only** → stage 2 seek-extract (no choice; the only viable preview is the embedded JPEG). Top-priority fast path.
   - **JPEG-only** → stage 3. A JPEG is a monolithic stream (no targeted shortcut to a small preview), but its full read is the **same read replication owes** — fan it out (read once → decode previews **and** write to targets). It is *not* an extra "scan for previews."
-  - **Pair (RAW+JPEG)** → **measurement decides**: seek the ~3 MB embedded strip (half the bytes, lower quality, non-contiguous read) vs sequentially read the ~6 MB JPEG (higher quality, readahead-friendly). Half the bytes does *not* guarantee half the time on flash; and both files get copied regardless. Measure bytes + wall time on a real card and eyeball the embedded 1:1 quality before locking.
+  - **Pair (RAW+JPEG)** → **embedded preview (RESOLVED).** On a ~20 MB/s card-bound pipeline (measured), reading the smaller embedded strip (~3 MB) instead of the standalone JPEG (~6 MB) roughly halves per-pair read time; the lower embedded quality is the accepted tradeoff for triage speed. `get_prioritized` is RAW-first so metadata and preview agree on the source.
 - **Two subsystems, not three peers.** A *preview subsystem* (stage 1 skeleton + stage 2/3 good-preview) tuned for triage latency, and a *replication subsystem* (stage 3) that copies everything and lends its read to previews when the file being copied is itself a JPEG. RAW-only frames still hit stage 3 — for copying, not previewing.
 
-### Step 3 — Streaming channel (two-pass)
+### Step 3 — Streaming channel (engine owns the data)
 
-A multi-producer channel (`crossbeam-channel`; prefer it over `std::sync::mpsc` so the read/CPU stages can be MPMC without a rewrite). The stream is **two-pass**, matching the read stages:
+**The engine owns the asset store** — `Engine.scan_response: Arc<RwLock<ScanResponse>>` — and the UI borrows it to present. (An earlier draft inverted this: app-owns-data, engine-stateless. It was changed because later phases that *re-process the heavy data* — clustering, replication, XMP — are engine operations over owned state; cloning multi-MB previews into a stateless engine would be a memory disaster. The engine is a stateful aggregate that encapsulates the data and the methods over it.)
 
-```rust
-// Pass A — skeleton sweep across ALL assets first (header-only, fast):
-//   the date-folder tree + placeholder grid fill before any heavy preview renders.
-SkeletonReady { key, captured_at, thumb_jpeg /* 160×120 */, raw_strip_offset }
-// Pass B — good previews stream in behind the skeleton (stage 2 seek / stage 3 read):
-PreviewReady  { key, thumb_jpeg /* 512 */, preview_jpeg /* 1920 */ }
-```
+Two passes map onto the two read stages:
 
-The skeleton sweep runs across *all* assets before pass B does heavy work on any single one — otherwise asset 1's 1920 encode blocks asset 50's date, and the tree fills slowly. The consumer owns the single asset store (from `scan()`); it applies `captured_at` from pass A (lights up the tree), paints placeholders, then upgrades cells as pass B arrives. The engine stays stateless about the store — the message carries the deltas, not a duplicate store.
+- **`scan()` = stage-1 skeleton, synchronous.** Walk + `enrich_assets`: header-only reads populate, for every asset, `captured_at` (→ date-folder tree), the 160×120 IFD1 thumb (→ instant grid placeholder), and the cached IFD0 strip ref (→ stage 2). Fast (measured cold ~14 s / 879 frames), so the UI gets its full skeleton before any heavy work begins.
+- **`ingest()` = stage-2/3 previews, streamed in the background.** Spawns a worker, returns a bounded `crossbeam_channel::Receiver<IngestEvent>` (prefer crossbeam over `std::sync::mpsc` for MPMC), and streams a **lean notification per asset** — `IngestEvent::Preview { key, error }`, *not* the bytes. On each message the UI takes a brief read lock and reads that asset's freshly-stored preview from the engine store by key.
+
+**Lock discipline (the subtle part that makes engine-owned data work).** The worker must never hold the store lock across the heavy work, or it serialises the UI and deadlocks the bounded channel. Pattern: snapshot the per-asset inputs (key, path, strip ref) under one brief read lock → **read + decode + encode entirely lock-free** → take a brief *per-asset* write lock to store the result → release → *then* `send`. A task blocked on a full channel holds no lock, so the UI always drains. The message is lean because the data already lives in the engine; errors are recorded on the asset (`image_data.errors`) and the notification carries only `error: bool`, so the cause stays inspectable.
+
+> **Error-handling pattern (project-wide):** fallible functions return `Result<_, Box<dyn Error + Send + Sync>>`, never a bare `Option` that swallows the cause. Errors are recorded (on `image_data.errors`) and, where relevant, surfaced to the UI — one bad frame never aborts the batch, and the failure stays observable. `Option` is reserved for genuine *absence* (e.g. no embedded thumbnail), not failure.
+
+#### Measured (Phase 2 — 879-asset Canon card, 8 cores)
+
+| | cold | warm |
+|---|---|---|
+| scan + enrich (stage 1) | 14.4 s (61 fps) | 0.07 s |
+| ingest (read + decode + 2 encodes) | **154 s (6 fps)** | **~26 s (33 fps)** |
+| read-only stage, 2 threads / 8 threads | **158 s / 158 s ≈ 20 MB/s** | sub-second |
+
+**The pipeline is read-bound on the card**, confirmed three ways: cold ≫ warm (6×); cold-ingest ≈ cold-read-only (CPU fully hidden under I/O); **2 ≈ 8 threads cold** (identical). The card is a fixed ~20 MB/s pipe — concurrency cannot beat it, so cap source-card reads at **1–2** (frees CPU threads otherwise parked on I/O, at zero throughput cost; the two-tier split is resource hygiene, not a speedup). CPU floor ≈ **33 fps**; on SSD/NVMe the pipeline flips CPU-bound (the step-2 4.26× regime). The only cold speed lever is **reading fewer bytes** (embedded-over-JPEG for pairs; never slurp full RAWs). Streaming makes *time-to-interaction* ≈ the 14 s skeleton, not the 154 s completion.
 
 ---
 
@@ -262,6 +271,34 @@ Add a step to the Phase 2 pool: compute a perceptual hash (pHash) on the *downsa
 
 ---
 
+## Phase 6: Performance & Pre-warming (last — latency hiding, not throughput)
+
+Layered on once the core pipeline works. **Framing, grounded in the Phase-2 measurement:** none of this makes a *single* card faster — the card is a fixed ~20 MB/s pipe. These features (a) overlap the unavoidable read with the user's think-time, and (b) exploit the *one* real parallelism win, **distinct physical devices**.
+
+### Step 1 — Auto-detect + auto-start (warm during idle time)
+
+Detect removable volumes and kick the pipeline without waiting for an explicit "import":
+
+- **Enumerate at startup:** macOS removable volumes mount under `/Volumes` (removable flag via DiskArbitration / `diskutil`); cross-platform listing via `sysinfo`.
+- **React to insertion:** subscribe to mount events — **DiskArbitration** (macOS), **udev** (Linux), **WM_DEVICECHANGE** (Windows) — so a card inserted while the app runs auto-starts `scan` + `ingest`.
+- **"Warming" for ingot = running `scan`+`ingest` eagerly, not priming the OS page cache.** The engine reads + decodes + stores the finished preview in its own RAM, so eager ingest is strictly better than page-cache priming (which would leave the decode undone). The streaming architecture already runs the card read during think-time; this just *triggers* it on detection instead of on a button press.
+
+### Step 2 — Per-device parallel pipelines (the real parallelism win)
+
+Concurrency only helps across *distinct physical devices* — each has its own ~20 MB/s pipe, so N cards ≈ N× aggregate. Same card, more threads = no gain (measured 2 ≈ 8). So: **one read-tier per detected device** (each capped at 1–2 reads), devices processed in parallel, all feeding the shared CPU pool (ample — the CPU floor is ~33 fps, far above what one or two cards deliver).
+
+### Step 3 — Prioritized, cancellable prefetch (esp. the 1:1 loupe)
+
+Don't slurp the whole card speculatively — the read budget is finite and the user may want only a few frames. Warm **prioritized** (visible grid range first, expand outward), **cancellable** (redirect on scroll/select), and **RAM-bounded**. The highest-value targeted prefetch is the **1:1 loupe**: pre-read the full-res bytes of frames *adjacent to the user's focus* so zoom / arrow-key is instant — the one place ingot re-reads bytes it didn't already store. Explicit page-cache hints exist (`F_RDADVISE` macOS / `posix_fadvise(WILLNEED)` Linux / `madvise(WILLNEED)`), but the simplest warm is just reading the bytes.
+
+### Caveats (measured constraints, not opinions)
+
+- Cache warming **moves** the read earlier (overlapping idle time); it does **not** beat the device. Total work is unchanged — you cannot warm 3 GB of card in under ~150 s at 20 MB/s.
+- Eager full-card reads waste the limited read budget if the user wants few frames → keep prefetch prioritized + cancellable.
+- Dominant cache = the OS **page cache** (unified buffer cache): bytes held in RAM after first read, served at GB/s vs the card's 20 MB/s. Secondary: VFS dentry/inode cache (path lookups), device readahead.
+
+---
+
 ## Consolidated Dependencies (and exactly what each does)
 
 | Crate | Role | Notes |
@@ -284,7 +321,7 @@ Add a step to the Phase 2 pool: compute a perceptual hash (pHash) on the *downsa
 
 ## Changes from v1 (summary)
 
-1. **Crate roles split:** `kamadak-exif` reads the date only; a separate writer crate handles `xmp:Rating`; RAW-only previews need a RAW crate.
+1. **Crate roles split:** `kamadak-exif` reads the date *and* (via `StripOffsets`/`StripByteCounts`) locates the CR2 full-size embedded preview — no RAW crate needed for Canon; a RAW crate is only required to add *other* formats (NEF/ARW/RAF/DNG). A separate writer crate handles `xmp:Rating`.
 2. **Ratings go to XMP for both files** (`xmp:Rating`, −1..5), never to a nonexistent EXIF rating tag, and never by rewriting pixel data.
 3. **Read-once, fan-out copy** replaces per-target `copy()` (no more N× source reads); writes go to temp then atomic-rename.
 4. **Two semaphore tiers:** cap source-card *reads* (1–2) as well as per-target *writes*.
@@ -296,3 +333,7 @@ Add a step to the Phase 2 pool: compute a perceptual hash (pHash) on the *downsa
 10. **Date handling:** `DateTimeOriginal` + `SubSecTimeOriginal`; ISO sortable folders (`2026-05-12`).
 11. **Storage choices:** `rusqlite` over `sled`; blobs as files-on-disk.
 12. **Honesty notes:** `tokio::fs` is threadpool-backed; consecutive-frame clustering is single-linkage and can chain.
+13. **Engine owns the data** (`Arc<RwLock<ScanResponse>>`), not the app — a stateful aggregate, because later phases (clustering/replication/XMP) re-process the heavy owned data; the streamed message is a *lean notification*, not the bytes (Phase 2 Step 3).
+14. **Seek machinery, two read stages:** stage-1 reads only a ~128 KiB header (not kamadak's whole-file slurp — measured 264× faster); stage-2 seek-reads just the embedded-preview strip. Bounded by file length, not a magic constant.
+15. **Error-handling pattern:** fallible functions return `Result<_, Box<dyn Error + Send + Sync>>` and record errors (never silent `Option`-swallowing); `Option` is for genuine absence only.
+16. **Measured read-bound floor:** on a real card the pipeline is read-bound at ~20 MB/s (concurrency can't beat one device; 2≈8 threads). Drives the device-tuned read permits and the new **Phase 6** (cross-device parallelism + prefetch — latency hiding, not throughput).

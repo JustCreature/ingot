@@ -54,7 +54,7 @@ These are deliberate design decisions, not suggestions. When discussing implemen
 
 ## Status
 
-**Current phase:** Phase 2 — CPU-Bound Processing & Streaming — **steps 1–4 ✅** (capture-time; IFD1 thumb + `make_preview`/`make_thumbnail`; RAW-only IFD0 preview; **step 4 streaming ingest built + measured**). Phase 2 essentially complete — ready to finalise (`--v`).
+**Current phase:** Phase 3 — Asynchronous I/O Engine (replication: read-once fan-out + BLAKE3 verify; type-gated deletion sweep). **Not started.** Phase 2 finalised 2026-06-14 via `--v--FORCE` (steps 1–4 complete + measured; 7 items carried forward — see Phase 2 record below).
 
 **Last session:** 2026-06-14 — **Step 4 built + Phase-2 measured.** Engine now owns the data (`Arc<RwLock<ScanResponse>>`); `ingest()` spawns a background worker (snapshot → lock-free read+decode+encode → brief per-asset write → `send`), streams `IngestEvent` over a bounded crossbeam channel. Seek machinery: stage-1 128 KiB header read (`read_exif_header`, 264× faster than the slurp) + stage-2 `read_embedded_preview` seek-read (~2 MB, file-len-bounded). Project-wide error pattern: `Result<_, Box<dyn Error+Send+Sync>>`, errors recorded on `image_data.errors`, never silent `None` (documented at top of CLAUDE.md). **Measured (879-asset card): pipeline is read-bound** — cold ingest 154 s (6 fps) ≈ cold read-only, 2≈8 threads ≈ 20 MB/s card ceiling; warm/CPU floor ~26 s (33 fps). `cargo test --workspace` 11 green, clippy clean.
 
@@ -90,9 +90,29 @@ These are deliberate design decisions, not suggestions. When discussing implemen
 
 ---
 
-### Phase 2 — CPU-Bound Processing & Streaming (in progress)
+### Phase 2 — CPU-Bound Processing & Streaming — ✅ COMPLETE (finalised 2026-06-14, `--v--FORCE`)
 
-Per `docs/planning/global-plan.md`: read `DateTimeOriginal` with `kamadak-exif` (read-only, date-only) to populate `PhotoAsset.captured_at` (feeds `build_destination_path`); decode parallel `.JPG` / extract full-size embedded preview for RAW-only (needs `rawler`/`rawloader` or `libraw`, per resolved scoping decision #1); downsample to ~1920px **compressed JPEG bytes in memory**; stream processed assets to the UI over an mpsc/crossbeam channel.
+**Learning objectives (met):**
+- I/O-bound vs CPU-bound, and why parallelism helps one and hurts the other (measured both directions, both flip by device).
+- Reading *only the bytes you need*: bounded EXIF header read + targeted embedded-preview seek-read (vs whole-file slurp).
+- Streaming ingest with **engine-owned state** + correct lock discipline (no lock held during heavy work).
+- End-to-end measurement proving the pipeline is **read-bound on the card** (~20 MB/s, device-fixed).
+
+**Artifacts:** `crates/ingot_core/src/` — `metadata.rs` (`read_exif_header` 128 KiB prefix, `read_embedded_preview` seek, `enrich_assets`), `preview.rs` (`make_preview`/`make_thumbnail`, `Result`-based), `engine.rs` (`Engine`/`EngineConfig`/`IngestEvent`/`read_source_bytes`, `Arc<RwLock<ScanResponse>>` streaming worker), `asset.rs` (`ImageData`, `PreviewStrip`, error aliases). Benches: `bench_enrich`, `bench_preview`, `bench_ingest`, `bench_read_threads`. Reports: `docs/lessons/phase-2/{long,short}-report.md`. `cargo test --workspace` 11 green, clippy clean.
+
+**Key numbers (measured, 879-asset Canon card, i7-1068NG7 4P/8L):** enrichment cold serial 4.85 s (181 fps) vs parallel 6.20 s (−28% on SD; +3.7× on SSD — device property). Preview parallel scaling 4.26× (1→8 threads). Scaled decode 3/8 = 2.7× over 1/1. Header read 128 KiB vs 36 MB slurp = 264× faster. **End-to-end ingest: cold 154 s (6 fps) / warm ~26 s (33 fps); read-only 2≈8 threads ≈ 20 MB/s — read-bound, three ways.**
+
+**Lessons (proved by measurement):**
+- Optimal source-read concurrency is a **device property**, not a constant; the card is a fixed ~20 MB/s pipe you can't parallelize past (2≈8 threads) → cap `card_read_permits` 1–2.
+- Cold ingest ≈ cold read-only → CPU is hidden under I/O; CPU floor ~33 fps, and an SSD source flips the pipeline CPU-bound. The only cold lever is fewer bytes (embedded-for-pairs).
+- Engine-owned `Arc<RwLock>` + background worker is only correct with strict lock scope; holding the write lock across the loop kills streaming *and* deadlocks the bounded channel.
+- Errors are data: `Result<_, Box<dyn Error + Send + Sync>>`, recorded not swallowed.
+
+**Open items carried forward (deferred-with-rationale / next-phase):** (1) two-tier read/CPU split — CPU-thread hygiene, not a speedup; (2) previews-to-disk vs in-RAM — Phase 4; (3) EXIF `Orientation` — display-time; (4) per-thread `Decompressor` reuse; (5) multi-format embedded extraction (`rawler`/`libraw`); (6) `main.rs` demo cleanups (`ingot_bench_preview.JPG`, `tx.send().expect`→graceful, lock-poison policy, Arc-wrap previews); (7) **Phase 6** (auto-detect/auto-start, per-device parallel, loupe prefetch).
+
+---
+
+Per `docs/planning/global-plan.md`: read `DateTimeOriginal` with `kamadak-exif` (read-only, date-only) to populate `PhotoAsset.captured_at` (feeds `build_destination_path`); decode parallel `.JPG` / extract full-size embedded preview for RAW-only; downsample to ~1920px **compressed JPEG bytes in memory**; stream processed assets to the UI over a crossbeam channel.
 
 #### Step 1 — capture-time enrichment — ✅ DONE (2026-06-11)
 
@@ -137,28 +157,24 @@ Two compressed-JPEG outputs per asset, streamed (not stored on `PhotoAsset`): fr
 - **Probe numbers (`IMG_1939.CR2`):** `buf().len()` = 36,599,837 B (whole file — kamadak-exif holds the entire CR2) · `StripByteCounts` = 2,039,424 B (single-strip full-res ~1.95 MB) · turbojpeg decoded it → 1920px output visually verified. → slice-from-`buf()` is the correct extraction (seek-read would re-read; file already resident); 36 MB/CR2 resident is bounded by step-4 read-permit tier (~1–2 alive).
 - **Three preview tiers:** IFD1 160×120 placeholder → generated 512 grid thumb → generated 1920 loupe preview (also the streaming order).
 
-**Remaining (next): step 4 — streaming ingest.** Designed in guide mode 2026-06-13 (see global-plan Phase 2 §"three read stages" + §"Streaming channel (two-pass)"). The card is the bottleneck → read as little/late as possible. **Three read stages** (a different axis from Phase 3's concurrency tiers):
-- **Stage 1 — skeleton** (header-only, *seek machinery*, every asset): `DateTimeOriginal` → greyed target tree; 160×120 IFD1 thumb → instant grid placeholder. **Caches the IFD0 strip offset** it parses, so stage 2 needs no second header read.
-- **Stage 2 — embedded seek** (assets *with a RAW*): `pread` only the embedded-JPEG strip (~2–3 MB) using the cached offset → 512 + 1920 previews. **Mandatory, not an optimization:** kamadak slurps the *whole* 36 MB CR2 for `buf()`; targeted `pread` = ~12× less I/O on the primary (RAW-only) path.
-- **Stage 3 — full read + fan-out** (replication; every kept file): read whole file once → write all targets; **also previews JPEG-source assets** (the copy read tees into decode — not an extra scan).
+#### Step 4 — streaming ingest — ✅ DONE + MEASURED (2026-06-14)
 
-**Preview-source by type:** RAW-only → stage 2 (only viable source); JPEG-only → stage 3 (full read = the replication read, fan out); pair → **measurement decides** (seek ~3 MB embedded, lower-quality/non-contiguous, vs sequential ~6 MB JPEG, higher-quality/readahead). Two subsystems: *preview* (stages 1+2/3, triage-latency) + *replication* (stage 3, copies everything, lends its read to JPEG previews).
+Built (Code Exception). Full design in global-plan Phase 2 §"three read stages" + §"Streaming channel (engine owns the data)"; full numbers in `docs/sessions/phase-2/main-session.md` (2026-06-14).
 
-**Two-pass stream:** `SkeletonReady { key, captured_at, thumb_jpeg/160, raw_strip_offset }` (pass A, sweep ALL assets first → tree+placeholders) → `PreviewReady { key, thumb_jpeg/512, preview_jpeg/1920 }` (pass B). Consumer owns the asset store (from `scan()`); engine stateless, messages carry deltas. `captured_at` moves to pass A (was in `ProcessedPreview`).
+- **Engine owns the data:** `Engine.scan_response: Arc<RwLock<ScanResponse>>`; UI borrows to present. (Reversed the earlier app-owns/engine-stateless plan — later phases re-process heavy owned data.) `scan()` = synchronous stage-1 skeleton (walk + `enrich_assets`: date + 160×120 thumb + cached IFD0 strip ref). `ingest()` spawns a background worker, returns bounded `crossbeam_channel::Receiver<IngestEvent>`, streams **lean notifications** (`IngestEvent::Preview { key, error }`) — the UI reads the data from the store by key.
+- **Lock discipline:** worker snapshots inputs (brief read lock) → **read + decode + encode lock-free** → brief per-asset write lock to store → `send` after release. No lock held while blocked on the channel → no deadlock.
+- **Read stages wired:** `read_source_bytes` (RAW → `read_embedded_preview` seek-read ~2 MB; JPEG → full read), both `get_prioritized()` RAW-first so metadata + preview agree → **pairs use the embedded preview**. Seek machinery: `read_exif_header` 128 KiB prefix (264× faster than slurp) + `read_embedded_preview` file-len-bounded seek.
+- **Error pattern (project-wide):** `Result<_, Box<dyn Error + Send + Sync>>`, errors recorded on `image_data.errors`, never silent `None` (documented at top of this file). `preview.rs` converted from `Option`.
+- **Measured (879-asset card, 8 cores):** scan+enrich cold 14.4 s (61 fps); ingest cold **154 s (6 fps)** / warm **~26 s (33 fps)**; read-only **2≈8 threads ≈ 20 MB/s**. **Read-bound on card** (cold≫warm, cold-ingest≈cold-read, 2≈8). Card ceiling is device-fixed → cap `card_read_permits` 1–2 (CPU-thread hygiene, not a speedup). CPU floor ~33 fps; SSD flips it CPU-bound. Only cold lever = fewer bytes.
+- **Artifacts:** `engine.rs` (`Engine`/`EngineConfig`/`IngestEvent`/`IngestMessage`/`read_source_bytes`); `examples/bench_ingest.rs` + `bench_read_threads.rs`. `cargo test --workspace` 11 green, clippy clean.
 
-**Why embedded < standalone JPEG at same res:** harder-compressed throwaway (low quality factor, 4:2:0, coarse quant) — RAW is the master. Standalone `.JPG` is higher quality → prefer for 1:1 focus; only byte-count favours embedded.
-
-**Next concrete step — the spike** (before serial baseline): on one frame each of {RAW-only CR2, JPEG-only, pair} measure **bytes read + wall time** for slurp-vs-seek (CR2) and sequential-JPEG-vs-seek-embedded (pair), find the header-prefix size that captures the IFD0 offset, and eyeball embedded 1:1 quality. Settles the pair decision + stage-1/2 fusion. Then build the serial baseline (one worker, one channel) before layering the two pools.
-
-**Known open items from step 2:**
-- Per-frame `Decompressor` (per-thread reuse = later optimization to measure).
-- Bench iterates one image 999× (CPU throughput proxy); real two-tier read+CPU measurement deferred to the streaming step.
-- Previews-to-disk (SQLite blob path) vs held-in-RAM — decided at step 4 (channel consumer).
-- EXIF `Orientation` (portrait frames stored landscape + tag) — display-time handling, parked.
-- Step-4 message contract — **RESOLVED 2026-06-13:** two-pass, **consumer owns the store**, engine stateless, messages carry deltas. `SkeletonReady {key, captured_at, thumb_jpeg/160, raw_strip_offset}` → `PreviewReady {key, thumb_jpeg/512, preview_jpeg/1920}`. `captured_at` belongs to pass A (skeleton), not the preview message.
-- Step-4 **pair preview-source** — OPEN, resolved by spike: seek embedded (~3 MB) vs read standalone JPEG (~6 MB). Decided by measured bytes+time on a real card + embedded 1:1 quality eyeball.
-- Step-4 build order: spike (3 read strategies on {RAW-only, JPEG-only, pair}) → serial `P_read=1/P_cpu=1` baseline (one worker, one `crossbeam-channel`) → layer the two pools.
-- `get_embedded_preview_from_tiff_like` currently slices from kamadak's full `buf()` (36 MB resident). Step-4 stage 2 replaces this with targeted `pread` of the cached IFD0 strip offset (~3 MB). Multi-format extraction (NEF/ARW/RAF/DNG) → `rawler`/`libraw` later.
-- Nothing committed yet — the workspace refactor (staged renames + new module files) awaits review/commit.
+**Phase-2 open items carried forward (next-phase or deferred-with-rationale):**
+- **Two-tier read/CPU split** — deferred; measurement says it's *not* a throughput win (card is the wall), only CPU-thread hygiene. Not blocking.
+- Previews-to-disk (SQLite blob path) vs held-in-RAM (~1.5 GB / 5000) — decide when the UI lands (Phase 4 LRU/texture-cache).
+- EXIF `Orientation` (portrait stored landscape + tag) — display-time, parked.
+- Per-thread `Decompressor` reuse — micro-opt to measure later.
+- Multi-format embedded extraction (NEF/ARW/RAF/DNG) → `rawler`/`libraw` (Canon CR2 works via kamadak `StripOffsets`).
+- `main.rs` demo leaves `ingot_bench_preview.JPG` artifact; `tx.send().expect` → graceful "consumer gone" later; lock-poison policy; UI must take brief read locks (Arc-wrap previews).
+- **Phase 6** (new, plan end): auto-detect + auto-start on card insert, per-device parallel pipelines, prioritized/cancellable loupe prefetch — latency hiding, not throughput.
 
 **Resolved (was open, now done):** repo junk cleanup (`test_thumb/` + `example.JPG` git-removed, benches repointed/`CARGO_MANIFEST_DIR`, `.DS_Store` gitignored); `pub` visibility (crate boundary forced the audit → internals `pub(crate)`); `println!` removed; preview test repointed; CR2-only thumb marker added; `resize` threads `target_long_dim`; redundant casts dropped.
