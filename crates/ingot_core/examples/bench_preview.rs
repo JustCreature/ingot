@@ -8,7 +8,7 @@ fn main() {
     else {
         panic!("lol")
     };
-    let Some(new_image) = make_preview_from_jpeg_bytes(&src) else {
+    let Ok(new_image) = make_preview_from_jpeg_bytes(&src) else {
         panic!("lol3")
     };
     let out = std::env::temp_dir().join("ingot_bench_preview.JPG");

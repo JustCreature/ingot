@@ -143,15 +143,21 @@ impl Engine {
                 ) = match read_source_bytes(kind, &path, strip) {
                     Err(e) => (None, None, vec![e]),
                     Ok(jpeg) => {
-                        let thumb = make_thumbnail_from_jpeg_bytes(&jpeg);
-                        let preview = make_preview_from_jpeg_bytes(&jpeg);
                         let mut errors = Vec::new();
-                        if thumb.is_none() {
-                            errors.push(ImageProcessingError::from("error generating thumbnail"));
-                        }
-                        if preview.is_none() {
-                            errors.push(ImageProcessingError::from("error generating preview"));
-                        }
+                        let thumb = match make_thumbnail_from_jpeg_bytes(&jpeg) {
+                            Ok(t) => Some(t),
+                            Err(e) => {
+                                errors.push(format!("thumbnail generation failed: {e}").into());
+                                None
+                            }
+                        };
+                        let preview = match make_preview_from_jpeg_bytes(&jpeg) {
+                            Ok(p) => Some(p),
+                            Err(e) => {
+                                errors.push(format!("preview generation failed: {e}").into());
+                                None
+                            }
+                        };
                         (thumb, preview, errors)
                     }
                 };

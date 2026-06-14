@@ -4,6 +4,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Error-handling pattern (project-wide)
+
+**Fallible functions return `Result`, never a bare `Option` that swallows the cause.** A `None` throws away *why* something failed; errors are data we need for observability, and some must be surfaced to the UI. So:
+
+- The standard engine error type is `Box<dyn std::error::Error + Send + Sync>` (aliased per module, e.g. `PreviewError`, `MetadataError`, `ImageProcessingError`). `Send + Sync` is mandatory — errors travel across the ingest worker threads and are stored in the engine-owned asset.
+- Propagate with `?` (turbojpeg/fir/io errors auto-convert); add context when collapsing a typed error to a string (`format!("preview generation failed: {e}")`).
+- **Record, don't drop.** A failed asset still streams a message; its errors are collected into `PhotoAsset.image_data.errors` so the batch never aborts (one bad frame must not kill a 10k-card ingest) *and* the failure remains inspectable.
+- `Option` is still correct for genuine *absence* (e.g. a frame has no embedded thumbnail), not for *failure*.
+
 ## What this project is
 
 **Ingot** — a high-performance RAW+JPEG photo ingestion and triage engine, intended to be written in **Rust**. It competes with Photo Mechanic / FastRawViewer: ingest a camera card fast, let the photographer rate and cull *immediately* while files replicate to multiple storage targets in the background.

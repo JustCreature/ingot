@@ -1,25 +1,36 @@
+//! The preview pipeline: JPEG bytes in -> downscaled JPEG bytes out, via
+//! turbojpeg scaled-decode -> fast_image_resize (Lanczos3) -> turbojpeg encode.
+//!
+//! Every fallible step returns `Result<_, PreviewError>` and propagates the real
+//! underlying error with `?`, rather than collapsing to `None`. Errors are data
+//! we record and (where relevant) surface to the UI — see the error-handling
+//! pattern at the top of CLAUDE.md.
+
 use fast_image_resize as fir;
 
-pub fn make_preview_from_jpeg_bytes(src: &[u8]) -> Option<Vec<u8>> {
+/// Boxed error for the preview pipeline. `Send + Sync` so it can travel across
+/// the ingest worker threads and be stored in the engine-owned asset.
+pub type PreviewError = Box<dyn std::error::Error + Send + Sync>;
+
+pub fn make_preview_from_jpeg_bytes(src: &[u8]) -> Result<Vec<u8>, PreviewError> {
     let target_long_dim = 1920usize;
-    let new_image = get_resized_from_jpeg_bytes(src, target_long_dim)?;
-
-    Some(new_image)
+    get_resized_from_jpeg_bytes(src, target_long_dim)
 }
 
-pub fn make_thumbnail_from_jpeg_bytes(src: &[u8]) -> Option<Vec<u8>> {
+pub fn make_thumbnail_from_jpeg_bytes(src: &[u8]) -> Result<Vec<u8>, PreviewError> {
     let target_long_dim = 512usize;
-    let new_image = get_resized_from_jpeg_bytes(src, target_long_dim)?;
-
-    Some(new_image)
+    get_resized_from_jpeg_bytes(src, target_long_dim)
 }
 
-pub fn get_resized_from_jpeg_bytes(src: &[u8], target_long_dim: usize) -> Option<Vec<u8>> {
+pub fn get_resized_from_jpeg_bytes(
+    src: &[u8],
+    target_long_dim: usize,
+) -> Result<Vec<u8>, PreviewError> {
     let decompressed_image = decompress(src, target_long_dim)?;
     let resized_image = resize(decompressed_image, target_long_dim)?;
     let new_image = compress(resized_image)?;
 
-    Some(new_image)
+    Ok(new_image)
 }
 
 fn pick_scaling_factor(src_dim: usize, target_dim: usize) -> turbojpeg::ScalingFactor {
@@ -31,13 +42,16 @@ fn pick_scaling_factor(src_dim: usize, target_dim: usize) -> turbojpeg::ScalingF
         .unwrap_or(turbojpeg::ScalingFactor::ONE)
 }
 
-pub fn decompress(src: &[u8], target_long_dim: usize) -> Option<turbojpeg::Image<Vec<u8>>> {
-    let mut decompressor = turbojpeg::Decompressor::new().ok()?;
+pub fn decompress(
+    src: &[u8],
+    target_long_dim: usize,
+) -> Result<turbojpeg::Image<Vec<u8>>, PreviewError> {
+    let mut decompressor = turbojpeg::Decompressor::new()?;
 
-    let header = decompressor.read_header(src).ok()?;
+    let header = decompressor.read_header(src)?;
     let scaling: turbojpeg::ScalingFactor =
         pick_scaling_factor(header.width.max(header.height), target_long_dim);
-    decompressor.set_scaling_factor(scaling).ok()?;
+    decompressor.set_scaling_factor(scaling)?;
 
     let scaled_header = header.scaled(scaling);
 
@@ -52,33 +66,29 @@ pub fn decompress(src: &[u8], target_long_dim: usize) -> Option<turbojpeg::Image
 
     // decompress the JPEG into the image
     // (we use as_deref_mut() to convert from &mut Image<Vec<u8>> into Image<&mut [u8]>)
-    decompressor.decompress(src, image.as_deref_mut()).ok()?;
+    decompressor.decompress(src, image.as_deref_mut())?;
 
-    Some(image)
+    Ok(image)
 }
 
-pub fn compress(src: turbojpeg::Image<Vec<u8>>) -> Option<Vec<u8>> {
-    let mut compressor = turbojpeg::Compressor::new().ok()?;
-    compressor.set_quality(85).ok()?;
-
-    // compressor.compress(image, output)
+pub fn compress(src: turbojpeg::Image<Vec<u8>>) -> Result<Vec<u8>, PreviewError> {
+    let mut compressor = turbojpeg::Compressor::new()?;
+    compressor.set_quality(85)?;
 
     // initialize the output buffer
     let mut output_buf = turbojpeg::OutputBuf::new_owned();
 
     // compress the image into JPEG
     // (we use as_deref() to convert from &Image<Vec<u8>> to Image<&[u8]>)
-    compressor.compress(src.as_deref(), &mut output_buf).ok()?;
+    compressor.compress(src.as_deref(), &mut output_buf)?;
 
-    Some(output_buf.to_owned())
+    Ok(output_buf.to_owned())
 }
 
 pub fn resize(
     src: turbojpeg::Image<Vec<u8>>,
     target_long_dim: usize,
-) -> Option<turbojpeg::Image<Vec<u8>>> {
-    // resize(src)
-    // turbojpeg::Transform::op(turbojpeg::TransformOp::Transpose)
+) -> Result<turbojpeg::Image<Vec<u8>>, PreviewError> {
     let mut resizer = fir::Resizer::new();
 
     let long = src.width.max(src.height);
@@ -97,18 +107,17 @@ pub fn resize(
         src.height as u32,
         src.pixels,
         fir::PixelType::U8x3,
-    )
-    .ok()?;
+    )?;
 
     let resize_alg = fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3);
     let resize_opts = fir::ResizeOptions::new().resize_alg(resize_alg);
 
-    resizer.resize(&source, &mut dst, &resize_opts).ok()?;
+    resizer.resize(&source, &mut dst, &resize_opts)?;
 
     let dst_width = dst.width() as usize;
     let dst_height = dst.height() as usize;
 
-    Some(turbojpeg::Image {
+    Ok(turbojpeg::Image {
         pixels: dst.into_vec(),
         width: dst_width,
         pitch: 3 * dst_width,
