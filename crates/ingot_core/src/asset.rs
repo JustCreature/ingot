@@ -53,6 +53,18 @@ impl AssetFiles {
 
         None
     }
+
+    /// Returns a tuple of (FileKind, &Path) according to a priority, RAW -> JPEG -> None.
+    pub fn get_prioritized(&self) -> (FileKind, &Path) {
+        if let Some(path) = self.get(FileKind::Raw) {
+            return (FileKind::Raw, path);
+        }
+        let path = self.get(FileKind::Jpeg);
+        (
+            FileKind::Jpeg,
+            path.expect("asset should always have at least one file"),
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -73,12 +85,22 @@ pub struct PreviewStrip {
     pub len: usize,
 }
 
+pub(crate) type ImageProcessingError = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Debug)]
+pub struct ImageData {
+    pub preview: Option<Vec<u8>>,
+    pub thumb: Option<Vec<u8>>,
+    pub full: Option<Vec<u8>>,
+    pub errors: Option<Vec<ImageProcessingError>>,
+}
+
 /// Everything we pull out of one EXIF parse: cheap metadata only. The heavy
 /// full-size embedded preview is *not* here — only a `PreviewStrip` *reference*
 /// to it, so the metadata pass stays header-only. The bytes feed the CPU stage
 /// via a separate seek-read. Add a new property by adding a field here plus a
 /// line in `metadata::extract_exif_data`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExifAssetData {
     pub captured_at: Option<NaiveDateTime>,
     pub thumbnail: Option<Vec<u8>>,
@@ -91,6 +113,7 @@ pub struct PhotoAsset {
     pub state: TriageState,
     pub rating: u8,
     pub exif_data: ExifAssetData,
+    pub image_data: ImageData,
 }
 
 impl PhotoAsset {
@@ -103,6 +126,12 @@ impl PhotoAsset {
                 captured_at: None,
                 thumbnail: None,
                 embedded_preview_file_location: None,
+            },
+            image_data: ImageData {
+                preview: None,
+                thumb: None,
+                full: None,
+                errors: None,
             },
         }
     }

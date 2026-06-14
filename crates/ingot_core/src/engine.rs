@@ -5,10 +5,16 @@
 //! `cpu_threads`). Those resources are shared across all in-flight assets, so
 //! they must live on an instance, not in free functions.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
-use crate::asset::AssetKey;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+use crate::asset::{AssetKey, ImageProcessingError};
+use crate::preview::{make_preview_from_jpeg_bytes, make_thumbnail_from_jpeg_bytes};
 use crate::scan::{ScanResponse, scan_source_dir};
+use crate::{FileKind, PreviewStrip, enrich_assets, read_embedded_preview};
 
 /// Tunable engine policy. Construct via `..Default::default()` and override what
 /// you need; the defaults are the values measured/locked in Phase 2.
@@ -42,24 +48,36 @@ impl Default for EngineConfig {
     }
 }
 
+#[derive(Debug)]
+pub struct IngestMessage {
+    pub key: AssetKey,
+    pub error: bool,
+}
+
 /// What `ingest` streams back to the consumer, one per processed asset.
 /// (Single-message-per-asset for v1; per-tier splitting is a later refinement.)
 #[derive(Debug)]
-pub struct ProcessedPreview {
-    pub key: AssetKey,
-    pub thumb_jpeg: Vec<u8>,
-    pub preview_jpeg: Vec<u8>,
+pub enum IngestEvent {
+    Preview(IngestMessage),
 }
 
 /// The engine instance. Cheap to construct; holds config now, concurrency
 /// resources after step 4.
 pub struct Engine {
     config: EngineConfig,
+    pub scan_response: Arc<RwLock<ScanResponse>>,
 }
 
 impl Engine {
     pub fn new(config: EngineConfig) -> Self {
-        Engine { config }
+        Engine {
+            config,
+            scan_response: Arc::new(RwLock::new(ScanResponse {
+                assets: HashMap::new(),
+                collisions: vec![],
+                errors: vec![],
+            })),
+        }
     }
 
     pub fn config(&self) -> &EngineConfig {
@@ -68,15 +86,123 @@ impl Engine {
 
     /// Fast enumeration: walk + pair, no file-content reads. Gives the UI its
     /// grid skeleton immediately.
-    pub fn scan(&self, source: &Path) -> ScanResponse {
-        scan_source_dir(source)
+    pub fn scan(&mut self, source: &Path) -> Arc<RwLock<ScanResponse>> {
+        let response = scan_source_dir(source);
+        let mut writable_scan_response = self.scan_response.write().unwrap();
+        *writable_scan_response = response;
+        enrich_assets(&mut writable_scan_response.assets);
+        Arc::clone(&self.scan_response)
     }
 
-    // Step 4 (guided): `ingest(&self, source: &Path) -> IngestHandle`.
-    // The per-asset processing unit (open -> parse EXIF -> preview-source
-    // branch -> make_thumbnail + make_preview -> emit ProcessedPreview), the
-    // two-tier concurrency (card_read_permits feeding cpu_threads), and the
-    // channel land here.
+    pub fn ingest(&mut self) -> crossbeam_channel::Receiver<IngestEvent> {
+        let (tx, rx): (
+            crossbeam_channel::Sender<IngestEvent>,
+            crossbeam_channel::Receiver<IngestEvent>,
+        ) = crossbeam_channel::bounded(64);
+
+        let cloned_scan_response = Arc::clone(&self.scan_response);
+
+        std::thread::spawn(move || Engine::run_processing_worker(cloned_scan_response, tx));
+
+        rx
+    }
+
+    fn run_processing_worker(
+        scan_response: Arc<RwLock<ScanResponse>>,
+        tx: crossbeam_channel::Sender<IngestEvent>,
+    ) {
+        let work_items: Vec<(AssetKey, FileKind, PathBuf, Option<PreviewStrip>)> = {
+            let readable = scan_response.read().unwrap();
+            readable
+                .assets
+                .iter()
+                .map(|(key, asset)| {
+                    let (kind, path) = asset.files.get_prioritized();
+                    (
+                        key.clone(),
+                        kind,
+                        path.to_path_buf(),
+                        asset.exif_data.embedded_preview_file_location,
+                    )
+                })
+                .collect()
+        };
+
+        // let mut writable_scan_response = scan_response.write().unwrap();
+        work_items
+            .into_par_iter()
+            .for_each(|(key, kind, path, preview_location_strip)| {
+                let src_jpeg_bytes: Result<Vec<u8>, ImageProcessingError> = match (kind, path) {
+                    (FileKind::Raw, path) => match preview_location_strip {
+                        Some(strip) => read_embedded_preview(&path, strip),
+                        None => Err(ImageProcessingError::from(
+                            "no embedded preview strip with jpeg bytes offset, limit was found",
+                        )),
+                    },
+                    (FileKind::Jpeg, path) => {
+                        std::fs::read(path).map_err(ImageProcessingError::from)
+                    }
+                };
+
+                match src_jpeg_bytes {
+                    Err(e) => {
+                        let mut writable_scan_response = scan_response.write().unwrap();
+                        let Some(writable_asset) = writable_scan_response.assets.get_mut(&key)
+                        else {
+                            return;
+                        };
+                        writable_asset
+                            .image_data
+                            .errors
+                            .get_or_insert_with(Vec::new)
+                            .push(e);
+                        drop(writable_scan_response);
+                        tx.send(IngestEvent::Preview(IngestMessage { key, error: true }))
+                            .expect("error sending message to the channel");
+                    }
+                    Ok(jpeg) => {
+                        let mut error_thumb: bool = false;
+                        let mut error_preview: bool = false;
+                        let thumb = make_thumbnail_from_jpeg_bytes(&jpeg);
+                        let preview = make_preview_from_jpeg_bytes(&jpeg);
+
+                        let mut writable_scan_response = scan_response.write().unwrap();
+                        let Some(writable_asset) = writable_scan_response.assets.get_mut(&key)
+                        else {
+                            return;
+                        };
+                        if thumb.is_none() {
+                            writable_asset
+                                .image_data
+                                .errors
+                                .get_or_insert_with(Vec::new)
+                                .push(ImageProcessingError::from("error generating thumbnail"));
+                            error_thumb = true;
+                        } else {
+                            writable_asset.image_data.thumb = thumb
+                        }
+
+                        if preview.is_none() {
+                            writable_asset
+                                .image_data
+                                .errors
+                                .get_or_insert_with(Vec::new)
+                                .push(ImageProcessingError::from("error generating preview"));
+                            error_preview = true;
+                        } else {
+                            writable_asset.image_data.preview = preview
+                        }
+                        drop(writable_scan_response);
+
+                        tx.send(IngestEvent::Preview(IngestMessage {
+                            key,
+                            error: error_thumb && error_preview,
+                        }))
+                        .expect("error sending message to the channel");
+                    }
+                };
+            });
+    }
 }
 
 #[cfg(test)]

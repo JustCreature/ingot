@@ -13,7 +13,9 @@ use std::path::Path;
 
 use chrono::NaiveDateTime;
 
-use crate::asset::{AssetKey, ExifAssetData, FileKind, PhotoAsset, PreviewStrip};
+use crate::asset::{AssetKey, ExifAssetData, PhotoAsset, PreviewStrip};
+
+pub(crate) type MetadataError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Bytes of the file head we read to parse EXIF metadata. Measured against Canon
 /// CR2: the EXIF/IFD directories, `DateTimeOriginal`, and the *entire* 160x120
@@ -55,20 +57,27 @@ pub fn get_embedded_preview_location(exif: &exif::Exif) -> Option<PreviewStrip> 
 /// allocating: a malformed `StripByteCounts` funnels to `None` rather than
 /// over-allocating. The check bounds the allocation by a fact about the file,
 /// not a guessed constant.
-pub fn read_embedded_preview(path: &Path, strip: PreviewStrip) -> Option<Vec<u8>> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let file_len = file.metadata().ok()?.len();
+pub fn read_embedded_preview(path: &Path, strip: PreviewStrip) -> Result<Vec<u8>, MetadataError> {
+    let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
 
-    if strip.len == 0 || strip.offset.checked_add(strip.len as u64)? > file_len {
-        return None;
+    let is_out_of_bounds = match strip.offset.checked_add(strip.len as u64) {
+        Some(end) => end > file_len,
+        None => true, // Overflow means it's definitely out of bounds
+    };
+
+    if strip.len == 0 || is_out_of_bounds {
+        return Err(MetadataError::from(
+            "identified jpeg preview length is not allowed",
+        ));
     }
 
-    file.seek(std::io::SeekFrom::Start(strip.offset)).ok()?;
+    file.seek(std::io::SeekFrom::Start(strip.offset))?;
 
     let mut buf = vec![0u8; strip.len];
-    file.read_exact(&mut buf).ok()?;
+    file.read_exact(&mut buf)?;
 
-    Some(buf)
+    Ok(buf)
 }
 
 fn get_thumbnail(exif: &exif::Exif) -> Option<Vec<u8>> {
@@ -119,10 +128,7 @@ fn get_capture_time(exif: &exif::Exif) -> Option<NaiveDateTime> {
 /// `Vec` and hand kamadak a `Cursor` over it. The full-size embedded preview is
 /// a separate seek-read (stage 2), never this buffer.
 pub(crate) fn read_exif_header(asset: &PhotoAsset) -> Option<exif::Exif> {
-    let path = asset
-        .files
-        .get(FileKind::Jpeg)
-        .or_else(|| asset.files.get(FileKind::Raw))?;
+    let (_, path) = asset.files.get_prioritized();
 
     read_exif_header_from_path(path, EXIF_HEADER_PREFIX_LEN)
 }
