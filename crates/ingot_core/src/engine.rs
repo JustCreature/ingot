@@ -111,6 +111,8 @@ impl Engine {
         scan_response: Arc<RwLock<ScanResponse>>,
         tx: crossbeam_channel::Sender<IngestEvent>,
     ) {
+        // Snapshot the per-asset inputs under a brief read lock, then release it.
+        // Everything heavy below — the file read and both encodes — runs lock-free.
         let work_items: Vec<(AssetKey, FileKind, PathBuf, Option<PreviewStrip>)> = {
             let readable = scan_response.read().unwrap();
             readable
@@ -128,80 +130,72 @@ impl Engine {
                 .collect()
         };
 
-        // let mut writable_scan_response = scan_response.write().unwrap();
         work_items
             .into_par_iter()
-            .for_each(|(key, kind, path, preview_location_strip)| {
-                let src_jpeg_bytes: Result<Vec<u8>, ImageProcessingError> = match (kind, path) {
-                    (FileKind::Raw, path) => match preview_location_strip {
-                        Some(strip) => read_embedded_preview(&path, strip),
-                        None => Err(ImageProcessingError::from(
-                            "no embedded preview strip with jpeg bytes offset, limit was found",
-                        )),
-                    },
-                    (FileKind::Jpeg, path) => {
-                        std::fs::read(path).map_err(ImageProcessingError::from)
+            .for_each(|(key, kind, path, strip)| {
+                // 1. Off-lock: read the source bytes and generate both outputs. A
+                //    missing output stays `None` (its desired failed state) and is
+                //    recorded as an error; a missing *source* fails both.
+                let (thumb, preview, errors): (
+                    Option<Vec<u8>>,
+                    Option<Vec<u8>>,
+                    Vec<ImageProcessingError>,
+                ) = match read_source_bytes(kind, &path, strip) {
+                    Err(e) => (None, None, vec![e]),
+                    Ok(jpeg) => {
+                        let thumb = make_thumbnail_from_jpeg_bytes(&jpeg);
+                        let preview = make_preview_from_jpeg_bytes(&jpeg);
+                        let mut errors = Vec::new();
+                        if thumb.is_none() {
+                            errors.push(ImageProcessingError::from("error generating thumbnail"));
+                        }
+                        if preview.is_none() {
+                            errors.push(ImageProcessingError::from("error generating preview"));
+                        }
+                        (thumb, preview, errors)
                     }
                 };
+                let failed = thumb.is_none() && preview.is_none();
 
-                match src_jpeg_bytes {
-                    Err(e) => {
-                        let mut writable_scan_response = scan_response.write().unwrap();
-                        let Some(writable_asset) = writable_scan_response.assets.get_mut(&key)
-                        else {
-                            return;
-                        };
-                        writable_asset
+                // 2. Brief write lock: store the results into the engine-owned asset.
+                {
+                    let mut writable = scan_response.write().unwrap();
+                    let Some(asset) = writable.assets.get_mut(&key) else {
+                        return;
+                    };
+                    asset.image_data.thumb = thumb;
+                    asset.image_data.preview = preview;
+                    if !errors.is_empty() {
+                        asset
                             .image_data
                             .errors
                             .get_or_insert_with(Vec::new)
-                            .push(e);
-                        drop(writable_scan_response);
-                        tx.send(IngestEvent::Preview(IngestMessage { key, error: true }))
-                            .expect("error sending message to the channel");
+                            .extend(errors);
                     }
-                    Ok(jpeg) => {
-                        let mut error_thumb: bool = false;
-                        let mut error_preview: bool = false;
-                        let thumb = make_thumbnail_from_jpeg_bytes(&jpeg);
-                        let preview = make_preview_from_jpeg_bytes(&jpeg);
+                }
 
-                        let mut writable_scan_response = scan_response.write().unwrap();
-                        let Some(writable_asset) = writable_scan_response.assets.get_mut(&key)
-                        else {
-                            return;
-                        };
-                        if thumb.is_none() {
-                            writable_asset
-                                .image_data
-                                .errors
-                                .get_or_insert_with(Vec::new)
-                                .push(ImageProcessingError::from("error generating thumbnail"));
-                            error_thumb = true;
-                        } else {
-                            writable_asset.image_data.thumb = thumb
-                        }
-
-                        if preview.is_none() {
-                            writable_asset
-                                .image_data
-                                .errors
-                                .get_or_insert_with(Vec::new)
-                                .push(ImageProcessingError::from("error generating preview"));
-                            error_preview = true;
-                        } else {
-                            writable_asset.image_data.preview = preview
-                        }
-                        drop(writable_scan_response);
-
-                        tx.send(IngestEvent::Preview(IngestMessage {
-                            key,
-                            error: error_thumb && error_preview,
-                        }))
-                        .expect("error sending message to the channel");
-                    }
-                };
+                // 3. Notify (lock already released). A dropped receiver means the
+                //    consumer is gone — stop quietly rather than panic.
+                let _ = tx.send(IngestEvent::Preview(IngestMessage { key, error: failed }));
             });
+    }
+}
+
+/// Acquire the JPEG bytes that feed the preview pipeline for one asset, per its
+/// read stage: a RAW seek-reads its embedded-preview strip; a JPEG reads the
+/// file. Lock-free and self-contained, so it is unit-testable without threads.
+fn read_source_bytes(
+    kind: FileKind,
+    path: &Path,
+    strip: Option<PreviewStrip>,
+) -> Result<Vec<u8>, ImageProcessingError> {
+    match kind {
+        FileKind::Raw => strip
+            .ok_or_else(|| {
+                ImageProcessingError::from("no embedded preview location found for RAW asset")
+            })
+            .and_then(|strip| read_embedded_preview(path, strip)),
+        FileKind::Jpeg => std::fs::read(path).map_err(ImageProcessingError::from),
     }
 }
 
