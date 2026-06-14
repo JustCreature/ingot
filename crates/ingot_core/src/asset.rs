@@ -62,14 +62,27 @@ pub enum TriageState {
     Rejected,
 }
 
+/// Where the full-size embedded preview lives inside its file, as a byte range —
+/// *not* the bytes themselves. The 128 KiB header read parses these inline IFD0
+/// values cheaply; stage 2 then seek-reads exactly this range (see
+/// `metadata::read_embedded_preview`). Offset is relative to the start of the
+/// file the EXIF was parsed from (the RAW, for a RAW-only asset).
+#[derive(Debug, Clone, Copy)]
+pub struct PreviewStrip {
+    pub offset: u64,
+    pub len: usize,
+}
+
 /// Everything we pull out of one EXIF parse: cheap metadata only. The heavy
-/// full-size embedded preview is *not* here — it feeds the CPU stage, not the
-/// per-asset metadata bundle. Add a new property by adding a field here plus a
+/// full-size embedded preview is *not* here — only a `PreviewStrip` *reference*
+/// to it, so the metadata pass stays header-only. The bytes feed the CPU stage
+/// via a separate seek-read. Add a new property by adding a field here plus a
 /// line in `metadata::extract_exif_data`.
 #[derive(Debug)]
 pub struct ExifAssetData {
     pub captured_at: Option<NaiveDateTime>,
     pub thumbnail: Option<Vec<u8>>,
+    pub embedded_preview_file_location: Option<PreviewStrip>,
 }
 
 #[derive(Debug)]
@@ -89,6 +102,7 @@ impl PhotoAsset {
             exif_data: ExifAssetData {
                 captured_at: None,
                 thumbnail: None,
+                embedded_preview_file_location: None,
             },
         }
     }

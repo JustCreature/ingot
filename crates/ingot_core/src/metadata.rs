@@ -1,37 +1,74 @@
-//! Capture-time + embedded-image extraction from one EXIF parse.
+//! Capture-time + embedded-image extraction, split by read cost.
 //!
-//! Two reaches, one slice idiom: IFD1 (`In::THUMBNAIL`) holds the tiny 160x120
-//! thumbnail; IFD0 (`In::PRIMARY`) holds the full-size embedded preview. Both
-//! are byte-slices out of the resident TIFF buffer — extract, never decode RAW.
-//! Every failure funnels to `None`: one malformed frame must not abort a batch.
+//! Stage 1 reads only the file *head* (`read_exif_header`, ~128 KiB): from it we
+//! slice the date and the tiny 160x120 IFD1 thumbnail (both resident in the
+//! prefix) and *cache a reference* to the full-size IFD0 preview without reading
+//! it. Stage 2 (`read_embedded_preview`) seek-reads exactly that ~2 MB strip on
+//! demand — never the whole 35 MB file, never a RAW decode. Every failure
+//! funnels to `None`: one malformed frame must not abort a batch.
 
 use std::collections::HashMap;
+use std::io::{Read, Seek};
+use std::path::Path;
 
 use chrono::NaiveDateTime;
 
-use crate::asset::{AssetKey, ExifAssetData, FileKind, PhotoAsset};
+use crate::asset::{AssetKey, ExifAssetData, FileKind, PhotoAsset, PreviewStrip};
 
-/// Full-size embedded preview from a TIFF-like container (CR2): a single-strip
-/// JPEG referenced by `StripOffsets`/`StripByteCounts` in IFD0. Feeds the same
-/// preview pipeline as a parallel JPEG — the RAW-only path converges here.
-pub fn get_embedded_preview_from_tiff_like(exif: &exif::Exif) -> Option<Vec<u8>> {
+/// Bytes of the file head we read to parse EXIF metadata. Measured against Canon
+/// CR2: the EXIF/IFD directories, `DateTimeOriginal`, and the *entire* 160x120
+/// IFD1 thumbnail all live in the first ~72 KiB (the thumb spans 54,424..71,768);
+/// the 2 MB full-size preview starts at 71,768 and is deliberately excluded.
+/// 128 KiB gives headroom for other bodies without dragging the big preview into
+/// the metadata read. JPEG EXIF (APP1) sits at the very front, so the same budget
+/// covers it. ~273x less I/O than slurping a 35 MB CR2.
+const EXIF_HEADER_PREFIX_LEN: u64 = 128 * 1024;
+
+/// Locate (don't read) the full-size embedded preview in a TIFF-like container
+/// (CR2): a single-strip JPEG referenced by `StripOffsets`/`StripByteCounts` in
+/// IFD0. These values are inline in the IFD0 directory, so they parse from the
+/// 128 KiB header read — stage 1 caches the *reference*, stage 2 seek-reads the
+/// bytes. A parallel JPEG has no such IFD0 strip, so this yields `None` for it.
+pub fn get_embedded_preview_location(exif: &exif::Exif) -> Option<PreviewStrip> {
     let preview_offset_field = exif.get_field(exif::Tag::StripOffsets, exif::In::PRIMARY)?;
     let preview_len_field = exif.get_field(exif::Tag::StripByteCounts, exif::In::PRIMARY)?;
 
-    let preview_offset = match preview_offset_field.value {
+    let offset = match preview_offset_field.value {
+        exif::Value::Long(ref v) => *v.first()? as u64,
+        _ => return None,
+    };
+
+    let len = match preview_len_field.value {
         exif::Value::Long(ref v) => *v.first()? as usize,
         _ => return None,
     };
 
-    let preview_len = match preview_len_field.value {
-        exif::Value::Long(ref v) => *v.first()? as usize,
-        _ => return None,
-    };
+    Some(PreviewStrip { offset, len })
+}
 
-    let buf = exif.buf();
-    let preview = buf.get(preview_offset..preview_offset + preview_len)?;
+/// Stage 2: seek-read exactly the embedded-preview strip referenced by `strip`
+/// from `path` — one `seek` + one `read_exact`, never the whole file. This is
+/// the RAW-only fast path: ~2 MB read instead of kamadak's 35 MB slurp.
+///
+/// A strip cannot physically extend past the end of its file, so the reference
+/// is validated against the file length (a free `fstat`, no content read) before
+/// allocating: a malformed `StripByteCounts` funnels to `None` rather than
+/// over-allocating. The check bounds the allocation by a fact about the file,
+/// not a guessed constant.
+pub fn read_embedded_preview(path: &Path, strip: PreviewStrip) -> Option<Vec<u8>> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
 
-    Some(preview.to_vec())
+    if strip.len == 0 || strip.offset.checked_add(strip.len as u64)? > file_len {
+        return None;
+    }
+
+    file.seek(std::io::SeekFrom::Start(strip.offset)).ok()?;
+
+    let mut buf = vec![0u8; strip.len];
+    file.read_exact(&mut buf).ok()?;
+
+    Some(buf)
 }
 
 fn get_thumbnail(exif: &exif::Exif) -> Option<Vec<u8>> {
@@ -72,23 +109,38 @@ fn get_capture_time(exif: &exif::Exif) -> Option<NaiveDateTime> {
     Some(capture_date_time)
 }
 
-/// Open one file (JPEG-preferred, RAW-fallback) and parse its EXIF container.
-pub(crate) fn read_exif_container(asset: &PhotoAsset) -> Option<exif::Exif> {
-    let file = std::fs::File::open(
-        asset
-            .files
-            .get(FileKind::Jpeg)
-            .or_else(|| asset.files.get(FileKind::Raw))?,
-    )
-    .ok()?;
+/// Open one file (JPEG-preferred, RAW-fallback) and parse its EXIF container
+/// from only the head of the file — the stage-1 skeleton read.
+///
+/// `kamadak-exif` slurps the *entire* file for a TIFF-like CR2 (35 MB resident
+/// to read a 20-byte date). Bounding the read to `EXIF_HEADER_PREFIX_LEN` keeps
+/// the metadata pass header-only. The parser needs `BufRead + Seek`, and
+/// `Read::take` yields only `Read` (no `Seek`), so we read the prefix into a
+/// `Vec` and hand kamadak a `Cursor` over it. The full-size embedded preview is
+/// a separate seek-read (stage 2), never this buffer.
+pub(crate) fn read_exif_header(asset: &PhotoAsset) -> Option<exif::Exif> {
+    let path = asset
+        .files
+        .get(FileKind::Jpeg)
+        .or_else(|| asset.files.get(FileKind::Raw))?;
 
-    let mut bufreader = std::io::BufReader::new(file);
+    read_exif_header_from_path(path, EXIF_HEADER_PREFIX_LEN)
+}
 
-    let exif_container = exif::Reader::new()
-        .read_from_container(&mut bufreader)
-        .ok()?;
+/// Read at most `max_bytes` from the head of `path` and parse it as an EXIF
+/// container. `take(max_bytes).read_to_end` caps the read *and* tolerates files
+/// shorter than the budget (no `UnexpectedEof`); `with_capacity` makes it a
+/// single allocation. A field whose value lands beyond the prefix simply fails
+/// to slice later (funnels to `None`); it does not abort the parse.
+fn read_exif_header_from_path(path: &Path, max_bytes: u64) -> Option<exif::Exif> {
+    let file = std::fs::File::open(path).ok()?;
 
-    Some(exif_container)
+    let mut head = Vec::with_capacity(max_bytes as usize);
+    file.take(max_bytes).read_to_end(&mut head).ok()?;
+
+    exif::Reader::new()
+        .read_from_container(&mut std::io::Cursor::new(head))
+        .ok()
 }
 
 /// The single extension point: assemble all cheap-metadata properties from one
@@ -98,6 +150,7 @@ pub(crate) fn extract_exif_data(exif: &exif::Exif) -> ExifAssetData {
     ExifAssetData {
         captured_at: get_capture_time(exif),
         thumbnail: get_thumbnail(exif),
+        embedded_preview_file_location: get_embedded_preview_location(exif),
     }
 }
 
@@ -109,7 +162,7 @@ pub fn enrich_assets(assets: &mut HashMap<AssetKey, PhotoAsset>) {
     let asset_keys_with_exif_data: Vec<(AssetKey, ExifAssetData)> = assets
         .iter()
         .filter_map(|(key, asset)| {
-            read_exif_container(asset)
+            read_exif_header(asset)
                 .map(|exif_container| (key.clone(), extract_exif_data(&exif_container)))
         })
         .collect();
@@ -146,25 +199,81 @@ mod tests {
     }
 
     #[test]
-    fn get_embedded_preview_from_tiff_like_test_preview_extracted_successfully() {
-        let file = std::fs::File::open(Path::new("testdata/test_exif_read/IMG_1939.CR2"))
-            .ok()
-            .unwrap();
+    fn embedded_preview_ref_from_header_then_seek_read_extracts_full_preview() {
+        // The 128 KiB header read yields only a
+        // *reference* (offset/len, inline in IFD0), then a targeted seek-read
+        // pulls the ~2 MB strip — never the whole 35 MB file.
+        let path = Path::new("testdata/test_exif_read/IMG_1939.CR2");
+        let exif =
+            read_exif_header_from_path(path, EXIF_HEADER_PREFIX_LEN).expect("header parse failed");
 
-        let mut bufreader = std::io::BufReader::new(file);
+        let strip = get_embedded_preview_location(&exif).expect("no preview ref in header");
+        // Reference points past the 128 KiB header: the data is NOT in the buffer.
+        assert!(strip.offset + strip.len as u64 > EXIF_HEADER_PREFIX_LEN);
 
-        let exif_container = exif::Reader::new()
-            .read_from_container(&mut bufreader)
-            .ok()
-            .unwrap();
-        let preview =
-            get_embedded_preview_from_tiff_like(&exif_container).expect("no preview extracted");
+        let preview = read_embedded_preview(path, strip).expect("seek-read failed");
         assert!(preview.starts_with(&[0xFF, 0xD8]));
         assert!(preview.ends_with(&[0xFF, 0xD9]));
+        assert_eq!(
+            preview.len(),
+            strip.len,
+            "seek-read must return exactly the referenced strip length"
+        );
         assert!(
             (500_000..6_000_000).contains(&preview.len()),
             "preview size out of expected band: {} bytes",
             preview.len()
+        );
+    }
+
+    #[test]
+    fn read_exif_header_default_prefix_yields_date_and_thumb_without_slurp() {
+        // The CR2 is ~35 MB; everything stage 1 needs — DateTimeOriginal and the
+        // full 160x120 IFD1 thumbnail (ends at byte 71,768) — is in the first
+        // ~72 KiB. Prove the default 128 KiB prefix parses a truncated CR2 and
+        // recovers both, so no full-file read is ever required for metadata.
+        let path = Path::new("testdata/test_exif_read/IMG_1939.CR2");
+        let exif = read_exif_header_from_path(path, EXIF_HEADER_PREFIX_LEN)
+            .expect("header parse failed on 128 KiB-truncated CR2");
+
+        let data = extract_exif_data(&exif);
+        assert_eq!(
+            data.captured_at.expect("no date from prefix").to_string(),
+            "2026-01-10 13:05:16"
+        );
+        let thumb = data.thumbnail.expect("no thumbnail from prefix");
+        assert!(thumb.starts_with(&[0xFF, 0xD8]) && thumb.ends_with(&[0xFF, 0xD9]));
+
+        // The big embedded preview's *reference* is cached from the header (the
+        // offset/len are inline in IFD0), but the ~2 MB of data itself lies past the 128 KiB prefix.
+        let strip = data
+            .embedded_preview_file_location
+            .expect("preview reference should be cached from the header");
+        assert!(
+            strip.offset + strip.len as u64 > EXIF_HEADER_PREFIX_LEN,
+            "preview data must lie beyond the header read"
+        );
+    }
+
+    #[test]
+    fn read_exif_header_prefix_below_thumb_keeps_date_drops_thumb() {
+        // Documents what "only necessary bytes" means: the thumbnail spans
+        // 54,424..71,768. A 64 KiB (65,536) prefix covers the IFD directories +
+        // date but truncates the thumbnail data, so the date still resolves while
+        // the thumb slice fails *gracefully* to None — the failure funnel, never
+        // an abort.
+        let path = Path::new("testdata/test_exif_read/IMG_1939.CR2");
+        let exif =
+            read_exif_header_from_path(path, 64 * 1024).expect("header parse failed at 64 KiB");
+
+        let data = extract_exif_data(&exif);
+        assert!(
+            data.captured_at.is_some(),
+            "date must survive a 64 KiB prefix"
+        );
+        assert!(
+            data.thumbnail.is_none(),
+            "thumb data extends past 64 KiB, so the slice must funnel to None"
         );
     }
 
