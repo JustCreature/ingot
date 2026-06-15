@@ -404,3 +404,17 @@ IFD1 thumb; (3) RAW-only CR2 IFD0 path; (4) `ProcessedPreview` channel streaming
 ## Phase 2 — FINALISED 2026-06-14 (`--v--FORCE`)
 
 Steps 1–4 complete and measured (full record in CLAUDE.md Phase 2 block; reports in `docs/lessons/phase-2/`). 7 items carried forward (two-tier split, previews-to-disk, EXIF orientation, Decompressor reuse, multi-format extraction, main.rs cleanups, Phase 6). Next: **Phase 3 — Asynchronous I/O Engine** (read-once fan-out replication + BLAKE3 verify + type-gated deletion), shaped by the measured ~20 MB/s card ceiling.
+
+---
+
+## Session — 2026-06-14 (post-finalisation) — Two-tier read/CPU split (Code Exception)
+
+Triggered by **M4 Pro data** (14 cores, same 879 card, merged-pool RAYON sweep): ingest 1→136 s, 2→60, **4→53 (best)**, 8→55, 14→60 — the M4 card path has **read queue depth ~4** (unlike the Intel serial SD reader's 2≈8 at 20 MB/s). A merged pool can't size read and CPU widths independently → **separation needed**.
+
+**Implemented (`engine.rs`):** `run_processing_worker` → two `rayon` pools joined by a bounded channel, via `std::thread::scope`. Reader tier (`card_read_permits`, default 2→**4**) does only `read_source_bytes`, sends raw bytes; CPU tier (`cpu_threads`) `par_bridge`-consumes, decodes/encodes lock-free, brief write-lock to store, notify. Channel cap ≈ `cpu_threads` (backpressure). `bench_ingest` gained `INGOT_READ_THREADS`/`INGOT_CPU_THREADS` overrides (RAYON_NUM_THREADS no longer controls the explicit pools). 11 tests green, clippy clean.
+
+**Intel re-measure (serial SD reader, same card):** read=2 ingest **99.5 / 84.7 / 84.5 s** vs read=4 **133 / 162 / 167 s** (worsening). Findings: (1) **separated read=2 (~90 s cold) beats the old merged design (154 s cold)** — overlapping a dedicated reader tier with the CPU tier is a *real* win, not just hygiene; (2) **read=4 thrashes the serial reader** (step-1 small-read penalty) → read-width must match the device. Default 4 (M4); serial SD wants 2 — tunable.
+
+**Caching anomaly (open):** this Intel session the cold→warm speedup failed to materialise (`scan+enrich` 6.5 s not 0.07 s; ingest never reached the ~26 s CPU floor), same as the M4. External-removable-volume caching/eviction is unexplained across machines — flagged, not yet a lesson.
+
+**Docs synced:** CLAUDE.md (carried item #1 → DONE + addendum), global-plan Phase 2 measured block (two-tier resolved + M4 data + device-property conclusion), both lesson reports (long §7.8 + short §17), this log.

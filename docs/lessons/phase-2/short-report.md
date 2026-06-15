@@ -156,7 +156,13 @@ kamadak slurps the **whole** CR2 for a TIFF (36 MB resident for a 20-byte date);
 
 ## 15. End-to-end: read-bound on the card
 
-879-asset card: scan+enrich cold 14.4 s / warm 0.07 s; ingest cold **154 s (6 fps)** / warm **~26 s (33 fps)**; read-only cold **2 threads = 8 threads = 158 s ≈ 20 MB/s**. **Read-bound, three ways:** cold≫warm (6×), cold-ingest≈cold-read-only (CPU hidden under I/O), 2≈8 threads. The card is a fixed ~20 MB/s pipe — you can't parallelize past one device → cap `card_read_permits` 1–2 (the two-tier split is CPU-thread hygiene, not a speedup). CPU floor ~33 fps; SSD source flips it CPU-bound (the §12 regime). Only cold lever = fewer bytes (embedded-for-pairs). **Caches** = OS page cache; warming only *moves* the read into idle time (latency hiding), never beats the device → Phase 6 (cross-device parallelism, auto-detect/auto-start, loupe prefetch).
+879-asset card (Intel serial SD reader): scan+enrich cold 14.4 s / warm 0.07 s; ingest cold **154 s (6 fps)** / warm **~26 s (33 fps)**; read-only cold **2 = 8 threads = 158 s ≈ 20 MB/s**. **Read-bound, three ways:** cold≫warm (6×), cold-ingest≈cold-read-only (CPU hidden under I/O), 2≈8 threads. The serial card is a fixed ~20 MB/s pipe. CPU floor ~33 fps; SSD source (or warm) flips it CPU-bound (the §12 regime). Only cold lever = fewer bytes (embedded-for-pairs). **Caches** = OS page cache; warming only *moves* the read into idle time (latency hiding), never beats the device → Phase 6. (Anomaly: cold→warm sometimes fails to materialise on external removable volumes — seen on M4 *and* Intel — unexplained, flagged.)
+
+---
+
+## 17. Two-tier split: read-width is a device property
+
+Second machine (M4 Pro, 14 cores, same card, merged-pool sweep): ingest 1→136 s, **2→60, 4→53 (best), 8→55, 14→60** — this card path has **read queue depth ~4**, unlike the Intel serial reader (2≈8). So read-concurrency optimum is **per-device**; a *merged* pool can't set read=4 AND cpu=14 at once. **Fix (implemented):** reader tier (`card_read_permits`) + CPU tier (`cpu_threads`) joined by a bounded channel (`thread::scope`: read_pool `into_par_iter`→`raw_tx`; cpu_pool `raw_rx.par_bridge()`→decode/store/notify). Separated **read=2 on Intel ~90 s cold beats merged 154 s** (overlap is a real win, not just hygiene); **read=4 thrashes the serial reader** (133→167 s). Default `card_read_permits = 4` (M4 reader); serial SD wants 2 — tunable (`INGOT_READ_THREADS`/config). RAYON_NUM_THREADS no longer controls ingest (explicit pools).
 
 ---
 

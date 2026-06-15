@@ -501,9 +501,42 @@ The cold→warm gap is the **OS page cache** (on macOS the *unified buffer cache
 
 ---
 
+### 7.8 The two-tier split — read-width is a device property, sized independently
+
+Part 7.1–7.3 measured a *serial* SD reader on the Intel box (2 ≈ 8 threads, ~20 MB/s — concurrency neutral). A second machine told a different story. On an **M4 Pro (14 cores), same card**, sweeping the *merged* single-pool width (`RAYON_NUM_THREADS`):
+
+| threads | ingest | note |
+|---|---|---|
+| 1 | 136 s (6 fps) | serial |
+| 2 | 60 s (15 fps) | 2.3× |
+| **4** | **53 s (17 fps)** | **best** |
+| 8 | 55 s (16 fps) | flat |
+| 14 | 60 s (14 fps) | regresses |
+
+This card path has **read queue depth ~4** (1→4 = 2.6×, then >4 *hurts*) — unlike the Intel serial reader. So **read-concurrency optimum is a device property**, and we now have two points bracketing it: serial SD ≈ 1–2, queue-depth reader ≈ 4, SSD/NVMe higher.
+
+The problem the merged pool exposes: with **one** width knob you cannot satisfy both tiers. Tuned for reads (4) it *starves* the 14-core CPU; tuned for the CPU (14) it *thrashes* the card (4-wide is already past this card's depth). The fix is the plan's two tiers, now built: a **reader tier** (`card_read_permits` threads, doing only `read_source_bytes`) feeding a **CPU tier** (`cpu_threads`, decode/encode) over a **bounded channel** (backpressure / memory governor — only ~`cpu_threads` raw buffers alive). Two independent widths.
+
+```rust
+std::thread::scope(|s| {
+    s.spawn(move || read_pool.install(|| {           // reader tier: read_threads wide
+        work.into_par_iter().for_each(|item| { let _ = raw_tx.send((key, read_source_bytes(...))); });
+    }));                                              // raw_tx drops here → channel closes
+    cpu_pool.install(|| {                             // CPU tier: cpu_threads wide
+        raw_rx.into_iter().par_bridge().for_each(|(key, bytes)| { /* decode → store → notify */ });
+    });
+});
+```
+
+**Measured payoff (Intel serial reader, same card, separated build):** read=2 ingest **99.5 / 84.7 / 84.5 s** vs read=4 **133 / 162 / 167 s** (worsening). Two findings: (1) the **separated read=2 cold (~90 s) beats the old merged cold (154 s)** — a dedicated reader tier overlapping the CPU tier is a *real* throughput win, not just hygiene, even on a serial card; (2) **read=4 thrashes the serial reader** (the §2.3 small-read penalty), confirming the read width must match the device. Default `card_read_permits = 4` (M4 reader); a serial SD card wants 2 — it is tunable for exactly this reason.
+
+**Caching anomaly (open).** On both the M4 and a later Intel session the cold→warm speedup *failed to materialise* (e.g. `scan+enrich` 6.5 s, not the warm 0.07 s; ingest never reaching the ~26 s CPU floor), unlike the clean 6× warm-up of §7.1. External removable volumes appear to cache/evict unpredictably across machines/sessions. Unexplained — flagged for a controlled investigation (mount options, free RAM, eviction policy), not yet a lesson.
+
+---
+
 ## Part 8: Benchmark Results (consolidated)
 
-All on i7-1068NG7 (4 physical / 8 logical), Rust release.
+All on i7-1068NG7 (4 physical / 8 logical), Rust release; cross-device note: M4 Pro (14 cores).
 
 **Enrichment, 879-asset card, cold = first read:**
 
@@ -580,10 +613,15 @@ Read-bound (cold≫warm 6×; cold-ingest≈cold-read; 2≈8 threads). Card ceili
   read + a targeted ~2 MB seek-read of the embedded preview replace it (279× fewer bytes). Everything
   stage 1 needs is in the first ~72 KiB, measured.
 - **The full ingest is read-bound on the card**, proven three ways: cold ≫ warm (6×), cold-ingest ≈
-  cold-read-only (CPU hidden under I/O), and **2 ≈ 8 threads cold** (~20 MB/s, device-fixed). You cannot
-  parallelize past one device, so cap card reads at 1–2; the two-tier split is resource hygiene, not a
-  speedup. CPU floor ≈ 33 fps — an SSD source flips the pipeline CPU-bound. The only cold lever is
+  cold-read-only (CPU hidden under I/O), and **2 ≈ 8 threads cold** on a *serial* SD reader (~20 MB/s).
+  CPU floor ≈ 33 fps — an SSD source (or warm) flips the pipeline CPU-bound. The only cold lever is
   reading *fewer bytes* (embedded-over-JPEG for pairs).
+- **Read-width optimum is a device property; the read and CPU tiers must be sized independently.** A
+  second machine (M4 Pro) showed a card path with read queue-depth ~4 (1→4 = 2.6×, >4 regresses), vs the
+  Intel serial reader's 2≈8. A merged pool can't set read=4 *and* cpu=14, so we split into a reader tier
+  + CPU tier over a bounded channel. The split is a *real* cold win (Intel separated read=2 ~90 s beats
+  merged 154 s), not just hygiene — provided the read width matches the device (read=4 thrashes a serial
+  reader). Default `card_read_permits = 4`, tunable.
 - **Engine owns the data; the worker never holds a lock during heavy work.** Engine-owned `Arc<RwLock>`
   state + a background worker is only correct with strict lock scope (snapshot → lock-free read/decode/
   encode → brief per-asset write → send); holding the write lock across the loop both kills streaming and
