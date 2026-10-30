@@ -7,6 +7,7 @@ use ingot_core::{DateFolders, ExtensionCase, FileKind, ImportOptions, NameTempla
 
 pub const HELP: &str = "\
 ingot import <source> --dest <folder> [options]
+ingot gdrive-login       sign in to Google Drive (see docs/guides/google-drive.md)
 
 Source
   --no-subfolders          only the top folder of <source>
@@ -20,6 +21,7 @@ Destination
   --date-format <format>   for --organize date: a chrono format, default %Y/%Y-%m-%d
                            e.g. %Y/%m/%d  %Y/%m-%d  %Y/%B/%d  %Y-%m-%d  %Y%m%d
   --second-copy <folder>   also copy here, without slowing the card (repeatable)
+  --gdrive                 also upload to __ingot_backups in My Drive, without slowing the card
 
 File renaming
   --rename <template>      tokens: {name} {folder} {custom} {filenum} {seq} {seq:4}
@@ -46,6 +48,7 @@ pub struct ImportArgs {
     pub source: PathBuf,
     pub destination: Option<PathBuf>,
     pub second_copies: Vec<PathBuf>,
+    pub gdrive: bool,
     pub include_subfolders: bool,
     pub options: ImportOptions,
     pub previews: bool,
@@ -62,11 +65,22 @@ fn date(value: &str) -> Result<NaiveDate, Usage> {
         .map_err(|_| Usage(format!("not a YYYY-MM-DD date: {value}")))
 }
 
-/// Returns `None` when help was asked for.
-pub fn parse(args: &[String]) -> Result<Option<ImportArgs>, Usage> {
+pub fn gdrive_credentials_path() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join("ingot").join("gdrive-token.json"))
+}
+
+#[derive(Debug)]
+pub enum Command {
+    Help,
+    Import(Box<ImportArgs>),
+    GdriveLogin,
+}
+
+pub fn parse(args: &[String]) -> Result<Command, Usage> {
     let mut args = args.iter();
     match args.next().map(String::as_str) {
-        None | Some("help" | "--help" | "-h") => return Ok(None),
+        None | Some("help" | "--help" | "-h") => return Ok(Command::Help),
+        Some("gdrive-login") => return Ok(Command::GdriveLogin),
         Some("import") => {}
         Some(other) => return Err(Usage(format!("unknown command: {other}"))),
     }
@@ -74,6 +88,7 @@ pub fn parse(args: &[String]) -> Result<Option<ImportArgs>, Usage> {
     let mut source = None;
     let mut destination = None;
     let mut second_copies = vec![];
+    let mut gdrive = false;
     let mut include_subfolders = true;
     let mut options = ImportOptions::default();
     let mut organize = None;
@@ -90,6 +105,7 @@ pub fn parse(args: &[String]) -> Result<Option<ImportArgs>, Usage> {
             "--dest" => destination = Some(PathBuf::from(value()?)),
             "--subfolder" => options.subfolder = Some(PathBuf::from(value()?)),
             "--second-copy" => second_copies.push(PathBuf::from(value()?)),
+            "--gdrive" => gdrive = true,
             "--organize" => organize = Some(value()?.to_string()),
             "--date-format" => date_format = Some(value()?.to_string()),
             "--rename" => {
@@ -146,7 +162,7 @@ pub fn parse(args: &[String]) -> Result<Option<ImportArgs>, Usage> {
     }
 
     let source = source.ok_or_else(|| Usage("no source folder given".to_string()))?;
-    if add && (destination.is_some() || !second_copies.is_empty()) {
+    if add && (destination.is_some() || !second_copies.is_empty() || gdrive) {
         return Err(Usage(
             "--add copies nothing, so it takes no destination".to_string(),
         ));
@@ -157,30 +173,34 @@ pub fn parse(args: &[String]) -> Result<Option<ImportArgs>, Usage> {
         ));
     }
 
-    Ok(Some(ImportArgs {
+    Ok(Command::Import(Box::new(ImportArgs {
         source,
         destination,
         second_copies,
+        gdrive,
         include_subfolders,
         options,
         previews,
         dry_run,
         eject,
-    }))
+    })))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parsed(line: &str) -> Result<Option<ImportArgs>, Usage> {
+    fn parsed(line: &str) -> Result<Box<ImportArgs>, Usage> {
         let args: Vec<String> = line.split_whitespace().map(String::from).collect();
-        parse(&args)
+        match parse(&args)? {
+            Command::Import(args) => Ok(args),
+            other => panic!("expected an import, got {other:?}"),
+        }
     }
 
     #[test]
     fn defaults_go_into_one_folder() {
-        let args = parsed("import /card --dest /photos").unwrap().unwrap();
+        let args = parsed("import /card --dest /photos").unwrap();
         assert_eq!(args.options.organize, Organize::IntoOneFolder);
         assert!(args.options.skip_suspected_duplicates);
         assert!(args.include_subfolders && args.previews);
@@ -191,10 +211,10 @@ mod tests {
         let args = parsed(
             "import /card --dest /photos --subfolder Wedding --organize date --date-format %Y/%m \
              --rename {custom}-{seq:3} --custom-text Anna --start-number 5 --extensions lower \
-             --only raw --since 2026-01-01 --all --second-copy /backup --no-subfolders",
+             --only raw --since 2026-01-01 --all --second-copy /backup --no-subfolders --gdrive",
         )
-        .unwrap()
         .unwrap();
+        assert!(args.gdrive);
         assert_eq!(args.options.subfolder, Some(PathBuf::from("Wedding")));
         assert!(matches!(args.options.organize, Organize::ByDate(_)));
         assert!(args.options.rename.is_some());
@@ -217,7 +237,8 @@ mod tests {
             "import /card --dest /photos --wat",
             "import /card --add --dest /photos",
             "import /card --dest",
-            "copy /card",
+            "import /card --add --gdrive",
+            "import /card --dest /photos --gdrive Elsewhere",
         ] {
             assert!(parsed(line).is_err(), "{line}");
         }

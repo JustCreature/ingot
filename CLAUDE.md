@@ -47,15 +47,19 @@ These are deliberate design decisions, not suggestions. Preserve them in any imp
 
 ## Status
 
-**Current phase:** Phase 3 — Asynchronous I/O Engine. **In progress:** replication is built and tested on synthetic data (2026-10-30). The deletion sweep, engine integration, and a real-card measurement remain. Nothing from this work is committed yet.
+**Current phase:** Phase 3 — Asynchronous I/O Engine. Copying to local folders and Google Drive works through `ingot import` (2026-10-30); not yet measured on a real card.
 
-**Built (`crates/ingot_core/src/replicate/`):** `ReplicationTarget` trait, `LocalTarget`, `VerifiedReplica`, `CopyEngine::replicate`, `ReplicationReport`; `examples/bench_replicate.rs`. Details in global-plan Phase 3 Step 2b. `cargo test --workspace` 21 green, clippy clean.
+**Built (`crates/ingot_core/src/replicate/`):** `ReplicationTarget` trait, `LocalTarget`, `VerifiedReplica`, `CopyEngine::replicate`, `ReplicationReport`; `examples/bench_replicate.rs`. Details in global-plan Phase 3 Step 2b. 
 
 **Measured (40 × 30 MB synthetic files, warm cache, source and target on the same internal SSD; not a card number):** read=2, write=4: depth 1 → 247 MB peak, 4 → 305 MB, 16 → 546 MB, with throughput 450–570 MB/s and no trend. Depth controls RAM, not speed, so 4 is the default in the bench.
 
 **Import options (`import.rs`, `plan_import`):** subfolder; organize into one folder, by original folders, or by date (any chrono format); rename templates (`{name} {folder} {custom} {filenum} {seq:N} {date:FMT}`) with start number and extension case; selection by kind, date range, or hand-picked paths; suspected-duplicate skip (name + capture time + size) from an append-only history; second copies; include-subfolders; eject; add-only; dry run. CLI: `cargo run -- import --help`. All targets share one relative path.
 
 **Copy decisions (2026-10-30):** an identical file on a target counts as done; a different file under one name is kept and the new one gets `-2`; undated frames use the file date; a history entry is only written once a file is on every target; a waiting preview read goes first on the card (`CardGate`).
+
+**Google Drive (`replicate/drive.rs`, `drive_auth.rs`):** secondary target, modelled on rclone's backend (HTTP/1.1, 4 transfers, pacer with truncated exponential backoff, resumable sessions, folder-id cache). The whole file is one resumable PUT because it is already in RAM. Verified by BLAKE3 of the bytes against the card, then Drive's MD5 against the bytes. **Hard rule: Ingot only touches `__ingot_backups` in My Drive.** It is a constant with no setting, parents are the `ContainedFolder` type, and no delete/move/update call exists. Tested against a local mock server plus one real TLS round trip to Google's token endpoint that was correctly refused. **Never yet run with a real Google account.** Setup: `docs/guides/google-drive.md`.
+
+**Not built:** real-card measurement; real Drive upload; deletion sweep (depends on culling); culling UI, display. Lightroom coverage is in global-plan Phase 3 Step 4.
 
 **Project layout:** Cargo workspace. `/Cargo.toml` = workspace root **and** the `ingot` binary package; `/src/main.rs` = the app (constructs an `Engine`, drains `ingest()`). `crates/ingot_core/` = the engine library (UI-dep-free). Public API: `Engine`/`EngineConfig`/`IngestEvent` + `scan_source_dir`/`enrich_assets`/`get_embedded_preview_location`/`read_embedded_preview`/`plan_import`/`CopyEngine` + model types (`PreviewStrip` etc.). Run app: `cargo run -- import <source> --dest <folder>`; tests: `cargo test --workspace`; benches: `cargo run --release -p ingot_core --example bench_{enrich,preview,ingest,read_threads}` (ingest/read_threads default to `/Volumes/EOS_DIGITAL/DCIM`).
 
