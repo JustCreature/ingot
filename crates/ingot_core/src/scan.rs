@@ -62,6 +62,11 @@ pub fn scan_source(source: &Path, options: &ScanOptions) -> ScanResponse {
                 if !e.file_type().is_file() {
                     continue;
                 }
+                // macOS writes `._IMG_1.CR2` metadata files on exFAT cards. They
+                // have a photo's extension but hold no photo.
+                if e.file_name().to_string_lossy().starts_with("._") {
+                    continue;
+                }
                 let kind = e
                     .path()
                     .extension()
@@ -114,12 +119,13 @@ pub fn scan_source(source: &Path, options: &ScanOptions) -> ScanResponse {
 }
 
 fn classify(extension: &str) -> Option<FileKind> {
-    let ext: String = extension.to_lowercase();
-    match ext.as_str() {
-        "cr2" => Some(FileKind::Raw),
-        "jpg" | "jpeg" => Some(FileKind::Jpeg),
-        _ => None,
+    if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
+        return Some(FileKind::Jpeg);
     }
+    rawler::decoders::supported_extensions()
+        .iter()
+        .any(|raw| raw.eq_ignore_ascii_case(extension))
+        .then_some(FileKind::Raw)
 }
 
 #[cfg(test)]

@@ -15,6 +15,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Ingot** — a high-performance RAW+JPEG photo ingestion and triage engine, written in **Rust**. It competes with Photo Mechanic / FastRawViewer: ingest a camera card fast, let the photographer rate and cull *immediately* while files replicate to multiple storage targets in the background.
 
+## Licence
+
+GPL-3.0-or-later (MIT until commit 6bc36c7). `crates/ingot_develop` ports darktable code. Keep the attribution header in ported files and update `NOTICE`.
+
 ## Working on this repo
 
 - Implement changes directly: write code, run builds and tests, and verify the result.

@@ -13,7 +13,7 @@ use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
 
 use crate::asset::{AssetKey, ImageProcessingError};
 use crate::import::{DuplicateKey, ImportHistory, ImportPlan};
-use crate::preview::{make_preview_from_jpeg_bytes, make_thumbnail_from_jpeg_bytes};
+use crate::preview::{compress, make_preview_from_jpeg_bytes, make_thumbnail_from_jpeg_bytes};
 use crate::replicate::{
     CardGate, CopyEngine, ReplicationEvent, ReplicationFailure, ReplicationReport,
     ReplicationTarget,
@@ -353,20 +353,53 @@ impl Engine {
 
 /// Acquire the JPEG bytes that feed the preview pipeline for one asset, per its
 /// read stage: a RAW seek-reads its embedded-preview strip; a JPEG reads the
-/// file. Lock-free and self-contained, so it is unit-testable without threads.
+/// file. A RAW whose format hides its preview from that fast path, such as CR3 or
+/// RAF, goes through the RAW decoder's own preview extraction, which reads the
+/// whole file. Lock-free and self-contained, so it is unit-testable without threads.
 fn read_source_bytes(
     kind: FileKind,
     path: &Path,
     strip: Option<PreviewStrip>,
 ) -> Result<Vec<u8>, ImageProcessingError> {
     match kind {
-        FileKind::Raw => strip
-            .ok_or_else(|| {
-                ImageProcessingError::from("no embedded preview location found for RAW asset")
-            })
-            .and_then(|strip| read_embedded_preview(path, strip)),
+        FileKind::Raw => {
+            if let Some(strip) = strip {
+                let bytes = read_embedded_preview(path, strip)?;
+                if bytes.starts_with(&[0xFF, 0xD8]) {
+                    return Ok(bytes);
+                }
+            }
+            decoder_preview_jpeg(path)
+        }
         FileKind::Jpeg => std::fs::read(path).map_err(ImageProcessingError::from),
     }
+}
+
+/// The largest image embedded in a RAW, as found by the decoder, encoded as a JPEG.
+/// Never decodes the sensor data.
+fn decoder_preview_jpeg(path: &Path) -> Result<Vec<u8>, ImageProcessingError> {
+    let source = rawler::rawsource::RawSource::new(path)?;
+    let decoder = rawler::get_decoder(&source)?;
+    let params = rawler::decoders::RawDecodeParams::default();
+    let image = match decoder.full_image(&source, &params)? {
+        Some(image) => Some(image),
+        None => match decoder.preview_image(&source, &params)? {
+            Some(image) => Some(image),
+            None => decoder.thumbnail_image(&source, &params)?,
+        },
+    }
+    .ok_or_else(|| format!("{} has no embedded preview", path.display()))?;
+
+    let rgb = image.to_rgb8();
+    let (width, height) = (rgb.width() as usize, rgb.height() as usize);
+    compress(turbojpeg::Image {
+        pixels: rgb.into_raw(),
+        width,
+        pitch: width * 3,
+        height,
+        format: turbojpeg::PixelFormat::RGB,
+    })
+    .map_err(|err| format!("could not encode preview: {err}").into())
 }
 
 #[cfg(test)]
@@ -525,6 +558,26 @@ mod tests {
         let plan = plan_import(&engine.scan_response, &card, &options, Some(&history)).unwrap();
         assert!(plan.files.is_empty());
         assert_eq!(plan.skipped_duplicates.len(), 1);
+    }
+
+    #[test]
+    fn decoder_fallback_produces_a_usable_preview() {
+        let raw =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_exif_read/IMG_1939.CR2");
+
+        let jpeg = decoder_preview_jpeg(&raw).unwrap();
+
+        assert!(jpeg.starts_with(&[0xFF, 0xD8]));
+        assert!(make_thumbnail_from_jpeg_bytes(&jpeg).is_ok());
+    }
+
+    #[test]
+    fn raw_that_is_not_an_image_records_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("IMG_1.NEF");
+        std::fs::write(&fake, b"not a raw file at all").unwrap();
+
+        assert!(read_source_bytes(FileKind::Raw, &fake, None).is_err());
     }
 
     #[test]
