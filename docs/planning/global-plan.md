@@ -309,6 +309,8 @@ There is **no standard EXIF star-rating tag** — Lightroom/Bridge read `xmp:Rat
 
 ## Phase 5: Visual Clustering (Milestone 2)
 
+**Built (2026-10-30), `crates/ingot_core/src/cluster.rs`.** Differs from the steps below in three ways: the hash is implemented here rather than taken from `image_hasher`; it runs on a thread fed from thumbnails already in memory, not inside the preview pool; and photos are also compared by a 4x4 color grid, because the design's slider goes from "scene only" to "+ subject position". Capture order uses the file's date, which is known before headers are read, and a gap over 30 minutes always breaks a group.
+
 Algorithmic grouping folded into the existing Rayon pipeline.
 
 ### Step 1 — Parallel hashing

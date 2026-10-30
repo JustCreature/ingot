@@ -22,6 +22,8 @@ Requirements from the project owner. None of these may be weakened without askin
 - **Never overwrite an existing file** on a target. Temp files and Ingot's own sidecars and state are the only exceptions.
 - **Google Drive: only ever inside `__ingot_backups`.** The folder name is a constant with no setting, parents are the `ContainedFolder` type, and no delete, move, rename or update call may exist in that code. Never commit an OAuth client: the repo is public.
 - **Culling never waits on copying.** No lock held across I/O; preview reads go first on the card; a backed-up copy must not hold a card slot.
+- **Import comes first.** Source and destination are chosen before any photo is opened: the folder listing reads names, sizes and dates only. Copying starts the moment the card is first read. Only ticked photos are imported, and the count is always visible.
+- **Nothing that reads the card or hashes runs on the UI thread.**
 - **Never touch the source card** when deleting or writing sidecars. Source deletion is out of scope for v1.
 - **Don't unmount or touch the user's device programmatically** for benchmarks. Ask them to run `sudo purge` or re-seat the card. (`--eject` runs only when the user asks.)
 
@@ -44,7 +46,8 @@ crates/ingot_core/       engine library, no UI dependencies
     asset.rs             PhotoAsset, AssetKey, TriageState
     metadata.rs          bounded EXIF header read, embedded preview location
     preview.rs           turbojpeg decode, resize, encode
-    import.rs            ImportOptions, rename templates, plan_import, ImportHistory
+    import.rs            ImportOptions, rename templates, plan_import, planned_relative, ImportHistory
+    cluster.rs           Fingerprint (pHash + color grid), looks_alike, cluster_ranges
     triage.rs            TriageStore (append-only JSONL), XMP sidecars
     sweep.rs             plan_sweep / execute_sweep: rejected copies to the Trash
     route.rs             Target configuration
@@ -54,7 +57,7 @@ crates/ingot_core/       engine library, no UI dependencies
       local.rs           LocalTarget: temp, verify, no-replace publish
       drive.rs           DriveTarget: pacer, resumable upload, ContainedFolder
       drive_auth.rs      desktop sign-in (PKCE), token refresh
-  examples/              bench_enrich, bench_preview, bench_ingest, bench_read_threads, bench_replicate
+  examples/              bench_enrich, bench_preview, bench_ingest, bench_read_threads, bench_replicate, bench_cluster
   testdata/test_exif_read/  real Canon CR2 and JPEG fixtures
 crates/ingot_develop/    RAW develop engine, darktable ports marked in each file
   src/
@@ -123,7 +126,17 @@ Mistakes actually made on this project, and what they taught. Add to this list w
 - A local pass doesn't prove CI passes: only trust the green run on the PR.
 - This environment can't capture the screen, so `render_views` draws each view to PNG instead. Headless runs don't prove how the app feels to use.
 
+**Import flow**
+- "Show where files go" took a very long time on a card, because `plan_import` statted every file and ran on the UI thread, and a card answers each stat slowly. The fix is at the root: the folder walk keeps sizes and dates, planning reads only those, and a test deletes the card before planning to prove it. Check every UI call for what it can reach on disk. The same audit found `find_cards` statting volumes every frame, a sweep hashing on the UI thread, and sidecars syncing on a keypress.
+- The first build opened photos and asked where to copy them afterwards. That is backwards: the user wants one card read, with copying starting at that moment. Read the PoC and ask what the flow is, not only what the options are.
+- A strictly-first preview queue starved the copy for minutes on a full card. A priority needs a turn limit (`PRIORITY_RUN`) when the low side also has to start promptly.
+- The stores loop only settled finished writes when the next file arrived. Fine for a batch, but an idle queue would have held progress and secondaries forever. `select!` on both.
+- A photo's date, identity and destination must not change as information arrives. Headers come later than the listing, so they all use the file date, and EXIF is only displayed.
+- History written at the end of a run would lose everything if a long session crashed. Write it per file.
+
 **UI (egui)**
+- A long label in a central panel can widen it over a side panel, which then looks clipped. Truncate. Only the rendered PNG showed this.
+- The test harness fails on unlabelled inputs. Use `.labelled_by(label.id)`; screen readers need it too.
 - The default font has no `★`, `⌘`, `←` or `⚠`. In the real app these become boxes; the test harness panics on them, which is how it was found. Draw shapes or use words.
 - Windows need several frames before they appear in tests (a sizing pass comes first), and a window's title can have the same label as its button.
 - Don't assume a texture fits: 6240 px exceeds the 2048 limit seen in tests. `fit_texture` shrinks to the real maximum.
@@ -170,7 +183,11 @@ These are deliberate design decisions, not suggestions. Preserve them in any imp
 
 ## Status
 
-**Current state (2026-10-30):** the app works end to end: import, cull, develop, trash rejected copies. Phases 3 and 4 are built apart from what "Not built" lists. Waiting on the owner's first hands-on test. 138 tests, plus 2 ignored ones that need a GPU or touch the Trash.
+**Current state (2026-10-30):** the app works end to end: import, cull, cluster, develop, trash rejected copies. Phases 3, 4 and 5 are built apart from what "Not built" lists. The owner tested the first app build; the import-first flow and clusters are that feedback, and await a second test.
+
+**Import flow (`src/ui/app.rs`, `ImportQueue`, `Engine::start_session`):** launchpad (source), import screen (names with ticks, destination, options), then Start, which begins copy, header reads and previews together. `ImportQueue` is live: `push` and `remove` work until `close`, and a file leaves reach once its read starts. A session stays open after the queue drains, and closes on New import, which is refused while files are pending. Each file keeps its planned name for the session. History is written per file, once it is on every target. Measured on 10,000 files on the internal SSD: listing 77 ms, planning 23 ms (`bench_cluster`).
+
+**Clusters (`cluster.rs`, `View::Clusters`, key `L`):** fingerprints come from the header thumbnail, replaced by the grid thumbnail when it arrives, so clustering adds no card read. Groups break between neighbors in capture order where color or structure differ by more than sensitivity allows, or the gap exceeds 30 minutes. Limits only tighten as sensitivity rises, so groups only split. Measured (`bench_cluster`, i7-1068NG7): 1.2 ms per 512 px fingerprint, 0.34 ms to regroup 10,000 photos. The thresholds were tuned on synthetic bursts and 3 real photos only, so expect to retune them on a real shoot.
 
 **Built (`crates/ingot_core/src/replicate/`):** `ReplicationTarget` trait, `LocalTarget`, `VerifiedReplica`, `CopyEngine::replicate`, `ReplicationReport`; `examples/bench_replicate.rs`. Details in global-plan Phase 3 Step 2b. 
 
@@ -184,9 +201,9 @@ These are deliberate design decisions, not suggestions. Preserve them in any imp
 
 **Develop engine (`crates/ingot_develop`, 2026-10-30):** ports darktable's scene-referred order: raw prepare, white balance, clip highlights, RCD demosaic, exposure, color matrix to Rec.2020, sigmoid, sRGB. Decoding is rawler. `ingot develop <raw> <out.jpg>`. Measured on 24 MP Canon CR2, i7-1068NG7: decode 0.35 s, develop 1.5 s, 560 MB peak. Bayer only: X-Trans and linear DNG return an error. Only CR2 has been tried on real files. Remaining darktable work: highlight reconstruction, PPG border, X-Trans, denoise, sharpening, color balance, lens correction, and more.
 
-**App (`src/ui/`, 2026-10-30):** `cargo run --release` opens it. Grid, loupe with 1:1, develop with Lightroom-style sliders, import dialog, trash sweep, Lightroom hotkeys (`/` lists them). `INGOT_SHOTS=<dir> cargo test --bin ingot render_views -- --ignored` renders each view to PNG. Sidecars are written beside copies only, never on the source; decisions live in `triage.jsonl` in the app data folder.
+**App (`src/ui/`, 2026-10-30):** `cargo run --release` opens it. Grid, loupe with 1:1, develop with Lightroom-style sliders, import dialog, trash sweep, Lightroom hotkeys (`/` lists them). `INGOT_SHOTS=<dir> cargo test --bin ingot render_views -- --ignored` renders each view to PNG, the import screen and clusters included. Sidecars are written beside copies only, never on the source; decisions live in `triage.jsonl` in the app data folder.
 
-**Not built:** highlight reconstruction, denoise, lens correction, color balance, tone curve, HSL, crop, X-Trans and linear DNG develop, video import, saved presets, collections, catalog. Sidecars aren't read back on open. Untested for real: card imports, Google Drive, RAW formats other than CR2. Highlights, shadows, levels, saturation and vibrance are Ingot's own simple versions, not darktable ports.
+**Not built:** keyboard ticking on the import screen, thumbnails before a destination is chosen (ruled out by the flow), highlight reconstruction, denoise, lens correction, color balance, tone curve, HSL, crop, X-Trans and linear DNG develop, video import, saved presets, collections, catalog. Sidecars aren't read back on open. Untested for real: card imports, Google Drive, RAW formats other than CR2. Highlights, shadows, levels, saturation and vibrance are Ingot's own simple versions, not darktable ports.
 
 **Phase-2 step-4 measured numbers (879-asset Canon card, 8 cores):** scan+enrich cold 14.4 s (61 fps) / warm 0.07 s; ingest cold **154 s (6 fps)** / warm **~26 s (33 fps)**; read-only cold **2≈8 threads ≈ 158 s ≈ 20 MB/s**. **Read-bound on card** (cold≫warm 6×, cold-ingest≈cold-read, 2≈8). Card ceiling is device-fixed; concurrency can't beat it → cap `card_read_permits` 1–2 (frees CPU threads, zero throughput cost). Only cold lever = fewer bytes (embedded-for-pairs ✓). On SSD/NVMe → flips CPU-bound (~33 fps). Streaming = time-to-interaction ~14 s, not 154 s.
 

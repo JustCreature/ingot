@@ -568,11 +568,6 @@ impl Library {
         self.refresh_visible();
     }
 
-    pub fn tick_none(&mut self) {
-        self.ticked.clear();
-        self.refresh_visible();
-    }
-
     pub fn mark_already_imported(&mut self, files: &HashSet<PathBuf>) {
         self.already_imported = self
             .photos
@@ -814,7 +809,7 @@ mod tests {
         let key = library.photos[0].key.clone();
         library.set_ticked(&key, false);
         assert_eq!(library.import_counts().photos, 2);
-        library.tick_none();
+        library.ticked.clear();
         assert_eq!(library.import_counts().files, 0);
         library.tick_all(false);
         assert_eq!(library.import_counts().files, 3);
