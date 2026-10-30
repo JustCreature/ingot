@@ -14,19 +14,17 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     hash::Hash,
-    io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError, RwLock},
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant, SystemTime},
 };
 
-use chrono::{DateTime, Local, NaiveDate};
 use tokio::{
     sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc},
     task::{self, JoinSet},
 };
 
-use crate::ScanResponse;
+use crate::import::{ImportPlan, PlannedFile};
 
 pub(crate) type ReplicationError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -188,8 +186,8 @@ pub struct FileInfo {
     /// Identifies the file for the proof only. Targets must never open it: the
     /// bytes were already read from it once.
     pub source: PathBuf,
-    pub file_name: OsString,
-    pub captured_at: NaiveDate,
+    /// Where the file belongs below a target's root.
+    pub relative: PathBuf,
     /// The source's modified time, kept on the copy where the target supports it.
     pub modified: Option<SystemTime>,
     pub src_hash: blake3::Hash,
@@ -234,20 +232,64 @@ pub struct ReplicationReport {
     pub primary_done_after: Duration,
 }
 
+/// Live progress, one event per file per target. Sending never waits, so a slow
+/// consumer can't hold up a copy.
+#[derive(Debug)]
+pub enum ReplicationEvent {
+    Verified {
+        source: PathBuf,
+        target: TargetId,
+        size: u64,
+        newly_written: bool,
+    },
+    Failed {
+        source: Option<PathBuf>,
+        target: Option<TargetId>,
+        error: String,
+    },
+}
+
+type Progress = Option<crossbeam_channel::Sender<ReplicationEvent>>;
+
 impl ReplicationReport {
+    fn record_failure(&mut self, progress: &Progress, failure: ReplicationFailure) {
+        if let Some(progress) = progress {
+            let _ = progress.send(ReplicationEvent::Failed {
+                source: failure.source.clone(),
+                target: failure.target,
+                error: failure.error.to_string(),
+            });
+        }
+        self.failures.push(failure);
+    }
+
     fn record_store(
         &mut self,
+        progress: &Progress,
         target: TargetId,
         source: PathBuf,
         result: Result<VerifiedReplica, ReplicationError>,
     ) {
         match result {
-            Ok(replica) => self.verified.push(replica),
-            Err(error) => self.failures.push(ReplicationFailure {
-                source: Some(source),
-                target: Some(target),
-                error,
-            }),
+            Ok(replica) => {
+                if let Some(progress) = progress {
+                    let _ = progress.send(ReplicationEvent::Verified {
+                        source,
+                        target,
+                        size: replica.size(),
+                        newly_written: replica.newly_written(),
+                    });
+                }
+                self.verified.push(replica);
+            }
+            Err(error) => self.record_failure(
+                progress,
+                ReplicationFailure {
+                    source: Some(source),
+                    target: Some(target),
+                    error,
+                },
+            ),
         }
     }
 }
@@ -261,6 +303,7 @@ pub struct CopyEngine {
     read_channel_depth: usize,
     primary_target: Arc<dyn ReplicationTarget>,
     secondary_targets: Vec<Arc<dyn ReplicationTarget>>,
+    progress: Progress,
 }
 
 #[derive(Clone)]
@@ -278,11 +321,6 @@ struct DeferredFile {
 
 type ReadOutcome = Result<CopyMessage, ReplicationFailure>;
 
-struct FileToRead {
-    source: PathBuf,
-    captured_at: Option<NaiveDate>,
-}
-
 fn read_failure(source: PathBuf, error: ReplicationError) -> ReplicationFailure {
     ReplicationFailure {
         source: Some(source),
@@ -291,83 +329,31 @@ fn read_failure(source: PathBuf, error: ReplicationError) -> ReplicationFailure 
     }
 }
 
-/// Snapshots the files to copy so that no lock is held during I/O. A file the
-/// scanner displaced from its asset is still a photo on the card, so it is copied
-/// with the rest.
-fn list_files(scan: &RwLock<ScanResponse>) -> Result<Vec<FileToRead>, ReplicationError> {
-    let scan = scan
-        .read()
-        .map_err(|err| format!("scan store lock poisoned: {err}"))?;
-
-    let mut files = vec![];
-    for asset in scan.assets.values() {
-        for (_, path) in asset.files.get_all() {
-            files.push(FileToRead {
-                source: path.clone(),
-                captured_at: asset.exif_data.captured_at.map(|at| at.date()),
-            });
-        }
-    }
-    for collision in &scan.collisions {
-        files.push(FileToRead {
-            source: collision.displaced.clone(),
-            captured_at: scan
-                .assets
-                .get(&collision.key)
-                .and_then(|asset| asset.exif_data.captured_at)
-                .map(|at| at.date()),
-        });
-    }
-    Ok(files)
-}
-
 /// Reads one file. The card slot is released as soon as the bytes are in RAM, so
 /// hashing and any wait for a slow target never keep a preview read off the card.
 fn read_file_blocking(
     permit: CardPermit,
-    file: FileToRead,
-    file_name: OsString,
+    file: PlannedFile,
 ) -> Result<CopyMessage, ReplicationError> {
-    let source = file.source;
-    let opened = std::fs::File::open(&source)?;
-    let metadata = opened.metadata()?;
-    let modified = metadata.modified().ok();
-    let size = metadata.len() as usize;
-    let mut opened = opened;
-    let mut bytes = Vec::with_capacity(size);
-    opened.read_to_end(&mut bytes)?;
+    let bytes = std::fs::read(&file.source)?;
     drop(permit);
-
-    // A frame with no EXIF date is still routed: the file's own date comes from
-    // the camera's clock too.
-    let captured_at = file
-        .captured_at
-        .or_else(|| modified.map(|at| DateTime::<Local>::from(at).date_naive()))
-        .ok_or("no capture date and no file date")?;
 
     let src_hash = blake3::hash(&bytes);
     Ok(CopyMessage {
         info: FileInfo {
-            source,
-            file_name,
-            captured_at,
-            modified,
+            source: file.source,
+            relative: file.relative,
+            modified: file.modified,
             src_hash,
         },
         bytes: Arc::from(bytes),
     })
 }
 
-async fn read_file(gate: Arc<CardGate>, file: FileToRead) -> ReadOutcome {
+async fn read_file(gate: Arc<CardGate>, file: PlannedFile) -> ReadOutcome {
     let source = file.source.clone();
-    let Some(file_name) = source.file_name().map(OsStr::to_os_string) else {
-        let error = ReplicationError::from(format!("no file name in {}", source.display()));
-        return Err(read_failure(source, error));
-    };
-
     let permit = gate.acquire_background().await;
-    let read =
-        tokio::task::spawn_blocking(move || read_file_blocking(permit, file, file_name)).await;
+    let read = tokio::task::spawn_blocking(move || read_file_blocking(permit, file)).await;
 
     match read {
         Ok(Ok(message)) => Ok(message),
@@ -459,6 +445,7 @@ async fn run_secondary(
     target: Arc<dyn ReplicationTarget>,
     mut hot: mpsc::Receiver<CopyMessage>,
     mut deferred: mpsc::UnboundedReceiver<DeferredFile>,
+    progress: Progress,
 ) -> ReplicationReport {
     let mut report = ReplicationReport::default();
     let mut stores = StoreSet::new();
@@ -468,7 +455,7 @@ async fn run_secondary(
     while hot_open || deferred_open {
         while stores.len() >= max_stores {
             if let Some((pending, result)) = stores.next().await {
-                report.record_store(target.id(), pending.info.source, result);
+                report.record_store(&progress, target.id(), pending.info.source, result);
             }
         }
 
@@ -476,7 +463,7 @@ async fn run_secondary(
             biased;
             finished = stores.next(), if !stores.is_empty() => {
                 if let Some((pending, result)) = finished {
-                    report.record_store(target.id(), pending.info.source, result);
+                    report.record_store(&progress, target.id(), pending.info.source, result);
                 }
             }
             msg = hot.recv(), if hot_open => match msg {
@@ -505,7 +492,7 @@ async fn run_secondary(
     }
 
     while let Some((pending, result)) = stores.next().await {
-        report.record_store(target.id(), pending.info.source, result);
+        report.record_store(&progress, target.id(), pending.info.source, result);
     }
     report
 }
@@ -521,6 +508,7 @@ fn settle_primary(
     report: &mut ReplicationReport,
     primary: TargetId,
     queues: &[SecondaryQueue],
+    progress: &Progress,
     pending: PendingStore,
     result: Result<VerifiedReplica, ReplicationError>,
 ) {
@@ -547,15 +535,18 @@ fn settle_primary(
         };
         match queued {
             Ok(()) => report.deferred_copies += 1,
-            Err(error) => report.failures.push(ReplicationFailure {
-                source: Some(info.source.clone()),
-                target: Some(queue.id),
-                error,
-            }),
+            Err(error) => report.record_failure(
+                progress,
+                ReplicationFailure {
+                    source: Some(info.source.clone()),
+                    target: Some(queue.id),
+                    error,
+                },
+            ),
         }
     }
 
-    report.record_store(primary, info.source, result);
+    report.record_store(progress, primary, info.source, result);
 }
 
 impl CopyEngine {
@@ -573,6 +564,7 @@ impl CopyEngine {
             read_channel_depth: read_channel_depth.max(1),
             primary_target,
             secondary_targets: vec![],
+            progress: None,
         }
     }
 
@@ -581,14 +573,15 @@ impl CopyEngine {
         self
     }
 
+    pub fn with_progress(mut self, progress: crossbeam_channel::Sender<ReplicationEvent>) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
     /// Reads every file once in the background. A slot is held from before the read
     /// until the bytes are in the channel, so a full channel stops further card
     /// reads, while the card itself stays free for previews during the wait.
-    fn start_read_stream(
-        &self,
-        scan: &RwLock<ScanResponse>,
-    ) -> Result<mpsc::Receiver<ReadOutcome>, ReplicationError> {
-        let files = list_files(scan)?;
+    fn start_read_stream(&self, files: Vec<PlannedFile>) -> mpsc::Receiver<ReadOutcome> {
         let (tx, rx) = mpsc::channel(self.read_channel_depth);
         let buffers = Arc::new(Semaphore::new(READS_IN_PROGRESS));
         let card = Arc::clone(&self.card);
@@ -614,20 +607,20 @@ impl CopyEngine {
             }
         });
 
-        Ok(rx)
+        rx
     }
 
-    /// Copies every scanned file to all targets. The primary paces the card;
+    /// Copies every planned file to all targets. The primary paces the card;
     /// secondaries take bytes from RAM when they keep up and from the primary's
     /// file when they don't. One bad file never stops the batch: its failure is
     /// recorded in the report.
-    pub async fn replicate(
-        &self,
-        scan: &RwLock<ScanResponse>,
-    ) -> Result<ReplicationReport, ReplicationError> {
+    pub async fn replicate(&self, plan: ImportPlan) -> ReplicationReport {
         let started = Instant::now();
-        let mut rx = self.start_read_stream(scan)?;
         let mut report = ReplicationReport::default();
+        for failure in plan.failures {
+            report.record_failure(&self.progress, failure);
+        }
+        let mut rx = self.start_read_stream(plan.files);
         let mut stores = StoreSet::new();
         let primary_id = self.primary_target.id();
         let max_stores = self.primary_target.max_concurrent_writes().max(1);
@@ -642,14 +635,19 @@ impl CopyEngine {
                 hot: hot_tx,
                 deferred: deferred_tx,
             });
-            workers.spawn(run_secondary(Arc::clone(target), hot_rx, deferred_rx));
+            workers.spawn(run_secondary(
+                Arc::clone(target),
+                hot_rx,
+                deferred_rx,
+                self.progress.clone(),
+            ));
         }
 
         while let Some(outcome) = rx.recv().await {
             let msg = match outcome {
                 Ok(msg) => msg,
                 Err(failure) => {
-                    report.failures.push(failure);
+                    report.record_failure(&self.progress, failure);
                     continue;
                 }
             };
@@ -658,7 +656,14 @@ impl CopyEngine {
             // work, is what passes backpressure on to the reader.
             while stores.len() >= max_stores {
                 if let Some((pending, result)) = stores.next().await {
-                    settle_primary(&mut report, primary_id, &queues, pending, result);
+                    settle_primary(
+                        &mut report,
+                        primary_id,
+                        &queues,
+                        &self.progress,
+                        pending,
+                        result,
+                    );
                 }
             }
 
@@ -682,7 +687,14 @@ impl CopyEngine {
         }
 
         while let Some((pending, result)) = stores.next().await {
-            settle_primary(&mut report, primary_id, &queues, pending, result);
+            settle_primary(
+                &mut report,
+                primary_id,
+                &queues,
+                &self.progress,
+                pending,
+                result,
+            );
         }
         report.primary_done_after = started.elapsed();
 
@@ -694,15 +706,18 @@ impl CopyEngine {
                     report.verified.extend(secondary.verified);
                     report.failures.extend(secondary.failures);
                 }
-                Err(err) => report.failures.push(ReplicationFailure {
-                    source: None,
-                    target: None,
-                    error: ReplicationError::from(format!("secondary worker failed: {err}")),
-                }),
+                Err(err) => report.record_failure(
+                    &self.progress,
+                    ReplicationFailure {
+                        source: None,
+                        target: None,
+                        error: ReplicationError::from(format!("secondary worker failed: {err}")),
+                    },
+                ),
             }
         }
 
-        Ok(report)
+        report
     }
 }
 
@@ -716,14 +731,27 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use std::sync::RwLock;
+
     use super::*;
-    use crate::{AssetKey, FileKind, PhotoAsset, Target, TargetKind};
+    use crate::{
+        AssetKey, DateFolders, FileKind, ImportOptions, Organize, PhotoAsset, ScanResponse, Target,
+        TargetKind, plan_import,
+    };
+    use chrono::{Local, NaiveDate};
+
+    fn plan_of(scan: &RwLock<ScanResponse>) -> ImportPlan {
+        let options = ImportOptions {
+            organize: Organize::ByDate(DateFolders::default()),
+            ..Default::default()
+        };
+        plan_import(scan, Path::new("/"), &options, None).unwrap()
+    }
 
     fn file_info(name: &str, src_hash: blake3::Hash) -> FileInfo {
         FileInfo {
             source: Path::new("card").join(name),
-            file_name: name.into(),
-            captured_at: date(),
+            relative: Path::new("2026/2026-05-22").join(name),
             modified: None,
             src_hash,
         }
@@ -764,6 +792,7 @@ mod tests {
             assets,
             collisions: vec![],
             errors: vec![],
+            ignored: vec![],
         })
     }
 
@@ -801,7 +830,7 @@ mod tests {
         let root = tmp.path().join("target");
 
         let engine = CopyEngine::new(CardGate::new(2), 4, local_target(&root, 4));
-        let report = engine.replicate(&scan).await.unwrap();
+        let report = engine.replicate(plan_of(&scan)).await;
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert_eq!(report.verified.len(), 2);
@@ -828,7 +857,7 @@ mod tests {
         let existing = write_source(&dated_dir(&root), "IMG_0001.CR2", b"existing bytes");
 
         let engine = CopyEngine::new(CardGate::new(1), 4, local_target(&root, 4));
-        let report = engine.replicate(&scan).await.unwrap();
+        let report = engine.replicate(plan_of(&scan)).await;
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert_eq!(fs::read(&existing).unwrap(), b"existing bytes");
@@ -847,11 +876,11 @@ mod tests {
         let root = tmp.path().join("target");
 
         let engine = CopyEngine::new(CardGate::new(2), 4, local_target(&root, 4));
-        let report = engine.replicate(&scan).await.unwrap();
+        let report = engine.replicate(plan_of(&scan)).await;
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert!(report.verified.iter().all(|r| r.newly_written()));
 
-        let report = engine.replicate(&scan).await.unwrap();
+        let report = engine.replicate(plan_of(&scan)).await;
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert_eq!(report.verified.len(), 2);
         assert!(report.verified.iter().all(|r| !r.newly_written()));
@@ -876,9 +905,8 @@ mod tests {
 
         let engine = CopyEngine::new(CardGate::new(1), 4, local_target(&root, 1));
         engine
-            .replicate(&scan_of(&[(&raw, FileKind::Raw)], true))
-            .await
-            .unwrap();
+            .replicate(plan_of(&scan_of(&[(&raw, FileKind::Raw)], true)))
+            .await;
 
         let copied = fs::metadata(dated_dir(&root).join("IMG_0001.CR2")).unwrap();
         assert_eq!(copied.modified().unwrap(), shot);
@@ -918,7 +946,7 @@ mod tests {
         let root = tmp.path().join("target");
 
         let engine = CopyEngine::new(CardGate::new(2), 4, local_target(&root, 4));
-        let report = engine.replicate(&scan).await.unwrap();
+        let report = engine.replicate(plan_of(&scan)).await;
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert_eq!(report.verified.len(), 2);
@@ -945,9 +973,8 @@ mod tests {
 
         let engine = CopyEngine::new(CardGate::new(1), 4, local_target(&root, 4));
         let report = engine
-            .replicate(&scan_of(&[(&undated, FileKind::Raw)], false))
-            .await
-            .unwrap();
+            .replicate(plan_of(&scan_of(&[(&undated, FileKind::Raw)], false)))
+            .await;
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         let today = Local::now().date_naive();
@@ -967,9 +994,8 @@ mod tests {
 
         let engine = CopyEngine::new(CardGate::new(1), 4, local_target(&root, 4));
         let report = engine
-            .replicate(&scan_of(&[(&missing, FileKind::Raw)], true))
-            .await
-            .unwrap();
+            .replicate(plan_of(&scan_of(&[(&missing, FileKind::Raw)], true)))
+            .await;
 
         assert_eq!(report.failures.len(), 1);
         assert_eq!(
@@ -995,7 +1021,7 @@ mod tests {
         let root = tmp.path().join("target");
 
         let engine = CopyEngine::new(CardGate::new(1), 4, local_target(&root, 4));
-        let report = engine.replicate(&scan).await.unwrap();
+        let report = engine.replicate(plan_of(&scan)).await;
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert_eq!(
@@ -1016,7 +1042,7 @@ mod tests {
 
         let gate = CardGate::new(1);
         let engine = CopyEngine::new(Arc::clone(&gate), 1, local_target(tmp.path(), 1));
-        let rx = engine.start_read_stream(&scan).unwrap();
+        let rx = engine.start_read_stream(plan_of(&scan).files);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Nothing is consuming, so the reader is stuck on the channel.
@@ -1043,7 +1069,7 @@ mod tests {
         let scan = scan_of(&files, true);
 
         let engine = CopyEngine::new(CardGate::new(1), DEPTH, local_target(tmp.path(), 1));
-        let mut rx = engine.start_read_stream(&scan).unwrap();
+        let mut rx = engine.start_read_stream(plan_of(&scan).files);
 
         // Nothing is consuming. Any file the reader hasn't reached by the time it
         // is deleted fails, so the successes count exactly what was read.
@@ -1118,7 +1144,7 @@ mod tests {
         });
 
         let engine = CopyEngine::new(CardGate::new(4), 8, target.clone());
-        let report = engine.replicate(&scan_of(&files, true)).await.unwrap();
+        let report = engine.replicate(plan_of(&scan_of(&files, true))).await;
 
         assert_eq!(report.verified.len(), 30);
         assert_eq!(target.peak.load(Ordering::SeqCst), 3);
@@ -1178,7 +1204,7 @@ mod tests {
         let scan = Arc::new(scan);
         let running = {
             let (engine, scan) = (Arc::clone(&engine), Arc::clone(&scan));
-            tokio::spawn(async move { engine.replicate(&scan).await.unwrap() })
+            tokio::spawn(async move { engine.replicate(plan_of(&scan)).await })
         };
 
         // With the secondary stalled, the primary must still receive everything.
@@ -1248,7 +1274,7 @@ mod tests {
 
         let engine = CopyEngine::new(CardGate::new(1), 4, local_target(&primary_root, 1))
             .with_secondary(secondary);
-        let report = engine.replicate(&scan).await.unwrap();
+        let report = engine.replicate(plan_of(&scan)).await;
 
         // The secondary had room, so it still got its copy from RAM.
         assert_eq!(report.verified.len(), 1);

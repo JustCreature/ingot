@@ -6,6 +6,7 @@
 
 mod asset;
 mod engine;
+mod import;
 mod metadata;
 pub mod preview;
 mod replicate;
@@ -18,11 +19,15 @@ mod test_support;
 pub use asset::{
     AssetFiles, AssetKey, ExifAssetData, FileKind, PhotoAsset, PreviewStrip, TriageState,
 };
-pub use engine::{Engine, EngineConfig, IngestEvent};
+pub use engine::{Engine, EngineConfig, ImportHandle, IngestEvent};
+pub use import::{
+    DateFolders, DuplicateKey, ExtensionCase, ImportHistory, ImportOptions, ImportPlan,
+    NameTemplate, Organize, PlannedFile, Selection, plan_import,
+};
 pub use metadata::{enrich_assets, get_embedded_preview_location, read_embedded_preview};
 pub use replicate::{
-    CardGate, CardPermit, CopyEngine, FileInfo, LocalTarget, ReplicaLocation, ReplicationFailure,
-    ReplicationReport, ReplicationTarget, TargetId, VerifiedReplica,
+    CardGate, CardPermit, CopyEngine, FileInfo, LocalTarget, ReplicaLocation, ReplicationEvent,
+    ReplicationFailure, ReplicationReport, ReplicationTarget, TargetId, VerifiedReplica,
 };
-pub use route::{Target, TargetKind, build_destination_path};
-pub use scan::{Collision, ScanResponse, scan_source_dir};
+pub use route::{Target, TargetKind};
+pub use scan::{Collision, ScanOptions, ScanResponse, scan_source, scan_source_dir};

@@ -24,20 +24,50 @@ pub struct ScanResponse {
     pub assets: HashMap<AssetKey, PhotoAsset>,
     pub collisions: Vec<Collision>,
     pub errors: Vec<walkdir::Error>,
+    /// Files that are not photos this engine understands, such as videos. Kept so
+    /// an import can say what it did not copy.
+    pub ignored: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScanOptions {
+    pub include_subfolders: bool,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        ScanOptions {
+            include_subfolders: true,
+        }
+    }
 }
 
 pub fn scan_source_dir(source: &Path) -> ScanResponse {
+    scan_source(source, &ScanOptions::default())
+}
+
+pub fn scan_source(source: &Path, options: &ScanOptions) -> ScanResponse {
     let mut asset_map: HashMap<AssetKey, PhotoAsset> = HashMap::new();
     let mut collisions: Vec<Collision> = vec![];
     let mut errors: Vec<walkdir::Error> = vec![];
-    for e in walkdir::WalkDir::new(source) {
+    let mut ignored: Vec<PathBuf> = vec![];
+    let mut walk = walkdir::WalkDir::new(source);
+    if !options.include_subfolders {
+        walk = walk.max_depth(1);
+    }
+    for e in walk {
         match e {
             Err(e) => errors.push(e),
             Ok(e) => {
-                let Some(ext) = e.path().extension() else {
+                if !e.file_type().is_file() {
                     continue;
-                };
-                let Some(kind) = classify(&ext.to_string_lossy()) else {
+                }
+                let kind = e
+                    .path()
+                    .extension()
+                    .and_then(|ext| classify(&ext.to_string_lossy()));
+                let Some(kind) = kind else {
+                    ignored.push(e.path().to_path_buf());
                     continue;
                 };
                 let Some(dir) = e.path().parent() else {
@@ -79,6 +109,7 @@ pub fn scan_source_dir(source: &Path) -> ScanResponse {
         assets: asset_map,
         collisions,
         errors,
+        ignored,
     }
 }
 
