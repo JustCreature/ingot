@@ -2,6 +2,7 @@
 //! options the import dialog will offer, and keeps previews flowing meanwhile.
 
 mod cli;
+mod ui;
 
 use std::{
     path::Path,
@@ -30,6 +31,7 @@ fn main() -> ExitCode {
             println!("{}", cli::HELP);
             return ExitCode::SUCCESS;
         }
+        CliCommand::Ui(folder) => run_ui(folder),
         CliCommand::Import(import) => run_import(*import),
         CliCommand::GdriveLogin => run_gdrive_login(),
         CliCommand::Develop(develop) => run_develop(*develop),
@@ -38,6 +40,18 @@ fn main() -> ExitCode {
         eprintln!("error: {err}");
         ExitCode::FAILURE
     })
+}
+
+fn run_ui(folder: Option<std::path::PathBuf>) -> AppResult {
+    ui::run(
+        ui::AppPaths {
+            triage: cli::triage_path().ok_or("no app data folder on this system")?,
+            history: cli::history_path().ok_or("no app data folder on this system")?,
+            gdrive: cli::gdrive_credentials_path().ok_or("no app data folder on this system")?,
+        },
+        folder,
+    )?;
+    Ok(ExitCode::SUCCESS)
 }
 
 type AppResult = Result<ExitCode, Box<dyn std::error::Error + Send + Sync>>;

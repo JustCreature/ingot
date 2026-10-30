@@ -7,6 +7,7 @@ use ingot_core::{DateFolders, ExtensionCase, FileKind, ImportOptions, NameTempla
 use ingot_develop::{DevelopParams, WhiteBalance};
 
 pub const HELP: &str = "\
+ingot [folder]           open the app, optionally on a folder or card
 ingot import <source> --dest <folder> [options]
 ingot gdrive-login       sign in to Google Drive (see docs/guides/google-drive.md)
 ingot develop <raw> <out.jpg> [--exposure <stops>] [--contrast <0.1-10>]
@@ -68,6 +69,10 @@ fn date(value: &str) -> Result<NaiveDate, Usage> {
         .map_err(|_| Usage(format!("not a YYYY-MM-DD date: {value}")))
 }
 
+pub fn triage_path() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join("ingot").join("triage.jsonl"))
+}
+
 pub fn gdrive_credentials_path() -> Option<PathBuf> {
     Some(dirs::data_dir()?.join("ingot").join("gdrive-token.json"))
 }
@@ -75,6 +80,7 @@ pub fn gdrive_credentials_path() -> Option<PathBuf> {
 #[derive(Debug)]
 pub enum Command {
     Help,
+    Ui(Option<PathBuf>),
     Import(Box<ImportArgs>),
     GdriveLogin,
     Develop(Box<DevelopArgs>),
@@ -139,11 +145,22 @@ fn parse_develop<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<Comma
 pub fn parse(args: &[String]) -> Result<Command, Usage> {
     let mut args = args.iter();
     match args.next().map(String::as_str) {
-        None | Some("help" | "--help" | "-h") => return Ok(Command::Help),
+        None => return Ok(Command::Ui(None)),
+        Some("help" | "--help" | "-h") => return Ok(Command::Help),
         Some("gdrive-login") => return Ok(Command::GdriveLogin),
         Some("develop") => return parse_develop(args),
         Some("import") => {}
-        Some(other) => return Err(Usage(format!("unknown command: {other}"))),
+        Some(other) if other.starts_with('-') => {
+            return Err(Usage(format!("unknown option: {other}")));
+        }
+        Some(folder) => {
+            let path = PathBuf::from(folder);
+            return if path.is_dir() {
+                Ok(Command::Ui(Some(path)))
+            } else {
+                Err(Usage(format!("not a command or a folder: {folder}")))
+            };
+        }
     }
 
     let mut source = None;

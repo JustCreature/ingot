@@ -13,7 +13,7 @@ mod sigmoid;
 
 pub use demosaic::{BayerPattern, demosaic_rcd};
 pub use pipeline::{
-    DevelopParams, DevelopedImage, PreviewBase, WhiteBalance, develop, develop_file,
+    DevelopParams, DevelopedImage, PreviewBase, WhiteBalance, develop, develop_file, orient_exif,
 };
 pub use sensor::{SensorImage, load_sensor};
 pub use sigmoid::Sigmoid;

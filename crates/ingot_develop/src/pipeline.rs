@@ -401,6 +401,11 @@ fn render(rgb: &[f32], width: usize, look: &Look, scale: f32) -> Vec<u8> {
     out
 }
 
+/// Rotates an 8-bit RGB image upright according to an EXIF orientation value.
+pub fn orient_exif(pixels: Vec<u8>, width: usize, height: usize, exif: u16) -> DevelopedImage {
+    orient(pixels, width, height, Orientation::from_u16(exif))
+}
+
 fn orient(
     pixels: Vec<u8>,
     width: usize,
