@@ -4,10 +4,13 @@ use std::path::PathBuf;
 
 use chrono::NaiveDate;
 use ingot_core::{DateFolders, ExtensionCase, FileKind, ImportOptions, NameTemplate, Organize};
+use ingot_develop::{DevelopParams, WhiteBalance};
 
 pub const HELP: &str = "\
 ingot import <source> --dest <folder> [options]
 ingot gdrive-login       sign in to Google Drive (see docs/guides/google-drive.md)
+ingot develop <raw> <out.jpg> [--exposure <stops>] [--contrast <0.1-10>]
+              [--skew <-1-1>] [--wb camera|daylight|<r>,<g>,<b>]
 
 Source
   --no-subfolders          only the top folder of <source>
@@ -74,6 +77,63 @@ pub enum Command {
     Help,
     Import(Box<ImportArgs>),
     GdriveLogin,
+    Develop(Box<DevelopArgs>),
+}
+
+#[derive(Debug)]
+pub struct DevelopArgs {
+    pub raw: PathBuf,
+    pub output: PathBuf,
+    pub params: DevelopParams,
+}
+
+fn number(value: &str) -> Result<f32, Usage> {
+    value
+        .parse()
+        .map_err(|_| Usage(format!("not a number: {value}")))
+}
+
+fn parse_develop<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<Command, Usage> {
+    let mut params = DevelopParams::default();
+    let mut paths = vec![];
+    while let Some(arg) = args.next() {
+        let mut value = || {
+            args.next()
+                .map(String::as_str)
+                .ok_or_else(|| Usage(format!("{arg} needs a value")))
+        };
+        match arg.as_str() {
+            "--exposure" => params.exposure = number(value()?)?,
+            "--contrast" => params.contrast = number(value()?)?,
+            "--skew" => params.skew = number(value()?)?,
+            "--wb" => {
+                params.white_balance = match value()? {
+                    "camera" => WhiteBalance::Camera,
+                    "daylight" => WhiteBalance::Daylight,
+                    custom => {
+                        let parts: Vec<&str> = custom.split(',').collect();
+                        let [r, g, b] = parts.as_slice() else {
+                            return Err(Usage(format!("not a white balance: {custom}")));
+                        };
+                        WhiteBalance::Custom([number(r)?, number(g)?, number(b)?])
+                    }
+                }
+            }
+            flag if flag.starts_with('-') => return Err(Usage(format!("unknown option: {flag}"))),
+            path => paths.push(PathBuf::from(path)),
+        }
+    }
+    let mut paths = paths.into_iter();
+    match (paths.next(), paths.next(), paths.next()) {
+        (Some(raw), Some(output), None) => Ok(Command::Develop(Box::new(DevelopArgs {
+            raw,
+            output,
+            params,
+        }))),
+        _ => Err(Usage(
+            "develop takes a RAW file and an output file".to_string(),
+        )),
+    }
 }
 
 pub fn parse(args: &[String]) -> Result<Command, Usage> {
@@ -81,6 +141,7 @@ pub fn parse(args: &[String]) -> Result<Command, Usage> {
     match args.next().map(String::as_str) {
         None | Some("help" | "--help" | "-h") => return Ok(Command::Help),
         Some("gdrive-login") => return Ok(Command::GdriveLogin),
+        Some("develop") => return parse_develop(args),
         Some("import") => {}
         Some(other) => return Err(Usage(format!("unknown command: {other}"))),
     }
@@ -223,6 +284,39 @@ mod tests {
         assert!(!args.options.skip_suspected_duplicates);
         assert_eq!(args.second_copies, [PathBuf::from("/backup")]);
         assert!(!args.include_subfolders);
+    }
+
+    #[test]
+    fn develop_options_are_applied() {
+        let args: Vec<String> =
+            "develop a.CR2 b.jpg --exposure 1.5 --contrast 2 --skew -0.5 --wb 2,1,1.5"
+                .split_whitespace()
+                .map(String::from)
+                .collect();
+        let Command::Develop(develop) = parse(&args).unwrap() else {
+            panic!("expected develop");
+        };
+        assert_eq!(develop.params.exposure, 1.5);
+        assert_eq!(develop.params.contrast, 2.0);
+        assert_eq!(develop.params.skew, -0.5);
+        assert_eq!(
+            develop.params.white_balance,
+            WhiteBalance::Custom([2.0, 1.0, 1.5])
+        );
+    }
+
+    #[test]
+    fn develop_mistakes_are_reported() {
+        for line in [
+            "develop",
+            "develop a.CR2",
+            "develop a b c",
+            "develop a b --wb 1,2",
+            "develop a b --exposure x",
+        ] {
+            let args: Vec<String> = line.split_whitespace().map(String::from).collect();
+            assert!(parse(&args).is_err(), "{line}");
+        }
     }
 
     #[test]

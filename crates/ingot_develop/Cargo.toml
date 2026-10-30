@@ -1,0 +1,12 @@
+[package]
+name = "ingot_develop"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+rawler = "0.8.0"
+rayon = "1.12.0"
+
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }

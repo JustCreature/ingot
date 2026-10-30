@@ -8,8 +8,10 @@ license = "GPL-3.0-or-later"
 chrono = "0.4.45"
 dirs = "7.0.0"
 ingot_core = { path = "crates/ingot_core" }
+ingot_develop = { version = "0.1.0", path = "crates/ingot_develop" }
 tokio = { version = "1.54.1", features = ["rt-multi-thread"] }
+turbojpeg = "1.5.1"
 
 [workspace]
 resolver = "2"
-members = ["crates/ingot_core"]
+members = ["crates/ingot_core", "crates/ingot_develop"]
