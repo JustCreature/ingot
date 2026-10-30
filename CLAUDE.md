@@ -119,6 +119,8 @@ Mistakes actually made on this project, and what they taught. Add to this list w
 - `tail` on `cargo add` hid a failed add. Check the manifest afterwards. Feature names also change between versions (`rustls-tls` became `rustls`, and `query` and `form` became features in reqwest 0.13).
 - Python `str.replace` edits silently do nothing once `cargo fmt` has reflowed the code. `assert old in s` first.
 - A fake `HOME` breaks rustup. Build first, then set `HOME` only for the built binary.
+- Unpinned `stable` in CI got a newer clippy than local, and a lint from inside the `async_trait` macro failed the first PR run. `rust-toolchain.toml` pins one version for both; bump it in its own PR.
+- A local pass doesn't prove CI passes: only trust the green run on the PR.
 - This environment can't capture the screen, so `render_views` draws each view to PNG instead. Headless runs don't prove how the app feels to use.
 
 **UI (egui)**

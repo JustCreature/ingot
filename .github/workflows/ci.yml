@@ -36,12 +36,10 @@ jobs:
             artifact: ingot_apple_x86_64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+      - name: Install Rust (version from rust-toolchain.toml)
+        run: rustup toolchain install
 
       - name: Install build tools
         run: brew install cmake nasm
@@ -62,7 +60,7 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Upload app binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact }}
           path: target/release/ingot
