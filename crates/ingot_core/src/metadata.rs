@@ -155,6 +155,10 @@ fn read_exif_header_from_path(path: &Path, max_bytes: u64) -> Option<exif::Exif>
 pub(crate) fn extract_exif_data(exif: &exif::Exif) -> ExifAssetData {
     ExifAssetData {
         captured_at: get_capture_time(exif),
+        orientation: exif
+            .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+            .and_then(|field| field.value.get_uint(0))
+            .and_then(|value| u16::try_from(value).ok()),
         thumbnail: get_thumbnail(exif),
         embedded_preview_file_location: get_embedded_preview_location(exif),
     }
@@ -259,6 +263,21 @@ mod tests {
             strip.offset + strip.len as u64 > EXIF_HEADER_PREFIX_LEN,
             "preview data must lie beyond the header read"
         );
+    }
+
+    #[test]
+    fn portrait_frame_reports_its_orientation() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/test_exif_read/IMG_1800.CR2");
+        let mut scan = crate::scan_source_dir(path.parent().unwrap());
+        enrich_assets(&mut scan.assets);
+        let asset = scan
+            .assets
+            .iter()
+            .find(|(key, _)| key.stem == "img_1800")
+            .unwrap()
+            .1;
+        assert!(matches!(asset.exif_data.orientation, Some(6 | 8)));
     }
 
     #[test]

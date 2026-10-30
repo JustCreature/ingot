@@ -12,6 +12,8 @@ pub mod preview;
 mod replicate;
 mod route;
 mod scan;
+mod sweep;
+mod triage;
 
 #[cfg(test)]
 mod test_support;
@@ -32,3 +34,7 @@ pub use replicate::{
 };
 pub use route::{Target, TargetKind};
 pub use scan::{Collision, ScanOptions, ScanResponse, scan_source, scan_source_dir};
+pub use sweep::{SweepPlan, SweepReport, execute_sweep, plan_sweep};
+pub use triage::{
+    SidecarOutcome, TriageKey, TriageRecord, TriageStore, sidecar_path, write_sidecar,
+};

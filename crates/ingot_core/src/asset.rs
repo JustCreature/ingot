@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDateTime;
+use serde::{Deserialize, Serialize};
 
 pub(crate) type ImageProcessingError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -73,7 +74,7 @@ impl AssetFiles {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TriageState {
     Pending,
     Accepted,
@@ -107,6 +108,8 @@ pub struct ImageData {
 #[derive(Debug, Clone)]
 pub struct ExifAssetData {
     pub captured_at: Option<NaiveDateTime>,
+    /// The EXIF orientation value, 1 to 8. Embedded previews aren't rotated.
+    pub orientation: Option<u16>,
     pub thumbnail: Option<Vec<u8>>,
     pub embedded_preview_file_location: Option<PreviewStrip>,
 }
@@ -128,6 +131,7 @@ impl PhotoAsset {
             rating: 0,
             exif_data: ExifAssetData {
                 captured_at: None,
+                orientation: None,
                 thumbnail: None,
                 embedded_preview_file_location: None,
             },
