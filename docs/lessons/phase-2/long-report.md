@@ -337,9 +337,206 @@ clock; remember this whenever a speedup looks disappointing.
 
 ---
 
-## Part 5: Benchmark Results (consolidated)
+## Part 5: The Seek Machinery — Reading Only What You Need
 
-All on i7-1068NG7 (4 physical / 8 logical), Rust release.
+Parts 1–4 read either a tiny EXIF header or a JPEG *already in RAM*. The real pipeline must get those bytes off the card first, and **how many bytes you read is the whole game** (Part 7 proves the card is the bottleneck). This part is about reading the *minimum*.
+
+### 5.1 The slurp problem
+
+`kamadak-exif`'s `read_from_container` behaves very differently by format:
+
+- **JPEG:** it walks the marker segments and stops after the **APP1** segment (where EXIF lives), which sits at the very front. Cheap — this is why Part 2's enrichment was fast.
+- **TIFF-like (CR2):** it reads the **entire file** into its internal buffer (`exif.buf()`). Measured: a 36 MB CR2 leaves **36 MB resident** just to read a 20-byte date. That is the *slurp*, and on a card-bound pipeline it is fatal.
+
+### 5.2 Where the bytes actually live (measured with `exiftool -n`)
+
+For a Canon CR2 (`IMG_1939.CR2`, 34.9 MB):
+
+| Item | Offset | Length | Ends at |
+|---|---|---|---|
+| IFD1 thumbnail (160×120) | 54,424 | 17,344 | **71,768** |
+| IFD0 full-res preview | 71,768 | 2,039,424 | 2,111,192 |
+| `DateTimeOriginal` (ExifIFD) | near front | ~20 B | — |
+
+Everything **stage 1** needs — the date *and* the full 160×120 thumbnail — lives in the **first ~72 KiB**. The 2 MB preview begins exactly where the thumbnail ends, so a bounded prefix cleanly excludes it.
+
+### 5.3 Stage 1 — the bounded prefix read
+
+Read only the head of the file and parse EXIF from that:
+
+```rust
+const EXIF_HEADER_PREFIX_LEN: u64 = 128 * 1024; // 72 KiB needed + headroom
+
+fn read_exif_header_from_path(path: &Path, max_bytes: u64) -> Option<exif::Exif> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut head = Vec::with_capacity(max_bytes as usize);
+    file.take(max_bytes).read_to_end(&mut head).ok()?;       // ≤ max_bytes, one alloc
+    exif::Reader::new().read_from_container(&mut std::io::Cursor::new(head)).ok()
+}
+```
+
+**The `Take`-isn't-`Seek` gotcha.** `read_from_container` requires `BufRead + **Seek**` (it seeks within the TIFF to follow IFD offsets). `Read::take(n)` yields only `Read` — no `Seek` — so you cannot lazily cap the reader in place. The fix: read the prefix into a `Vec`, then wrap it in a `Cursor` (which *is* `BufRead + Seek`). `take(n).read_to_end` both caps the read **and** tolerates files shorter than the budget (no `UnexpectedEof`); `with_capacity` makes it a single allocation.
+
+**Truncation tolerance.** kamadak parses the IFD directories and their *inline* field values (the date string at its offset, the strip offsets as numbers) — all near the front, all inside 128 KiB. A field whose *data* lands beyond the prefix (e.g. the thumbnail bytes if the prefix were too small, or the 2 MB preview) simply fails its `buf.get(range)?` slice and funnels to `None`; the parse itself does not abort. Verified: at 128 KiB both date and thumb extract; at 64 KiB (below the thumb's end of 71,768) the date still resolves but the thumbnail funnels to `None` — exactly the boundary you'd predict.
+
+**Measured:** 128 KiB vs 36 MB = **279× fewer bytes, 264× faster** (warm; cold is larger because the slurp physically pulls 36 MB off the card).
+
+### 5.4 Stage 2 — the targeted seek-read
+
+Stage 1 already parsed the IFD0 `StripOffsets`/`StripByteCounts` (inline, in the prefix), so it **caches the strip reference** on the asset — stage 2 needs no second header parse. Then:
+
+```rust
+pub fn read_embedded_preview(path: &Path, strip: PreviewStrip) -> Result<Vec<u8>, …> {
+    let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();                     // free fstat, 0 content bytes
+    if strip.len == 0 || strip.offset.checked_add(strip.len as u64)? > file_len {
+        return Err(…);                                          // corrupt ref → funnel
+    }
+    file.seek(SeekFrom::Start(strip.offset))?;
+    let mut buf = vec![0u8; strip.len];
+    file.read_exact(&mut buf)?;                                 // exactly the strip (~2 MB)
+    Ok(buf)
+}
+```
+
+One `seek` + one `read_exact` of exactly the ~2 MB strip — never the 36 MB file. **The allocation bound is a fact, not a guess:** a strip cannot extend past its file, so `offset + len ≤ file_len` (checked against a free `fstat`, which reads zero content bytes) rejects a corrupt `StripByteCounts` before the `vec![0; len]` can OOM. An earlier version used a magic 64 MB cap — wrong twice over: too small for future 150 MP medium-format previews, and an arbitrary number where the file length is the real invariant.
+
+This gives **three preview tiers**: the free 160×120 IFD1 thumb (placeholder, from the header) → a generated **512** grid thumb → a generated **1920** loupe preview, the latter two decoded from the 2 MB embedded strip (RAW) or the standalone `.JPG` (JPEG-only).
+
+### 5.5 Why the embedded preview is *smaller* than the standalone JPEG
+
+A surprising observation: at the **same resolution**, the CR2's embedded preview (~2–3 MB) is smaller than the standalone `.JPG` (~5–8 MB). It is not lower resolution — it is **harder-compressed**, on three axes: a lower JPEG quality factor (coarser quantization tables), **4:2:0** chroma subsampling (half the colour data) vs the deliverable JPEG's 4:2:2, and the simple fact that it is a *throwaway* — the camera knows the RAW is the master, so the embedded preview only has to be good enough to chimp on the camera's screen.
+
+This sets up the **pair decision**. For a RAW+JPEG pair you can preview from either. `get_prioritized` is **RAW-first**, so a pair uses the *embedded* preview — fewer bytes, which (Part 7) means proportionally faster on a card-bound pipeline. The cost is the lower embedded quality; the accepted tradeoff is speed for triage. (Metadata reads RAW-first too, so the strip ref and the preview source agree — see the Part 9 bug where they once disagreed.)
+
+---
+
+## Part 6: Streaming Ingest & Engine-Owned State
+
+### 6.1 Who owns the data
+
+The **engine owns the asset store**: `Engine.scan_response: Arc<RwLock<ScanResponse>>`. The UI *borrows* it to present. An earlier design inverted this — the app owned the data and the engine was a stateless pipeline — and it was reversed for a concrete reason: later phases (**clustering, replication, XMP writing**) *re-process the heavy owned data*. If the app owned it, every such call would either clone multi-MB previews (a memory disaster at thousands of frames) or thread `&mut` borrows that a background thread cannot hold. The engine is therefore a **stateful aggregate** — data plus the methods over it, in one place.
+
+### 6.2 Two passes: `scan()` = skeleton, `ingest()` = previews
+
+- **`scan()` is synchronous and cheap.** Walk the card + `enrich_assets` (the stage-1 header reads): every asset gets `captured_at` (→ the greyed date-folder tree), the 160×120 thumb (→ instant grid placeholder), and the cached strip ref. This is the "skeleton" and it finishes in ~14 s cold for 879 frames.
+- **`ingest()` streams in the background.** It spawns a worker, returns a **bounded** `crossbeam_channel::Receiver<IngestEvent>`, and emits a **lean notification per asset** — `IngestEvent::Preview { key, error }`, *not* the image bytes. The UI, on each message, takes a brief read lock and reads that asset's freshly-stored preview from the engine store by key. The message is lean precisely *because* the data already lives in the engine.
+
+### 6.3 Lock discipline — the subtle part that makes engine-owned data work
+
+The naïve worker holds the write lock across the whole loop. This is broken two ways, and we hit both:
+
+1. **No streaming.** While the worker holds the write lock, the UI's `read()` blocks until the *entire* run finishes. The user sees nothing until the end — the opposite of streaming.
+2. **Deadlock.** The bounded channel (cap 64) fills; the worker blocks on `send` #65 *while still holding the write lock*; the UI is blocked on the read lock and never drains the channel; neither side can proceed. (With an 11-asset fixture this hides — 11 < 64 and the worker finishes first; with 879 it hangs instantly.)
+
+The fix is **lock scope**: do the heavy work with **no lock held**.
+
+```rust
+work_items.into_par_iter().for_each(|(key, kind, path, strip)| {
+    // 1. read + decode + encode — entirely lock-free
+    let (thumb, preview, errors) = match read_source_bytes(kind, &path, strip) {
+        Err(e) => (None, None, vec![e]),
+        Ok(jpeg) => /* make_thumbnail + make_preview, collect errors */,
+    };
+    // 2. brief write lock — scope drops it before the send
+    { let mut w = scan_response.write().unwrap();
+      if let Some(a) = w.assets.get_mut(&key) { a.image_data.thumb = thumb; a.image_data.preview = preview; /*…*/ } }
+    // 3. notify — lock already released; a dropped receiver just stops us
+    let _ = tx.send(IngestEvent::Preview(IngestMessage { key, error: failed }));
+});
+```
+
+The critical section is a `HashMap` `get_mut` + a move — microseconds — so the many CPU threads barely contend, and the UI slips a read lock between writes. A task blocked on a full channel **holds no lock**, so the UI always drains: the bounded channel reverts to its proper role as **backpressure / a memory governor**, not a deadlock. (Why `Arc<RwLock>` at all: a `'static` spawned thread cannot borrow `&self`, so shared ownership is mandatory; `RwLock` gives many-readers-or-one-writer, and keeping the write section tiny is what makes that cheap.)
+
+### 6.4 The error-handling pattern (project-wide)
+
+A bare `Option` that returns `None` on failure **throws away the cause**. Errors are data we need — for observability, and because some must reach the UI. So the rule, adopted across the engine:
+
+- Fallible functions return **`Result<_, Box<dyn std::error::Error + Send + Sync>>`**. The `Send + Sync` is mandatory, not decoration: these errors travel across the ingest worker threads and are stored inside the engine-owned asset (`image_data.errors`), so the whole `PhotoAsset` must stay `Send`.
+- **Record, don't drop.** A failed asset still streams its notification; its errors are collected on the asset and remain inspectable; the batch never aborts (one bad frame must not kill a 10k-card ingest). Add context when boxing (`format!("preview generation failed: {e}")`).
+- **`Option` is reserved for genuine *absence*** (a frame legitimately has no embedded thumbnail), never for *failure*. The preview pipeline was migrated from `Option` to `Result` for exactly this reason — `?` auto-converts the underlying turbojpeg/fir errors into the box.
+
+---
+
+## Part 7: The End-to-End Read-Bound Result
+
+This is the headline measurement of the phase — the one that retroactively justifies every "read less, don't parallelize the card" decision above.
+
+### 7.1 The numbers (879-asset Canon card, i7-1068NG7, 8 logical)
+
+| Measurement | Cold | Warm |
+|---|---|---|
+| scan + enrich (stage 1) | 14.4 s (61 fps) | 0.07 s (13,000 fps) |
+| ingest (read + decode + 2 encodes) | **153.8 s (6 fps)** | **~26 s (33 fps)** |
+| read-only stage, **2 threads** | 158 s (6 fps, **20 MB/s**) | 0.59 s |
+| read-only stage, **8 threads** | 158 s (6 fps, **20 MB/s**) | 0.46 s |
+
+### 7.2 Read-bound, proven three independent ways
+
+1. **Cold ≫ warm:** ingest is 153.8 s cold vs ~26 s warm — a **6× gap** that is pure card-read latency (the code is identical).
+2. **Cold-ingest ≈ cold-read-only:** 153.8 s (full pipeline) ≈ 158 s (reads with *no* decode/encode). The entire decode+encode stage is **hidden under I/O wait** — the CPU is mostly idle during a cold ingest, because the pipeline overlaps reading and decoding and the card is the gate.
+3. **2 threads ≈ 8 threads, cold:** both 158 s, both 20 MB/s. **You cannot parallelize past one device.**
+
+### 7.3 The card is a fixed ~20 MB/s pipe
+
+This is the crux, and it reconciles with Part 2. There, *small* scattered header reads got *slower* with concurrency (−28%, seek contention destroying read-ahead). Here, *large* 2 MB reads are **throughput-bound**, so concurrency is *neutral* (2 ≈ 8). The two results say the same thing from opposite ends: **parallelizing card reads never helps** — at best neutral, at worst harmful. Hence cap `card_read_permits` at **1–2**.
+
+Crucially, this means the **two-tier read/CPU split is not a throughput win** — the card is the wall regardless of how the threads are arranged. Its real value is *resource hygiene*: freeing the CPU threads that would otherwise sit parked in a blocking `read()`, and avoiding the small-read penalty. We measured the ceiling before building the split, so we build it for the right reason.
+
+### 7.4 The CPU floor and the regime flip
+
+The warm ingest (~26 s, **33 fps**) is the **CPU floor** — pure decode + two encodes for 879 frames on 8 logical cores, the card removed from the equation. It is stable across every warm run. The consequence: on an **SSD/NVMe** source (or any warm read) the pipeline *flips* to **CPU-bound** and you hit ~33 fps — back in the Part 4 parallel-scaling regime (4.26×). **The device decides which regime you are in**, exactly as Part 2 first showed for enrichment.
+
+### 7.5 The only cold speed lever: fewer bytes
+
+Since the card is byte-rate-limited, the *only* way to make cold triage faster is to **read less**. This is why embedded-over-JPEG for pairs matters: at 20 MB/s, ~3 MB vs ~6 MB is ~150 ms vs ~300 ms per pair — reading the smaller source **halves** paired-asset read time. And it is why we never slurp the full RAW. Note that *output* resolution does **not** change read bytes — you read the whole source regardless of whether you emit a 512 or a 1920 — so the lever is the *source*, not the target.
+
+### 7.6 Streaming saves the UX, not the clock
+
+Cold *completion* is 153.8 s, but **time-to-interaction is ~14 s**: the skeleton sweep paints the date tree and all 160×120 placeholders, then previews stream in at 6 fps. The photographer starts culling immediately while the 153.8 s runs behind them. The read-bound total is *acceptable* precisely because the architecture is streaming — completion time was never the UX metric.
+
+### 7.7 Caches and pre-warming (the conceptual close)
+
+The cold→warm gap is the **OS page cache** (on macOS the *unified buffer cache*): bytes held in RAM after the first read, served at GB/s versus the card's 20 MB/s. The tempting idea is to "warm" it at startup so later actions are instant. The hard truth, forced by 7.3: **warming does not beat the device — it only *moves* the unavoidable 20 MB/s read earlier, overlapping it with the user's think-time.** You cannot warm 3 GB of card in under ~150 s. So warming is *latency hiding* (prefetch), not a throughput multiplier. For ingot specifically, the best "warm-up" is simply **running `scan`+`ingest` eagerly** — the engine stores decoded previews, which is strictly better than priming the page cache (that would leave the decode undone). The one genuine throughput win is **across distinct physical devices** (each has its own 20 MB/s pipe), which is what Phase 6 builds.
+
+---
+
+### 7.8 The two-tier split — read-width is a device property, sized independently
+
+Part 7.1–7.3 measured a *serial* SD reader on the Intel box (2 ≈ 8 threads, ~20 MB/s — concurrency neutral). A second machine told a different story. On an **M4 Pro (14 cores), same card**, sweeping the *merged* single-pool width (`RAYON_NUM_THREADS`):
+
+| threads | ingest | note |
+|---|---|---|
+| 1 | 136 s (6 fps) | serial |
+| 2 | 60 s (15 fps) | 2.3× |
+| **4** | **53 s (17 fps)** | **best** |
+| 8 | 55 s (16 fps) | flat |
+| 14 | 60 s (14 fps) | regresses |
+
+This card path has **read queue depth ~4** (1→4 = 2.6×, then >4 *hurts*) — unlike the Intel serial reader. So **read-concurrency optimum is a device property**, and we now have two points bracketing it: serial SD ≈ 1–2, queue-depth reader ≈ 4, SSD/NVMe higher.
+
+The problem the merged pool exposes: with **one** width knob you cannot satisfy both tiers. Tuned for reads (4) it *starves* the 14-core CPU; tuned for the CPU (14) it *thrashes* the card (4-wide is already past this card's depth). The fix is the plan's two tiers, now built: a **reader tier** (`card_read_permits` threads, doing only `read_source_bytes`) feeding a **CPU tier** (`cpu_threads`, decode/encode) over a **bounded channel** (backpressure / memory governor — only ~`cpu_threads` raw buffers alive). Two independent widths.
+
+```rust
+std::thread::scope(|s| {
+    s.spawn(move || read_pool.install(|| {           // reader tier: read_threads wide
+        work.into_par_iter().for_each(|item| { let _ = raw_tx.send((key, read_source_bytes(...))); });
+    }));                                              // raw_tx drops here → channel closes
+    cpu_pool.install(|| {                             // CPU tier: cpu_threads wide
+        raw_rx.into_iter().par_bridge().for_each(|(key, bytes)| { /* decode → store → notify */ });
+    });
+});
+```
+
+**Measured payoff (Intel serial reader, same card, separated build):** read=2 ingest **99.5 / 84.7 / 84.5 s** vs read=4 **133 / 162 / 167 s** (worsening). Two findings: (1) the **separated read=2 cold (~90 s) beats the old merged cold (154 s)** — a dedicated reader tier overlapping the CPU tier is a *real* throughput win, not just hygiene, even on a serial card; (2) **read=4 thrashes the serial reader** (the §2.3 small-read penalty), confirming the read width must match the device. Default `card_read_permits = 4` (M4 reader); a serial SD card wants 2 — it is tunable for exactly this reason.
+
+**Caching anomaly (open).** On both the M4 and a later Intel session the cold→warm speedup *failed to materialise* (e.g. `scan+enrich` 6.5 s, not the warm 0.07 s; ingest never reaching the ~26 s CPU floor), unlike the clean 6× warm-up of §7.1. External removable volumes appear to cache/evict unpredictably across machines/sessions. Unexplained — flagged for a controlled investigation (mount options, free RAM, eviction policy), not yet a lesson.
+
+---
+
+## Part 8: Benchmark Results (consolidated)
+
+All on i7-1068NG7 (4 physical / 8 logical), Rust release; cross-device note: M4 Pro (14 cores).
 
 **Enrichment, 879-asset card, cold = first read:**
 
@@ -359,9 +556,22 @@ All on i7-1068NG7 (4 physical / 8 logical), Rust release.
 
 **Locked decisions:** decode 3/8 · filter Lanczos3 · RGB/U8x3 · per-frame `Decompressor`.
 
+**Seek machinery (stage 1):** 128 KiB header read vs 36 MB slurp = **279× fewer bytes, 264× faster** (warm). Measured CR2 offsets: IFD1 thumb 54,424..71,768; IFD0 preview 71,768..2,111,192.
+
+**End-to-end ingest, 879-asset card:**
+
+| Phase | Cold | Warm |
+|---|---|---|
+| scan + enrich | 14.4 s (61 fps) | 0.07 s |
+| ingest (read + decode + 2 encodes) | **153.8 s (6 fps)** | **~26 s (33 fps)** |
+| read-only, 2 threads | 158 s (20 MB/s) | 0.59 s |
+| read-only, 8 threads | 158 s (20 MB/s) | 0.46 s |
+
+Read-bound (cold≫warm 6×; cold-ingest≈cold-read; 2≈8 threads). Card ceiling ≈ 20 MB/s, device-fixed. CPU floor ≈ 33 fps (warm); SSD source → CPU-bound. 879/879, 0 errors. `cargo test` 11 passing, clippy clean.
+
 ---
 
-## Part 6: Common Errors Encountered
+## Part 9: Common Errors Encountered
 
 | Error / symptom | Cause | Fix |
 |---|---|---|
@@ -374,6 +584,11 @@ All on i7-1068NG7 (4 physical / 8 logical), Rust release.
 | `"0000:00:00 00:00:00"` would-be crash | Dead-clock-battery cameras emit it | `parse_from_str` rejects month 00 → `.ok()` maps to `None` for free (no fix needed; design absorbs it) |
 | `turbojpeg` fails to link | `turbojpeg-sys` builds libjpeg-turbo and needs cmake + nasm (SIMD assembler) | `brew install jpeg-turbo cmake nasm`; isolate this as the first build gate before writing pipeline code |
 | `make_preview` "scaling is wrong" | Mislabelled bench prints; swapped "with/without resize" strings | Fix labels; trust numbers only after |
+| Ingest **deadlocks** above 64 assets (fixture of 11 "worked") | Worker held the `write()` lock across the whole loop; filled the bounded(64) channel; blocked on `send` while holding the lock; UI blocked on the read lock → neither proceeds | Lock scope: snapshot inputs → heavy work **lock-free** → brief per-asset write lock → `send` after release (Part 6.3) |
+| Every **paired** asset errors ("no embedded preview strip") | Metadata read JPEG-first (strip ref captured from the JPEG = `None`) but the preview source was RAW-first → demanded a strip that was never cached | Make both use the same priority (`get_prioritized`, RAW-first) so metadata + preview agree on the source |
+| `Take` can't be handed to `read_from_container` | `read_from_container` needs `BufRead + Seek`; `Read::take` yields only `Read` | Read the prefix into a `Vec`, wrap in `Cursor` (which is `BufRead + Seek`) |
+| `read_embedded_preview` could panic / over-allocate on a corrupt frame | `checked_add(len).unwrap()` panics on overflow; a magic 64 MB cap was arbitrary (and too small for 150 MP bodies) | Bound by the **file length** (free `fstat`): `offset + len ≤ file_len`; funnel overflow to `Err`, never `unwrap` |
+| Preview failures vanished silently | Pipeline returned `Option` — `None` threw away *why* it failed | Return `Result<_, Box<dyn Error + Send + Sync>>`, record on `image_data.errors` (Part 6.4) |
 
 ---
 
@@ -394,3 +609,23 @@ All on i7-1068NG7 (4 physical / 8 logical), Rust release.
 - **Modern-CPU caveats:** Hyper-Threads share execution ports (HT ≈ +6% on SIMD codec work, not 2×),
   and Turbo Boost makes the single-thread baseline run faster than all-core, so "speedup vs 1 thread"
   understates true parallel efficiency.
+- **Read only what you need.** kamadak slurps the whole CR2 (36 MB for a 20-byte date); a 128 KiB header
+  read + a targeted ~2 MB seek-read of the embedded preview replace it (279× fewer bytes). Everything
+  stage 1 needs is in the first ~72 KiB, measured.
+- **The full ingest is read-bound on the card**, proven three ways: cold ≫ warm (6×), cold-ingest ≈
+  cold-read-only (CPU hidden under I/O), and **2 ≈ 8 threads cold** on a *serial* SD reader (~20 MB/s).
+  CPU floor ≈ 33 fps — an SSD source (or warm) flips the pipeline CPU-bound. The only cold lever is
+  reading *fewer bytes* (embedded-over-JPEG for pairs).
+- **Read-width optimum is a device property; the read and CPU tiers must be sized independently.** A
+  second machine (M4 Pro) showed a card path with read queue-depth ~4 (1→4 = 2.6×, >4 regresses), vs the
+  Intel serial reader's 2≈8. A merged pool can't set read=4 *and* cpu=14, so we split into a reader tier
+  + CPU tier over a bounded channel. The split is a *real* cold win (Intel separated read=2 ~90 s beats
+  merged 154 s), not just hygiene — provided the read width matches the device (read=4 thrashes a serial
+  reader). Default `card_read_permits = 4`, tunable.
+- **Engine owns the data; the worker never holds a lock during heavy work.** Engine-owned `Arc<RwLock>`
+  state + a background worker is only correct with strict lock scope (snapshot → lock-free read/decode/
+  encode → brief per-asset write → send); holding the write lock across the loop both kills streaming and
+  deadlocks the bounded channel. Streaming makes time-to-interaction ~14 s, not the 154 s completion.
+- **Errors are data:** fallible functions return `Result<_, Box<dyn Error + Send + Sync>>` and record the
+  cause; never swallow it in a bare `Option`. Caches/pre-warming *move* the unavoidable read into idle
+  time — they never beat the device.

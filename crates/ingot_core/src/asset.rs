@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use chrono::NaiveDateTime;
 
+pub(crate) type ImageProcessingError = Box<dyn std::error::Error + Send + Sync>;
+
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum FileKind {
     Raw,
@@ -42,6 +44,10 @@ impl AssetFiles {
         self.files.push((kind, path));
 
         Ok(())
+    }
+
+    pub fn get_all(&self) -> &Vec<(FileKind, PathBuf)> {
+        &self.files
     }
 
     pub fn get(&self, kind: FileKind) -> Option<&Path> {
@@ -84,8 +90,6 @@ pub struct PreviewStrip {
     pub offset: u64,
     pub len: usize,
 }
-
-pub(crate) type ImageProcessingError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug)]
 pub struct ImageData {

@@ -8,6 +8,7 @@ mod asset;
 mod engine;
 mod metadata;
 pub mod preview;
+mod replicate;
 mod route;
 mod scan;
 
@@ -19,5 +20,9 @@ pub use asset::{
 };
 pub use engine::{Engine, EngineConfig, IngestEvent};
 pub use metadata::{enrich_assets, get_embedded_preview_location, read_embedded_preview};
+pub use replicate::{
+    CopyEngine, LocalTarget, ReplicationFailure, ReplicationReport, ReplicationTarget, TargetId,
+    VerifiedReplica,
+};
 pub use route::{Target, TargetKind, build_destination_path};
 pub use scan::{Collision, ScanResponse, scan_source_dir};

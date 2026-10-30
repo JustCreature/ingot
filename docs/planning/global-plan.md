@@ -117,7 +117,7 @@ The card is the bottleneck, so the engine reads it as little as possible and as 
 | Stage | Read | Who runs it | Feeds |
 |---|---|---|---|
 | **1 — skeleton** | **header-only**, tiny (seek machinery) | **every** asset | `DateTimeOriginal` → greyed target-folder tree; embedded 160×120 IFD1 thumb → instant grid placeholder |
-| **2 — embedded seek** | `pread` just the embedded-JPEG strip (~2–3 MB) | assets **with a RAW** (RAW-only always; pair only if measurement favours it) | the good 512 grid thumb + 1920 loupe preview |
+| **2 — embedded seek** | `pread` just the embedded-JPEG strip (~2–3 MB) | assets **with a RAW** (RAW-only *and* pairs — resolved: embedded over JPEG, halves per-pair read) | the good 512 grid thumb + 1920 loupe preview |
 | **3 — full read + fan-out** | whole file, **once** | **replication** (every kept file) | the targets; **and** previews for JPEG-source assets (the copy read tees into the decode) |
 
 Key facts driving this:
@@ -128,22 +128,35 @@ Key facts driving this:
 - **Preview-source choice per asset type:**
   - **RAW-only** → stage 2 seek-extract (no choice; the only viable preview is the embedded JPEG). Top-priority fast path.
   - **JPEG-only** → stage 3. A JPEG is a monolithic stream (no targeted shortcut to a small preview), but its full read is the **same read replication owes** — fan it out (read once → decode previews **and** write to targets). It is *not* an extra "scan for previews."
-  - **Pair (RAW+JPEG)** → **measurement decides**: seek the ~3 MB embedded strip (half the bytes, lower quality, non-contiguous read) vs sequentially read the ~6 MB JPEG (higher quality, readahead-friendly). Half the bytes does *not* guarantee half the time on flash; and both files get copied regardless. Measure bytes + wall time on a real card and eyeball the embedded 1:1 quality before locking.
+  - **Pair (RAW+JPEG)** → **embedded preview (RESOLVED).** On a ~20 MB/s card-bound pipeline (measured), reading the smaller embedded strip (~3 MB) instead of the standalone JPEG (~6 MB) roughly halves per-pair read time; the lower embedded quality is the accepted tradeoff for triage speed. `get_prioritized` is RAW-first so metadata and preview agree on the source.
 - **Two subsystems, not three peers.** A *preview subsystem* (stage 1 skeleton + stage 2/3 good-preview) tuned for triage latency, and a *replication subsystem* (stage 3) that copies everything and lends its read to previews when the file being copied is itself a JPEG. RAW-only frames still hit stage 3 — for copying, not previewing.
 
-### Step 3 — Streaming channel (two-pass)
+### Step 3 — Streaming channel (engine owns the data)
 
-A multi-producer channel (`crossbeam-channel`; prefer it over `std::sync::mpsc` so the read/CPU stages can be MPMC without a rewrite). The stream is **two-pass**, matching the read stages:
+**The engine owns the asset store** — `Engine.scan_response: Arc<RwLock<ScanResponse>>` — and the UI borrows it to present. (An earlier draft inverted this: app-owns-data, engine-stateless. It was changed because later phases that *re-process the heavy data* — clustering, replication, XMP — are engine operations over owned state; cloning multi-MB previews into a stateless engine would be a memory disaster. The engine is a stateful aggregate that encapsulates the data and the methods over it.)
 
-```rust
-// Pass A — skeleton sweep across ALL assets first (header-only, fast):
-//   the date-folder tree + placeholder grid fill before any heavy preview renders.
-SkeletonReady { key, captured_at, thumb_jpeg /* 160×120 */, raw_strip_offset }
-// Pass B — good previews stream in behind the skeleton (stage 2 seek / stage 3 read):
-PreviewReady  { key, thumb_jpeg /* 512 */, preview_jpeg /* 1920 */ }
-```
+Two passes map onto the two read stages:
 
-The skeleton sweep runs across *all* assets before pass B does heavy work on any single one — otherwise asset 1's 1920 encode blocks asset 50's date, and the tree fills slowly. The consumer owns the single asset store (from `scan()`); it applies `captured_at` from pass A (lights up the tree), paints placeholders, then upgrades cells as pass B arrives. The engine stays stateless about the store — the message carries the deltas, not a duplicate store.
+- **`scan()` = stage-1 skeleton, synchronous.** Walk + `enrich_assets`: header-only reads populate, for every asset, `captured_at` (→ date-folder tree), the 160×120 IFD1 thumb (→ instant grid placeholder), and the cached IFD0 strip ref (→ stage 2). Fast (measured cold ~14 s / 879 frames), so the UI gets its full skeleton before any heavy work begins.
+- **`ingest()` = stage-2/3 previews, streamed in the background.** Spawns a worker, returns a bounded `crossbeam_channel::Receiver<IngestEvent>` (prefer crossbeam over `std::sync::mpsc` for MPMC), and streams a **lean notification per asset** — `IngestEvent::Preview { key, error }`, *not* the bytes. On each message the UI takes a brief read lock and reads that asset's freshly-stored preview from the engine store by key.
+
+**Lock discipline (the subtle part that makes engine-owned data work).** The worker must never hold the store lock across the heavy work, or it serialises the UI and deadlocks the bounded channel. Pattern: snapshot the per-asset inputs (key, path, strip ref) under one brief read lock → **read + decode + encode entirely lock-free** → take a brief *per-asset* write lock to store the result → release → *then* `send`. A task blocked on a full channel holds no lock, so the UI always drains. The message is lean because the data already lives in the engine; errors are recorded on the asset (`image_data.errors`) and the notification carries only `error: bool`, so the cause stays inspectable.
+
+> **Error-handling pattern (project-wide):** fallible functions return `Result<_, Box<dyn Error + Send + Sync>>`, never a bare `Option` that swallows the cause. Errors are recorded (on `image_data.errors`) and, where relevant, surfaced to the UI — one bad frame never aborts the batch, and the failure stays observable. `Option` is reserved for genuine *absence* (e.g. no embedded thumbnail), not failure.
+
+#### Measured (Phase 2 — 879-asset Canon card, 8 cores)
+
+| | cold | warm |
+|---|---|---|
+| scan + enrich (stage 1) | 14.4 s (61 fps) | 0.07 s |
+| ingest (read + decode + 2 encodes) | **154 s (6 fps)** | **~26 s (33 fps)** |
+| read-only stage, 2 threads / 8 threads | **158 s / 158 s ≈ 20 MB/s** | sub-second |
+
+**The pipeline is read-bound on the card** (Intel SD reader), confirmed three ways: cold ≫ warm (6×); cold-ingest ≈ cold-read-only (CPU fully hidden under I/O); **2 ≈ 8 threads cold** (identical, ~20 MB/s — a *serial* reader). CPU floor ≈ **33 fps**; on SSD/NVMe (or warm) the pipeline flips CPU-bound (the step-2 4.26× regime). The only cold speed lever is **reading fewer bytes** (embedded-over-JPEG for pairs; never slurp full RAWs). Streaming makes *time-to-interaction* ≈ the 14 s skeleton, not the 154 s completion.
+
+**Second device (M4 Pro, 14 cores, same card, merged-pool RAYON sweep):** 1→136 s, **2→60 s, 4→53 s (best), 8→55 s, 14→60 s** — this card path has **read queue depth ~4** (unlike the serial Intel SD reader where 2≈8). So **read-concurrency optimum is a device property**, with two data points now bracketing it (serial ~1–2; queue-depth reader ~4). A *merged* pool cannot set read=4 and cpu=14 at once → **the read and CPU tiers must be sized independently.**
+
+**Resolved → two-tier split implemented (2026-06-14).** `ingest` now runs a **reader tier** (`card_read_permits`) + a **CPU tier** (`cpu_threads`) joined by a bounded channel (backpressure). Separated **read=2 on Intel (~90 s cold) beats the old merged design (154 s cold)** — overlapping a dedicated reader tier with the CPU tier helps even on a serial card — while **read=4 thrashes the serial reader** (133→167 s). So the split is a *real* cold win when the read width matches the device, not merely hygiene; default `card_read_permits = 4` (M4 reader), but a serial SD card wants 2 — tunable. *(Caching anomaly: cold→warm sometimes fails to materialise on external removable volumes — observed on both M4 and Intel — unexplained, flagged.)*
 
 ---
 
@@ -173,7 +186,7 @@ Calling `tokio::fs::copy(src, dest)` once per target reads the source **N times*
 ```rust
 /// Read the source ONCE under the source-read semaphore, hashing as we go.
 /// Fan out to each target under that target's write semaphore.
-/// Write to `dest.part`, fsync, rename to `dest`, then verify size + checksum.
+/// Write to `dest.tmp`, fsync, verify the checksum, rename to `dest`, fsync the directory.
 async fn replicate(
     src: &Path,
     targets: &[Target],
@@ -181,14 +194,38 @@ async fn replicate(
 ) -> Result<ReplicationReport, IoError> {
     let _read = engine.source_read.acquire().await?;
     let (bytes, src_hash) = read_with_checksum(src).await?;   // one read off the card
-    // for each target: acquire write permit -> write .part -> fsync -> rename
-    //                  -> re-read/compare size, then checksum == src_hash
+    // for each target: acquire write permit -> write .tmp -> fsync
+    //                  -> checksum == src_hash -> rename -> fsync directory
     // collect per-target VerifiedReplica on success
     todo!()
 }
 ```
 
 Verification for irreplaceable data should be at minimum a size match, ideally a full checksum (BLAKE3 is fast). Compute the source hash during the single read so verification is cheap.
+
+### Step 2b — Primary-paced streaming fan-out (the real architecture)
+
+The naive `spawn one task per target` fan-out (Step 2) has a flaw: it ties the card to the **slowest** target. If a network target is in the fan-out set, the source buffer stays alive — and the card stays engaged — until even the slow target drains it. The goal is the opposite: **read the card exactly once, paced to the fastest *local* sink, then disconnect the source and let the slow tail replicate from the local copy.** Card *residency time* is the thing to minimize (Phase 2 proved the card is a fixed ~20 MB/s wall).
+
+**The shape (two stages, built and measured in that order):**
+
+- **Stage 1 — reader + primary, source-connected.** A single reader task reads each source file once (under the `source_read` permit), produces `Arc<[u8]>`, and **blocking-sends it to the PRIMARY target's bounded queue**. The blocking send is the whole trick: backpressure throttles card reads to exactly the primary's write rate, so the card runs *at the speed of the fastest local target*, for free, via one bounded channel. One designated **primary** (`LocalTarget` by default) writes + verifies against `src_hash`; on success it emits `(file_id, primary_path)` — the moment the source is "done" with that file.
+- **Stage 2 — secondaries, source-free.** Each secondary (network, slow disk) gets the `Arc<[u8]>` via a **non-blocking `try_send`**: if its bounded queue has room it *hot-replicates from RAM*; if full (it's behind), the file is recorded on that secondary's **deferred** list and later replicated **from `primary_path`** on the fast local disk — never the card again. So slow targets *never* throttle the card.
+
+**Key design decisions / invariants:**
+
+- **`Arc` refcounting *is* the eviction mechanism.** No manual "mark acked/skipped, count to N-1, remove from channel" — channels are one-way ownership conveyors, they don't support in-place marking, multi-consumer fan-out, or item withdrawal. The buffer frees itself the instant its last accepting holder (primary + any hot secondaries) drops its clone. Slow secondaries never receive a clone, so they never extend its lifetime. Memory is bounded by the reader channel depth × file size × in-flight hot writers, and is self-evicting and race-free.
+- **No broadcast channel fits.** `tokio::sync::broadcast` is lossy (lagging receivers silently drop messages → data loss). `async_broadcast` (backpressured broadcast) makes the *slowest* receiver stall the sender → throttles the card, the exact thing to avoid. The correct pattern is **per-target bounded queues** with a blocking send to primary and `try_send` to secondaries.
+- **The proof chain stays anchored to the card: thread `src_hash` everywhere.** A deferred secondary re-reads from `primary_path` but verifies against the **original card hash**, never a fresh hash of the primary. That keeps the chain `card == primary == secondary`, all tied to the one hash computed at the single card read. Re-hashing the primary as a new baseline would let a silent primary corruption propagate "verified" to every secondary.
+- **Source disconnect is gated on primary *verify*, not primary *attempt*.** If the primary fails verification, the bytes must still be reachable (RAM buffer, or a card re-read) for a fallback — so eviction only fires on primary success. Failure policy (abort-and-surface vs keep card-sourced) is an explicit decision.
+- **The one legitimate shared-state ledger** is the `ReplicationReport` registry that aggregates per-`(file, target)` `VerifiedReplica`s + failures to know when a whole **asset** (RAW+JPG × N targets) is fully replicated — which is what gates deletion safety. That lives in shared state (`Mutex<HashMap<…>>` / a result-collecting `JoinSet`), distinct from the data channels.
+
+**Built (2026-10-30) in `replicate/`.** Decisions made during implementation:
+
+- **Verify before publish.** The temp file is hashed *before* the rename, so a destination path only ever holds verified bytes and the code never has to remove a destination file.
+- **Never overwrite.** An existing destination is a recorded failure. Each `LocalTarget` also claims a destination while writing it, so two source files routed to the same path can't race. This only protects against other writers in the same process.
+- **In-flight stores are capped at `max_concurrent_writes()`.** Spawning a store per message would drain the channel into tasks queued on the write semaphore, each holding a file buffer, which removes both the backpressure and the RAM bound.
+- **Read permits are held until the bytes are in the channel**, so a full channel stops card reads.
 
 ### Step 3 — Safe deletion sweep
 
@@ -262,6 +299,34 @@ Add a step to the Phase 2 pool: compute a perceptual hash (pHash) on the *downsa
 
 ---
 
+## Phase 6: Performance & Pre-warming (last — latency hiding, not throughput)
+
+Layered on once the core pipeline works. **Framing, grounded in the Phase-2 measurement:** none of this makes a *single* card faster — the card is a fixed ~20 MB/s pipe. These features (a) overlap the unavoidable read with the user's think-time, and (b) exploit the *one* real parallelism win, **distinct physical devices**.
+
+### Step 1 — Auto-detect + auto-start (warm during idle time)
+
+Detect removable volumes and kick the pipeline without waiting for an explicit "import":
+
+- **Enumerate at startup:** macOS removable volumes mount under `/Volumes` (removable flag via DiskArbitration / `diskutil`); cross-platform listing via `sysinfo`.
+- **React to insertion:** subscribe to mount events — **DiskArbitration** (macOS), **udev** (Linux), **WM_DEVICECHANGE** (Windows) — so a card inserted while the app runs auto-starts `scan` + `ingest`.
+- **"Warming" for ingot = running `scan`+`ingest` eagerly, not priming the OS page cache.** The engine reads + decodes + stores the finished preview in its own RAM, so eager ingest is strictly better than page-cache priming (which would leave the decode undone). The streaming architecture already runs the card read during think-time; this just *triggers* it on detection instead of on a button press.
+
+### Step 2 — Per-device parallel pipelines (the real parallelism win)
+
+Concurrency only helps across *distinct physical devices* — each has its own ~20 MB/s pipe, so N cards ≈ N× aggregate. Same card, more threads = no gain (measured 2 ≈ 8). So: **one read-tier per detected device** (each capped at 1–2 reads), devices processed in parallel, all feeding the shared CPU pool (ample — the CPU floor is ~33 fps, far above what one or two cards deliver).
+
+### Step 3 — Prioritized, cancellable prefetch (esp. the 1:1 loupe)
+
+Don't slurp the whole card speculatively — the read budget is finite and the user may want only a few frames. Warm **prioritized** (visible grid range first, expand outward), **cancellable** (redirect on scroll/select), and **RAM-bounded**. The highest-value targeted prefetch is the **1:1 loupe**: pre-read the full-res bytes of frames *adjacent to the user's focus* so zoom / arrow-key is instant — the one place ingot re-reads bytes it didn't already store. Explicit page-cache hints exist (`F_RDADVISE` macOS / `posix_fadvise(WILLNEED)` Linux / `madvise(WILLNEED)`), but the simplest warm is just reading the bytes.
+
+### Caveats (measured constraints, not opinions)
+
+- Cache warming **moves** the read earlier (overlapping idle time); it does **not** beat the device. Total work is unchanged — you cannot warm 3 GB of card in under ~150 s at 20 MB/s.
+- Eager full-card reads waste the limited read budget if the user wants few frames → keep prefetch prioritized + cancellable.
+- Dominant cache = the OS **page cache** (unified buffer cache): bytes held in RAM after first read, served at GB/s vs the card's 20 MB/s. Secondary: VFS dentry/inode cache (path lookups), device readahead.
+
+---
+
 ## Consolidated Dependencies (and exactly what each does)
 
 | Crate | Role | Notes |
@@ -284,7 +349,7 @@ Add a step to the Phase 2 pool: compute a perceptual hash (pHash) on the *downsa
 
 ## Changes from v1 (summary)
 
-1. **Crate roles split:** `kamadak-exif` reads the date only; a separate writer crate handles `xmp:Rating`; RAW-only previews need a RAW crate.
+1. **Crate roles split:** `kamadak-exif` reads the date *and* (via `StripOffsets`/`StripByteCounts`) locates the CR2 full-size embedded preview — no RAW crate needed for Canon; a RAW crate is only required to add *other* formats (NEF/ARW/RAF/DNG). A separate writer crate handles `xmp:Rating`.
 2. **Ratings go to XMP for both files** (`xmp:Rating`, −1..5), never to a nonexistent EXIF rating tag, and never by rewriting pixel data.
 3. **Read-once, fan-out copy** replaces per-target `copy()` (no more N× source reads); writes go to temp then atomic-rename.
 4. **Two semaphore tiers:** cap source-card *reads* (1–2) as well as per-target *writes*.
@@ -296,3 +361,7 @@ Add a step to the Phase 2 pool: compute a perceptual hash (pHash) on the *downsa
 10. **Date handling:** `DateTimeOriginal` + `SubSecTimeOriginal`; ISO sortable folders (`2026-05-12`).
 11. **Storage choices:** `rusqlite` over `sled`; blobs as files-on-disk.
 12. **Honesty notes:** `tokio::fs` is threadpool-backed; consecutive-frame clustering is single-linkage and can chain.
+13. **Engine owns the data** (`Arc<RwLock<ScanResponse>>`), not the app — a stateful aggregate, because later phases (clustering/replication/XMP) re-process the heavy owned data; the streamed message is a *lean notification*, not the bytes (Phase 2 Step 3).
+14. **Seek machinery, two read stages:** stage-1 reads only a ~128 KiB header (not kamadak's whole-file slurp — measured 264× faster); stage-2 seek-reads just the embedded-preview strip. Bounded by file length, not a magic constant.
+15. **Error-handling pattern:** fallible functions return `Result<_, Box<dyn Error + Send + Sync>>` and record errors (never silent `Option`-swallowing); `Option` is for genuine absence only.
+16. **Measured read-bound floor:** on a real card the pipeline is read-bound at ~20 MB/s (concurrency can't beat one device; 2≈8 threads). Drives the device-tuned read permits and the new **Phase 6** (cross-device parallelism + prefetch — latency hiding, not throughput).

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
 
 use crate::asset::{AssetKey, ImageProcessingError};
 use crate::preview::{make_preview_from_jpeg_bytes, make_thumbnail_from_jpeg_bytes};
@@ -26,11 +26,15 @@ pub struct EngineConfig {
     pub thumb_long_edge: usize,
     /// JPEG encode quality (1..=100) for generated outputs.
     pub jpeg_quality: i32,
-    /// Source-card concurrent reads. A *device property*: 1-2 for a camera
-    /// card (serial), higher for SSD/NVMe (queue depth). See Phase 2 step 1.
+    /// Width of the **dedicated reader tier** — source-card concurrent reads,
+    /// sized *independently* of the CPU tier. A *device property*: measured ~4
+    /// for a camera card over a fast reader (queue depth saturates ~4, >4
+    /// regresses); a serial SD reader wants 1-2; SSD/NVMe wants more. Decoupled
+    /// from `cpu_threads` precisely so reads and decode scale separately.
     pub card_read_permits: usize,
-    /// CPU worker threads for the preview pipeline. Defaults to the machine's
-    /// available parallelism.
+    /// Width of the **CPU tier** — decode/resize/encode workers, fed by the
+    /// reader tier over a bounded channel. Defaults to the machine's available
+    /// parallelism (CPU-bound work scales with cores).
     pub cpu_threads: usize,
 }
 
@@ -101,15 +105,28 @@ impl Engine {
         ) = crossbeam_channel::bounded(64);
 
         let cloned_scan_response = Arc::clone(&self.scan_response);
+        let read_threads = self.config.card_read_permits.max(1);
+        let cpu_threads = self.config.cpu_threads.max(1);
 
-        std::thread::spawn(move || Engine::run_processing_worker(cloned_scan_response, tx));
+        std::thread::spawn(move || {
+            Engine::run_processing_worker(cloned_scan_response, tx, read_threads, cpu_threads)
+        });
 
         rx
     }
 
+    /// Two decoupled tiers connected by a bounded channel: a **reader tier**
+    /// (`read_threads`) that does nothing but pull source bytes off the card, and
+    /// a **CPU tier** (`cpu_threads`) that decodes/encodes. Sizing them
+    /// separately is the whole point — the card's optimal read concurrency
+    /// (measured ~4, device-dependent) is unrelated to the core count the encode
+    /// wants. The bounded channel between them is the backpressure / memory
+    /// governor (only ~`cpu_threads` raw buffers alive at once).
     fn run_processing_worker(
         scan_response: Arc<RwLock<ScanResponse>>,
         tx: crossbeam_channel::Sender<IngestEvent>,
+        read_threads: usize,
+        cpu_threads: usize,
     ) {
         // Snapshot the per-asset inputs under a brief read lock, then release it.
         // Everything heavy below — the file read and both encodes — runs lock-free.
@@ -130,60 +147,89 @@ impl Engine {
                 .collect()
         };
 
-        work_items
-            .into_par_iter()
-            .for_each(|(key, kind, path, strip)| {
-                // 1. Off-lock: read the source bytes and generate both outputs. A
-                //    missing output stays `None` (its desired failed state) and is
-                //    recorded as an error; a missing *source* fails both.
-                let (thumb, preview, errors): (
-                    Option<Vec<u8>>,
-                    Option<Vec<u8>>,
-                    Vec<ImageProcessingError>,
-                ) = match read_source_bytes(kind, &path, strip) {
-                    Err(e) => (None, None, vec![e]),
-                    Ok(jpeg) => {
-                        let mut errors = Vec::new();
-                        let thumb = match make_thumbnail_from_jpeg_bytes(&jpeg) {
-                            Ok(t) => Some(t),
-                            Err(e) => {
-                                errors.push(format!("thumbnail generation failed: {e}").into());
-                                None
-                            }
-                        };
-                        let preview = match make_preview_from_jpeg_bytes(&jpeg) {
-                            Ok(p) => Some(p),
-                            Err(e) => {
-                                errors.push(format!("preview generation failed: {e}").into());
-                                None
-                            }
-                        };
-                        (thumb, preview, errors)
-                    }
-                };
-                let failed = thumb.is_none() && preview.is_none();
+        // Raw bytes flow reader -> CPU over this bounded channel. Cap ≈ cpu_threads
+        // keeps every CPU worker fed without holding more than ~that many multi-MB
+        // buffers resident.
+        let (raw_tx, raw_rx) = crossbeam_channel::bounded::<(
+            AssetKey,
+            Result<Vec<u8>, ImageProcessingError>,
+        )>(cpu_threads * 10);
 
-                // 2. Brief write lock: store the results into the engine-owned asset.
-                {
-                    let mut writable = scan_response.write().unwrap();
-                    let Some(asset) = writable.assets.get_mut(&key) else {
-                        return;
-                    };
-                    asset.image_data.thumb = thumb;
-                    asset.image_data.preview = preview;
-                    if !errors.is_empty() {
-                        asset
-                            .image_data
-                            .errors
-                            .get_or_insert_with(Vec::new)
-                            .extend(errors);
-                    }
-                }
+        let read_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(read_threads)
+            .build()
+            .expect("failed to build reader pool");
+        let cpu_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(cpu_threads)
+            .build()
+            .expect("failed to build cpu pool");
 
-                // 3. Notify (lock already released). A dropped receiver means the
-                //    consumer is gone — stop quietly rather than panic.
-                let _ = tx.send(IngestEvent::Preview(IngestMessage { key, error: failed }));
+        std::thread::scope(|s| {
+            // READER TIER: `read_threads`-wide, does only I/O. Dropping `raw_tx`
+            // when the pool drains closes the channel and ends the CPU stage.
+            s.spawn(move || {
+                read_pool.install(|| {
+                    work_items
+                        .into_par_iter()
+                        .for_each(|(key, kind, path, strip)| {
+                            let bytes = read_source_bytes(kind, &path, strip);
+                            let _ = raw_tx.send((key, bytes));
+                        });
+                });
             });
+
+            // CPU TIER: `cpu_threads`-wide, decode/encode lock-free, then a brief
+            // per-asset write lock to store, then notify. `par_bridge` adapts the
+            // blocking channel receiver to the cpu pool.
+            cpu_pool.install(|| {
+                raw_rx.into_iter().par_bridge().for_each(|(key, bytes)| {
+                    let (thumb, preview, errors): (
+                        Option<Vec<u8>>,
+                        Option<Vec<u8>>,
+                        Vec<ImageProcessingError>,
+                    ) = match bytes {
+                        Err(e) => (None, None, vec![e]),
+                        Ok(jpeg) => {
+                            let mut errors = Vec::new();
+                            let thumb = match make_thumbnail_from_jpeg_bytes(&jpeg) {
+                                Ok(t) => Some(t),
+                                Err(e) => {
+                                    errors.push(format!("thumbnail generation failed: {e}").into());
+                                    None
+                                }
+                            };
+                            let preview = match make_preview_from_jpeg_bytes(&jpeg) {
+                                Ok(p) => Some(p),
+                                Err(e) => {
+                                    errors.push(format!("preview generation failed: {e}").into());
+                                    None
+                                }
+                            };
+                            (thumb, preview, errors)
+                        }
+                    };
+                    let failed = thumb.is_none() && preview.is_none();
+
+                    {
+                        let mut writable = scan_response.write().unwrap();
+                        let Some(asset) = writable.assets.get_mut(&key) else {
+                            return;
+                        };
+                        asset.image_data.thumb = thumb;
+                        asset.image_data.preview = preview;
+                        if !errors.is_empty() {
+                            asset
+                                .image_data
+                                .errors
+                                .get_or_insert_with(Vec::new)
+                                .extend(errors);
+                        }
+                    }
+
+                    let _ = tx.send(IngestEvent::Preview(IngestMessage { key, error: failed }));
+                });
+            });
+        });
     }
 }
 

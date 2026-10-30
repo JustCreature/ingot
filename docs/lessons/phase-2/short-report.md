@@ -142,13 +142,45 @@ Near-linear to **4 physical cores**; HT adds ~6% (codec work is execution-port-b
 
 ---
 
+## 13. Seek machinery — read only what you need
+
+kamadak slurps the **whole** CR2 for a TIFF (36 MB resident for a 20-byte date); JPEG stops after APP1 (cheap). Measured CR2: IFD1 thumb 54,424..71,768, IFD0 preview 71,768..2,111,192 — everything stage 1 needs is in the first **~72 KiB**. **Stage 1:** read a 128 KiB prefix into a `Vec`, parse via `Cursor` (`read_from_container` needs `BufRead+Seek`; `Take` is `Read`-only) → **279× fewer bytes, 264× faster**; cache the IFD0 strip ref. **Stage 2:** `read_embedded_preview` = `seek(offset)` + `read_exact(len)` of exactly the ~2 MB strip, allocation bounded by `offset+len ≤ file_len` (free `fstat`). Embedded preview is smaller than the standalone JPEG at equal res (harder-compressed throwaway: low Q, 4:2:0) → pairs use it (RAW-first), trading quality for fewer bytes.
+
+---
+
+## 14. Streaming ingest + engine-owned state
+
+**Engine owns the data** (`Arc<RwLock<ScanResponse>>`), UI borrows to present — *not* app-owns/engine-stateless, because clustering/replication/XMP re-process the heavy owned data (cloning previews = memory disaster). `scan()` = synchronous skeleton (date + 160 thumb + strip ref); `ingest()` spawns a worker, returns a bounded `crossbeam` `Receiver<IngestEvent>`, streams **lean notifications** (`{key, error}`), not bytes — UI reads the store by key. **Lock discipline (critical):** snapshot inputs under a brief read lock → **read+decode+encode lock-free** → brief per-asset write lock → `send` *after* release. Holding the write lock across the loop both kills streaming and **deadlocks** the bounded channel (worker blocks on `send` while holding the lock; UI blocked on read lock).
+
+---
+
+## 15. End-to-end: read-bound on the card
+
+879-asset card (Intel serial SD reader): scan+enrich cold 14.4 s / warm 0.07 s; ingest cold **154 s (6 fps)** / warm **~26 s (33 fps)**; read-only cold **2 = 8 threads = 158 s ≈ 20 MB/s**. **Read-bound, three ways:** cold≫warm (6×), cold-ingest≈cold-read-only (CPU hidden under I/O), 2≈8 threads. The serial card is a fixed ~20 MB/s pipe. CPU floor ~33 fps; SSD source (or warm) flips it CPU-bound (the §12 regime). Only cold lever = fewer bytes (embedded-for-pairs). **Caches** = OS page cache; warming only *moves* the read into idle time (latency hiding), never beats the device → Phase 6. (Anomaly: cold→warm sometimes fails to materialise on external removable volumes — seen on M4 *and* Intel — unexplained, flagged.)
+
+---
+
+## 17. Two-tier split: read-width is a device property
+
+Second machine (M4 Pro, 14 cores, same card, merged-pool sweep): ingest 1→136 s, **2→60, 4→53 (best), 8→55, 14→60** — this card path has **read queue depth ~4**, unlike the Intel serial reader (2≈8). So read-concurrency optimum is **per-device**; a *merged* pool can't set read=4 AND cpu=14 at once. **Fix (implemented):** reader tier (`card_read_permits`) + CPU tier (`cpu_threads`) joined by a bounded channel (`thread::scope`: read_pool `into_par_iter`→`raw_tx`; cpu_pool `raw_rx.par_bridge()`→decode/store/notify). Separated **read=2 on Intel ~90 s cold beats merged 154 s** (overlap is a real win, not just hygiene); **read=4 thrashes the serial reader** (133→167 s). Default `card_read_permits = 4` (M4 reader); serial SD wants 2 — tunable (`INGOT_READ_THREADS`/config). RAYON_NUM_THREADS no longer controls ingest (explicit pools).
+
+---
+
+## 16. Error pattern (project-wide)
+
+Fallible fns return `Result<_, Box<dyn Error + Send + Sync>>`, never a bare `Option` that swallows the cause. `Send + Sync` is mandatory (errors cross worker threads, stored on `image_data.errors`). Record, don't drop — a failed asset still streams; errors stay inspectable; batch never aborts. `Option` is for genuine *absence* (no embedded thumb), not failure. Preview pipeline migrated `Option`→`Result` (`?` auto-converts turbojpeg/fir errors).
+
+---
+
 ## N. Full benchmark table
 
 **Enrichment (cold, 879 frames):** SD 4.85 s serial / 6.20 s parallel (181/142 fps); SSD 0.61 s / 0.17 s
-(1432/5256 fps). Cold/warm: SD ≈120×, SSD ≈13×. 879/879 parsed, 0 errors. Tests 5 passing, clippy clean.
+(1432/5256 fps). Cold/warm: SD ≈120×, SSD ≈13×. 879/879 parsed, 0 errors.
 **Preview scaling (999×, 1/2):** 100.5 / 54 / 30 / 23.5 s @ 1/2/4/8 threads = 4.26×.
 **Scaled decode (8 thr):** 1/1 48 s · 1/2 22.7 s · 3/8 17.7 s · 1/4 15.1 s.
-**Locked:** decode 3/8 · Lanczos3 · RGB/U8x3 · per-frame `Decompressor`.
+**Seek machinery:** 128 KiB header vs 36 MB slurp = 279× fewer bytes, 264× faster.
+**End-to-end ingest (879 card):** scan+enrich cold 14.4 s; ingest cold **154 s (6 fps)** / warm **~26 s (33 fps)**; read-only 2≈8 threads ≈ 158 s ≈ 20 MB/s. Read-bound; CPU floor 33 fps. Tests 11 passing, clippy clean.
+**Locked:** decode 3/8 · Lanczos3 · RGB/U8x3 · per-frame `Decompressor` · header prefix 128 KiB · `card_read_permits` 1–2.
 
 ---
 
@@ -164,3 +196,8 @@ Near-linear to **4 physical cores**; HT adds ~6% (codec work is execution-port-b
 | Skewed/striped image | `pitch=4*width` with RGB format | RGB ⇒ `pitch=3*width`, buffer `3*w*h` |
 | `turbojpeg` link failure | `turbojpeg-sys` needs cmake + nasm | `brew install jpeg-turbo cmake nasm` (do as gate 0) |
 | `"0000:00:00…"` | Dead clock battery | Parser rejects month 00 → `None` (auto-absorbed) |
+| Ingest deadlocks >64 assets (11 "worked") | Worker held `write()` lock across the loop; filled bounded channel; blocked on `send` holding the lock; UI blocked on read lock | Lock scope: snapshot → lock-free work → brief per-asset write → send after release |
+| Every paired asset errors | Metadata JPEG-first (no strip ref) but preview RAW-first → demands uncached strip | Same priority both (`get_prioritized` RAW-first) |
+| `Take` rejected by `read_from_container` | Needs `BufRead+Seek`; `Take` is `Read`-only | Read prefix to `Vec`, wrap in `Cursor` |
+| `read_embedded_preview` panic/over-alloc | `checked_add().unwrap()`; arbitrary 64 MB cap | Bound by `file_len` (free `fstat`); funnel overflow to `Err` |
+| Preview failures vanished | Returned `Option` (lost the cause) | `Result<_, Box<dyn Error+Send+Sync>>`, record on `image_data.errors` |

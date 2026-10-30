@@ -18,7 +18,22 @@ fn main() {
         .unwrap_or_else(|| "/Volumes/EOS_DIGITAL/DCIM".to_string());
     let source = Path::new(&path);
 
-    let mut engine = Engine::new(EngineConfig::default());
+    // The ingest now uses two explicit pools, so RAYON_NUM_THREADS no longer
+    // controls it — sweep the tiers with INGOT_READ_THREADS / INGOT_CPU_THREADS.
+    let mut config = EngineConfig::default();
+    if let Some(n) = std::env::var("INGOT_READ_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.card_read_permits = n;
+    }
+    if let Some(n) = std::env::var("INGOT_CPU_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.cpu_threads = n;
+    }
+    let mut engine = Engine::new(config);
 
     let t_scan = Instant::now();
     engine.scan(source); // walk + enrich
@@ -37,7 +52,7 @@ fn main() {
         n as f64 / scan_elapsed.as_secs_f64()
     );
 
-    for run in 1..=3 {
+    for run in 1..=2 {
         let t = Instant::now();
         let rx = engine.ingest();
         let (mut ok, mut err) = (0u32, 0u32);
