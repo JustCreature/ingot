@@ -24,7 +24,7 @@ pub(crate) type MetadataError = Box<dyn std::error::Error + Send + Sync>;
 /// 128 KiB gives headroom for other bodies without dragging the big preview into
 /// the metadata read. JPEG EXIF (APP1) sits at the very front, so the same budget
 /// covers it. ~273x less I/O than slurping a 35 MB CR2.
-const EXIF_HEADER_PREFIX_LEN: u64 = 128 * 1024;
+pub(crate) const EXIF_HEADER_PREFIX_LEN: u64 = 128 * 1024;
 
 /// Locate (don't read) the full-size embedded preview in a TIFF-like container
 /// (CR2): a single-strip JPEG referenced by `StripOffsets`/`StripByteCounts` in

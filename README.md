@@ -7,7 +7,9 @@ A fast RAW + JPEG photo importer and culling app, written in Rust. Choose where 
 ## What it does
 
 - **Destination, then source.** Name the import and choose the destination and options. Choosing the card is what starts it: everything begins copying and the grid opens.
-- **Choose in the grid.** Pick (`P`) the images you want. Rejecting (`X`) holds a photo back from the copy until you change your mind. Ratings and flags never wait on the copy, and preview reads go ahead of copy reads on the card.
+- **Pictures load in the order you see them.** First every thumbnail, then every preview, one by one from the first photo, and photos near where you jump to go first. A full-size image or RAW loads only when you zoom or develop.
+- **Choose in the grid.** Pick (`P`) the images you want. Rejecting (`X`) holds a photo back from the copy until you change your mind. The copy is a background job: it only uses the card when nothing you are looking at needs it, and it reads in small chunks so it gets out of the way quickly.
+- **Stop any time.** Stop import ends the copy without closing your photos. Finished copies stay unless you choose to send them to the Trash, nothing is left half written, and Resume copying picks up what's left.
 - **Finalize.** Stops queued copies of what you didn't choose, finishes the rest, and moves copies this import made of unchosen photos to the Trash. It shows the list first, and you can keep unflagged photos too.
 - **Clusters.** Similar photos are grouped automatically. A sensitivity slider goes from "same scene" to "same subject position" and regroups instantly.
 - **Verified copies.** Every file is read from the card once, written to a temp file, checked by hash, and only then given its real name. An existing file is never overwritten.

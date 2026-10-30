@@ -21,7 +21,8 @@ Requirements from the project owner. None of these may be weakened without askin
 
 - **Never overwrite an existing file** on a target. Temp files and Ingot's own sidecars and state are the only exceptions.
 - **Google Drive: only ever inside `__ingot_backups`.** The folder name is a constant with no setting, parents are the `ContainedFolder` type, and no delete, move, rename or update call may exist in that code. Never commit an OAuth client: the repo is public.
-- **Culling never waits on copying.** No lock held across I/O; preview reads go first on the card; a backed-up copy must not hold a card slot.
+- **Culling never waits on copying, and the user must not notice the copy.** No lock held across I/O. Card priority is strict: on-demand reads, then thumbs and previews, then copy (`CardGate`). The copy reads in chunks and holds one slot at most.
+- **Pictures load strictly in display order, in stages:** every header thumbnail, then every preview, with on-demand full size or RAW above both. Focus pulls nearby photos forward; the rest stay in order.
 - **The import flow:** name and destination first; choosing the source starts copying everything and opens the grid; choosing happens in the grid while it runs; Finalize stops queued copies of unchosen files, removes copies already made of them, and finishes the rest.
 - **Removal is proof-gated.** The one code path that removes from a target is `sweep.rs`: only a file this import newly wrote (`VerifiedReplica::newly_written`), hash re-checked, never the source, and to the Trash. A file already there or changed since stays.
 - **Drive gets nothing before Finalize,** because Ingot never deletes from Drive.
@@ -44,7 +45,7 @@ src/
     imports.rs           the named import list in the left panel, persisted
 crates/ingot_core/       engine library, no UI dependencies
   src/
-    engine.rs            Engine: scan, ingest (previews), start_import, read_full_jpeg
+    engine.rs            Engine: scan, start_session, start_loading (ordered stages), read_full_jpeg
     scan.rs              walk and pair files into assets, classify extensions
     asset.rs             PhotoAsset, AssetKey, TriageState
     metadata.rs          bounded EXIF header read, embedded preview location
@@ -56,11 +57,11 @@ crates/ingot_core/       engine library, no UI dependencies
     route.rs             Target configuration
     replicate/
       mod.rs             CopyEngine, ReplicationTarget, VerifiedReplica, claims
-      gate.rs            CardGate: shared card reads, previews first
+      gate.rs            CardGate: strict card priority, simulated slow card
       local.rs           LocalTarget: temp, verify, no-replace publish
       drive.rs           DriveTarget: pacer, resumable upload, ContainedFolder
       drive_auth.rs      desktop sign-in (PKCE), token refresh
-  examples/              bench_enrich, bench_preview, bench_ingest, bench_read_threads, bench_replicate, bench_cluster
+  examples/              bench_enrich, bench_preview, bench_ingest, bench_read_threads, bench_replicate, bench_cluster, bench_culling
   testdata/test_exif_read/  real Canon CR2 and JPEG fixtures
 crates/ingot_develop/    RAW develop engine, darktable ports marked in each file
   src/
@@ -129,13 +130,20 @@ Mistakes actually made on this project, and what they taught. Add to this list w
 - A local pass doesn't prove CI passes: only trust the green run on the PR.
 - This environment can't capture the screen, so `render_views` draws each view to PNG instead. Headless runs don't prove how the app feels to use.
 
+**Loading pictures**
+- The user saw a grid of names and no pictures on a real card, while every test passed. The cause, reproduced with a simulated 20 MB/s card (300 photos, copying): headers were read in `HashMap` order, so most landed off-screen, and each run of 4 waited behind a whole 30 MB copy read because of a "copy gets a turn" rule added to help the copy. First thumbnail on the first screen took 11 s, the first screen wasn't full after 120 s, all headers took 272 s, and previews only began after that.
+- **A test on warm fixtures proves nothing about a card.** Three local files load instantly in any order. `CardGate::with_simulated_speed` and `bench_culling` exist for this; hard links make a large card of real RAW files that takes no disk space. Measure a user-visible moment, such as the first screen full.
+- `par_iter` and `HashMap` iteration have no useful order. When a person watches work arrive, order is a requirement: take work from an ordered queue, and put parallel results back in order before publishing.
+- Fairness to the copy was the wrong goal. Check which side the user feels. Priorities need a limit on how long the top waits behind the bottom, which is why the copy reads in chunks.
+- A stop test passed alone and failed in the full suite, because under load the simulated 4 s copy finished before the stop arrived. If a test races real time, give it margin that survives a loaded machine, and run the whole suite, not just the test.
+- Two copy reads on a serial card made a zoom wait two chunks. The measurement showed this (100 ms read + 2 x chunk); the code looked fine.
+
 **Import flow**
 - "Show where files go" took a very long time on a card, because `plan_import` statted every file and ran on the UI thread, and a card answers each stat slowly. The fix is at the root: the folder walk keeps sizes and dates, planning reads only those, and a test deletes the card before planning to prove it. Check every UI call for what it can reach on disk. The same audit found `find_cards` statting volumes every frame, a sweep hashing on the UI thread, and sidecars syncing on a keypress.
 - **Confirm the flow against the design and the user's mental model before building it.** The flow was built wrong twice: first opening photos and asking where to copy afterwards, then a separate import screen with ticks and a Start button. The user wanted destination, then source starts the copy, then choose in the grid, then Finalize. Both wrong versions passed every test. Walk through the steps in words and get a yes first, and read the design's flow, not just its options. A selection concept that the design already has (the Pick flag) beats a new one (ticks).
 - Counting "pending" as every file not copied blocked the next import after Finalize, because removed files never finish. Any count that gates an action must know the current phase.
 - Choosing a Drive-style target that can't undo must change the order of work, not just add a warning: uploads wait for Finalize.
 - A row's id built from its label clashed when two imports had the same default name. egui's debug marker for a clash is a glyph the harness panics on, which is how it surfaced.
-- A strictly-first preview queue starved the copy for minutes on a full card. A priority needs a turn limit (`PRIORITY_RUN`) when the low side also has to start promptly.
 - The stores loop only settled finished writes when the next file arrived. Fine for a batch, but an idle queue would have held progress and secondaries forever. `select!` on both.
 - A photo's date, identity and destination must not change as information arrives. Headers come later than the listing, so they all use the file date, and EXIF is only displayed.
 - History written at the end of a run would lose everything if a long session crashed. Write it per file.

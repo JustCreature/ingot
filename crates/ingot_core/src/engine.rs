@@ -5,19 +5,18 @@
 //! `cpu_threads`). Those resources are shared across all in-flight assets, so
 //! they must live on an instance, not in free functions.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
-
-use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::asset::{AssetKey, ExifAssetData, ImageProcessingError};
 use crate::import::{ImportHistory, ImportPlan};
-use crate::metadata::read_exif_data;
+use crate::metadata::{EXIF_HEADER_PREFIX_LEN, read_exif_data};
 use crate::preview::{compress, make_preview_from_jpeg_bytes, make_thumbnail_from_jpeg_bytes};
 use crate::replicate::{
-    CardGate, CopyEngine, ImportQueue, ReplicationEvent, ReplicationFailure, ReplicationReport,
-    ReplicationTarget, TargetId, UploadFile, upload_copies,
+    CardGate, CopyEngine, DEFAULT_READ_CHUNK, ImportQueue, ReplicationEvent, ReplicationFailure,
+    ReplicationReport, ReplicationTarget, TargetId, UploadFile, upload_copies,
 };
 use crate::scan::{ScanOptions, ScanResponse, scan_source};
 use crate::{FileKind, PreviewStrip, enrich_assets, read_embedded_preview};
@@ -44,6 +43,10 @@ pub struct EngineConfig {
     pub cpu_threads: usize,
     /// How many files may wait in RAM for the primary target during an import.
     pub read_channel_depth: usize,
+    /// For measuring: bytes per second of a simulated slow card.
+    pub simulated_card_speed: Option<u64>,
+    /// Bytes the copy reads before letting a culling read go first.
+    pub copy_read_chunk: usize,
 }
 
 impl Default for EngineConfig {
@@ -57,6 +60,8 @@ impl Default for EngineConfig {
                 .map(|n| n.get())
                 .unwrap_or(4),
             read_channel_depth: 4,
+            simulated_card_speed: None,
+            copy_read_chunk: DEFAULT_READ_CHUNK,
         }
     }
 }
@@ -72,6 +77,21 @@ pub struct IngestMessage {
 #[derive(Debug)]
 pub enum IngestEvent {
     Preview(IngestMessage),
+}
+
+/// What `start_loading` reports, in display order within each stage.
+#[derive(Debug)]
+pub enum LoadEvent {
+    /// Stage 1: the photo's tiny thumbnail and details are in the store.
+    Header {
+        key: AssetKey,
+        orientation: Option<u16>,
+        captured_at: Option<chrono::NaiveDateTime>,
+    },
+    HeadersDone,
+    /// Stage 2: the photo's grid thumbnail and preview are in the store.
+    Preview(IngestMessage),
+    PreviewsDone,
 }
 
 /// The engine instance. Cheap to construct; holds config now, concurrency
@@ -111,7 +131,8 @@ impl ImportHandle {
 
 impl Engine {
     pub fn new(config: EngineConfig) -> Self {
-        let card = CardGate::new(config.card_read_permits);
+        let card =
+            CardGate::with_simulated_speed(config.card_read_permits, config.simulated_card_speed);
         Engine {
             card,
             config,
@@ -144,8 +165,8 @@ impl Engine {
         Arc::clone(&self.scan_response)
     }
 
-    /// Reads the largest JPEG of an asset for 1:1 viewing, ahead of copy reads on the
-    /// card. Blocks, so call it off the UI thread.
+    /// Reads the largest JPEG of an asset for 1:1 viewing, ahead of everything else on
+    /// the card. Blocks, so call it off the UI thread.
     pub fn read_full_jpeg(&self, key: &AssetKey) -> Result<Vec<u8>, ImageProcessingError> {
         let (kind, path, strip) = {
             let scan = self
@@ -163,46 +184,21 @@ impl Engine {
                 asset.exif_data.embedded_preview_file_location,
             )
         };
-        let _permit = self.card.acquire_priority();
-        read_source_bytes(kind, &path, strip)
+        let _permit = self.card.acquire_on_demand();
+        let bytes = read_source_bytes(kind, &path, strip)?;
+        self.card.simulate_read(bytes.len() as u64);
+        Ok(bytes)
     }
 
-    /// A card slot for reading a whole RAW for develop, ahead of copy reads.
+    /// A card slot for reading a whole RAW for develop, ahead of everything else.
     pub fn card_permit(&self) -> crate::CardPermit {
-        self.card.acquire_priority()
+        self.card.acquire_on_demand()
     }
 
     /// Walks a folder for names, sizes and dates. Opens no photo, so this can happen
     /// before the photographer has chosen where the copies go.
     pub fn scan_names(&mut self, source: &Path, options: &ScanOptions) {
         *self.scan_response.write().unwrap() = scan_source(source, options);
-    }
-
-    /// Reads each photo's header, ahead of copy reads, and stores what it finds with a
-    /// brief lock per photo. `on_each` runs after each one, so the UI gets its tiny
-    /// thumbnails as they arrive.
-    pub fn enrich_streaming(&self, mut on_each: impl FnMut(&AssetKey, &ExifAssetData)) {
-        let work: Vec<(AssetKey, PathBuf)> = {
-            let scan = self.scan_response.read().unwrap();
-            scan.assets
-                .iter()
-                .map(|(key, asset)| {
-                    let (_, path) = asset.files.get_prioritized();
-                    (key.clone(), path.to_path_buf())
-                })
-                .collect()
-        };
-        for (key, path) in work {
-            let data = {
-                let _permit = self.card.acquire_priority();
-                read_exif_data(&path)
-            };
-            let Some(data) = data else { continue };
-            if let Some(asset) = self.scan_response.write().unwrap().assets.get_mut(&key) {
-                asset.exif_data = data.clone();
-            }
-            on_each(&key, &data);
-        }
     }
 
     /// Starts copying `plan` in the background and returns at once. Holds no lock
@@ -244,7 +240,8 @@ impl Engine {
             self.config.read_channel_depth,
             primary,
         )
-        .with_progress(raw_progress_tx);
+        .with_progress(raw_progress_tx)
+        .with_read_chunk(self.config.copy_read_chunk);
         for secondary in secondaries {
             copy = copy.with_secondary(secondary);
         }
@@ -315,144 +312,282 @@ impl Engine {
         }
     }
 
+    /// Stage 2 alone, for callers that already read the headers: previews in key order.
     pub fn ingest(&self) -> crossbeam_channel::Receiver<IngestEvent> {
-        let (tx, rx): (
-            crossbeam_channel::Sender<IngestEvent>,
-            crossbeam_channel::Receiver<IngestEvent>,
-        ) = crossbeam_channel::bounded(64);
-
-        let cloned_scan_response = Arc::clone(&self.scan_response);
-        let read_threads = self.config.card_read_permits.max(1);
-        let cpu_threads = self.config.cpu_threads.max(1);
-
-        let card = Arc::clone(&self.card);
-
+        let (tx, rx) = crossbeam_channel::bounded(64);
+        let mut order: Vec<AssetKey> = self
+            .scan_response
+            .read()
+            .unwrap()
+            .assets
+            .keys()
+            .cloned()
+            .collect();
+        order.sort_by(|a, b| (&a.dir, &a.stem).cmp(&(&b.dir, &b.stem)));
+        let loader = self.loader(order, Arc::new(AtomicUsize::new(0)));
         std::thread::spawn(move || {
-            Engine::run_processing_worker(cloned_scan_response, tx, card, read_threads, cpu_threads)
+            loader.previews(|message| {
+                let _ = tx.send(IngestEvent::Preview(message));
+            });
         });
-
         rx
     }
 
-    /// Two decoupled tiers connected by a bounded channel: a **reader tier**
-    /// (`read_threads`) that does nothing but pull source bytes off the card, and
-    /// a **CPU tier** (`cpu_threads`) that decodes/encodes. Sizing them
-    /// separately is the whole point — the card's optimal read concurrency
-    /// (measured ~4, device-dependent) is unrelated to the core count the encode
-    /// wants. The bounded channel between them is the backpressure / memory
-    /// governor (only ~`cpu_threads` raw buffers alive at once).
-    fn run_processing_worker(
-        scan_response: Arc<RwLock<ScanResponse>>,
-        tx: crossbeam_channel::Sender<IngestEvent>,
-        card: Arc<CardGate>,
-        read_threads: usize,
-        cpu_threads: usize,
-    ) {
-        // Snapshot the per-asset inputs under a brief read lock, then release it.
-        // Everything heavy below — the file read and both encodes — runs lock-free.
-        let work_items: Vec<(AssetKey, FileKind, PathBuf, Option<PreviewStrip>)> = {
-            let readable = scan_response.read().unwrap();
-            readable
-                .assets
-                .iter()
-                .map(|(key, asset)| {
-                    let (kind, path) = asset.files.get_prioritized();
-                    (
-                        key.clone(),
-                        kind,
-                        path.to_path_buf(),
-                        asset.exif_data.embedded_preview_file_location,
-                    )
-                })
-                .collect()
-        };
-
-        // Raw bytes flow reader -> CPU over this bounded channel. Cap ≈ cpu_threads
-        // keeps every CPU worker fed without holding more than ~that many multi-MB
-        // buffers resident.
-        let (raw_tx, raw_rx) = crossbeam_channel::bounded::<(
-            AssetKey,
-            Result<Vec<u8>, ImageProcessingError>,
-        )>(cpu_threads * 10);
-
-        let read_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(read_threads)
-            .build()
-            .expect("failed to build reader pool");
-        let cpu_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(cpu_threads)
-            .build()
-            .expect("failed to build cpu pool");
-
-        std::thread::scope(|s| {
-            // READER TIER: `read_threads`-wide, does only I/O. Dropping `raw_tx`
-            // when the pool drains closes the channel and ends the CPU stage.
-            s.spawn(move || {
-                read_pool.install(|| {
-                    work_items
-                        .into_par_iter()
-                        .for_each(|(key, kind, path, strip)| {
-                            // The slot covers only the read, not the wait on the channel.
-                            let permit = card.acquire_priority();
-                            let bytes = read_source_bytes(kind, &path, strip);
-                            drop(permit);
-                            let _ = raw_tx.send((key, bytes));
-                        });
+    /// Loads everything for the photographer, strictly in `order`, the display order:
+    /// first the header thumbnail of every photo, then the preview of every photo. If
+    /// the photographer jumps ahead, `focus` (a position in `order`) pulls the photos
+    /// around it forward, and the rest carry on in order afterwards.
+    pub fn start_loading(
+        &self,
+        order: Vec<AssetKey>,
+        focus: Arc<AtomicUsize>,
+    ) -> crossbeam_channel::Receiver<LoadEvent> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let loader = self.loader(order, focus);
+        std::thread::spawn(move || {
+            loader.headers(|key, data| {
+                let _ = tx.send(LoadEvent::Header {
+                    key,
+                    orientation: data.orientation,
+                    captured_at: data.captured_at,
                 });
             });
+            let _ = tx.send(LoadEvent::HeadersDone);
+            loader.previews(|message| {
+                let _ = tx.send(LoadEvent::Preview(message));
+            });
+            let _ = tx.send(LoadEvent::PreviewsDone);
+        });
+        rx
+    }
 
-            // CPU TIER: `cpu_threads`-wide, decode/encode lock-free, then a brief
-            // per-asset write lock to store, then notify. `par_bridge` adapts the
-            // blocking channel receiver to the cpu pool.
-            cpu_pool.install(|| {
-                raw_rx.into_iter().par_bridge().for_each(|(key, bytes)| {
-                    let (thumb, preview, errors): (
-                        Option<Vec<u8>>,
-                        Option<Vec<u8>>,
-                        Vec<ImageProcessingError>,
-                    ) = match bytes {
-                        Err(e) => (None, None, vec![e]),
-                        Ok(jpeg) => {
-                            let mut errors = Vec::new();
-                            let thumb = match make_thumbnail_from_jpeg_bytes(&jpeg) {
-                                Ok(t) => Some(t),
-                                Err(e) => {
-                                    errors.push(format!("thumbnail generation failed: {e}").into());
-                                    None
-                                }
-                            };
-                            let preview = match make_preview_from_jpeg_bytes(&jpeg) {
-                                Ok(p) => Some(p),
-                                Err(e) => {
-                                    errors.push(format!("preview generation failed: {e}").into());
-                                    None
-                                }
-                            };
-                            (thumb, preview, errors)
-                        }
-                    };
-                    let failed = thumb.is_none() && preview.is_none();
+    fn loader(&self, order: Vec<AssetKey>, focus: Arc<AtomicUsize>) -> Loader {
+        Loader {
+            store: Arc::clone(&self.scan_response),
+            card: Arc::clone(&self.card),
+            order,
+            focus,
+            read_threads: self.config.card_read_permits.max(1),
+            cpu_threads: self.config.cpu_threads.max(1),
+        }
+    }
+}
 
-                    {
-                        let mut writable = scan_response.write().unwrap();
-                        let Some(asset) = writable.assets.get_mut(&key) else {
+/// One stage's place in the display order. Hands out the next photo to work on: the
+/// first not yet taken, except that photos just after the focus go first.
+struct OrderedWork {
+    taken: Vec<bool>,
+    frontier: usize,
+    next_sequence: usize,
+}
+
+/// Photos after the focus to pull forward: about two rows of the grid.
+const FOCUS_WINDOW: usize = 12;
+
+impl OrderedWork {
+    fn new(len: usize) -> Self {
+        OrderedWork {
+            taken: vec![false; len],
+            frontier: 0,
+            next_sequence: 0,
+        }
+    }
+
+    /// The next (sequence number, position in the order).
+    fn next(&mut self, focus: usize) -> Option<(usize, usize)> {
+        let len = self.taken.len();
+        let near_focus = (focus..focus.saturating_add(FOCUS_WINDOW).min(len))
+            .find(|position| !self.taken[*position]);
+        while self.frontier < len && self.taken[self.frontier] {
+            self.frontier += 1;
+        }
+        let position = near_focus.or((self.frontier < len).then_some(self.frontier))?;
+        self.taken[position] = true;
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        Some((sequence, position))
+    }
+}
+
+/// A photo's bytes on their way from the reader to the CPU tier.
+struct RawPreview {
+    sequence: usize,
+    key: AssetKey,
+    bytes: Result<Vec<u8>, ImageProcessingError>,
+}
+
+struct FinishedPreview {
+    sequence: usize,
+    key: AssetKey,
+    thumb: Option<Vec<u8>>,
+    preview: Option<Vec<u8>>,
+    errors: Vec<ImageProcessingError>,
+}
+
+struct Loader {
+    store: Arc<RwLock<ScanResponse>>,
+    card: Arc<CardGate>,
+    order: Vec<AssetKey>,
+    focus: Arc<AtomicUsize>,
+    read_threads: usize,
+    cpu_threads: usize,
+}
+
+impl Loader {
+    /// Stage 1: one small read per photo, so one reader in order is all it needs.
+    fn headers(&self, mut on_each: impl FnMut(AssetKey, &ExifAssetData)) {
+        let mut work = OrderedWork::new(self.order.len());
+        while let Some((_, position)) = work.next(self.focus.load(Ordering::Relaxed)) {
+            let key = &self.order[position];
+            let path = {
+                let scan = self.store.read().unwrap();
+                let Some(asset) = scan.assets.get(key) else {
+                    continue;
+                };
+                asset.files.get_prioritized().1.to_path_buf()
+            };
+            let data = {
+                let _permit = self.card.acquire_priority();
+                self.card.simulate_read(EXIF_HEADER_PREFIX_LEN);
+                read_exif_data(&path)
+            };
+            let Some(data) = data else { continue };
+            if let Some(asset) = self.store.write().unwrap().assets.get_mut(key) {
+                asset.exif_data = data.clone();
+            }
+            on_each(key.clone(), &data);
+        }
+    }
+
+    /// Stage 2: readers take photos in order, the CPU tier decodes them in parallel,
+    /// and a final step puts the results back in order before anyone sees them. The
+    /// bounded channel between the tiers limits how many buffers are in RAM.
+    fn previews(&self, mut on_each: impl FnMut(IngestMessage)) {
+        let work = Mutex::new(OrderedWork::new(self.order.len()));
+        let (raw_tx, raw_rx) = crossbeam_channel::bounded::<RawPreview>(self.cpu_threads * 2);
+        let (done_tx, done_rx) = crossbeam_channel::unbounded::<FinishedPreview>();
+
+        std::thread::scope(|scope| {
+            for _ in 0..self.read_threads {
+                let raw_tx = raw_tx.clone();
+                let work = &work;
+                scope.spawn(move || {
+                    loop {
+                        let focus = self.focus.load(Ordering::Relaxed);
+                        let Some((sequence, position)) =
+                            work.lock().unwrap_or_else(|e| e.into_inner()).next(focus)
+                        else {
                             return;
                         };
-                        asset.image_data.thumb = thumb;
-                        asset.image_data.preview = preview;
-                        if !errors.is_empty() {
-                            asset
-                                .image_data
-                                .errors
-                                .get_or_insert_with(Vec::new)
-                                .extend(errors);
+                        let key = self.order[position].clone();
+                        let source = {
+                            let scan = self.store.read().unwrap();
+                            scan.assets.get(&key).map(|asset| {
+                                let (kind, path) = asset.files.get_prioritized();
+                                (
+                                    kind,
+                                    path.to_path_buf(),
+                                    asset.exif_data.embedded_preview_file_location,
+                                )
+                            })
+                        };
+                        let bytes = match source {
+                            Some((kind, path, strip)) => {
+                                // The slot covers only the read, not the wait on the channel.
+                                let _permit = self.card.acquire_priority();
+                                let bytes = read_source_bytes(kind, &path, strip);
+                                if let Ok(bytes) = &bytes {
+                                    self.card.simulate_read(bytes.len() as u64);
+                                }
+                                bytes
+                            }
+                            None => Err("photo is no longer in the library".into()),
+                        };
+                        if raw_tx
+                            .send(RawPreview {
+                                sequence,
+                                key,
+                                bytes,
+                            })
+                            .is_err()
+                        {
+                            return;
                         }
                     }
-
-                    let _ = tx.send(IngestEvent::Preview(IngestMessage { key, error: failed }));
                 });
-            });
+            }
+            drop(raw_tx);
+
+            for _ in 0..self.cpu_threads {
+                let (raw_rx, done_tx) = (raw_rx.clone(), done_tx.clone());
+                scope.spawn(move || {
+                    for raw in raw_rx {
+                        let _ = done_tx.send(process_preview(raw));
+                    }
+                });
+            }
+            drop(done_tx);
+
+            // Whatever order the CPU tier finishes in, photos appear in read order.
+            let mut waiting: BTreeMap<usize, FinishedPreview> = BTreeMap::new();
+            let mut next = 0;
+            for finished in done_rx {
+                waiting.insert(finished.sequence, finished);
+                while let Some(finished) = waiting.remove(&next) {
+                    next += 1;
+                    on_each(self.publish(finished));
+                }
+            }
         });
+    }
+
+    /// Stores a finished preview with a brief lock, and says so.
+    fn publish(&self, finished: FinishedPreview) -> IngestMessage {
+        let failed = finished.thumb.is_none() && finished.preview.is_none();
+        {
+            let mut scan = self.store.write().unwrap();
+            if let Some(asset) = scan.assets.get_mut(&finished.key) {
+                asset.image_data.thumb = finished.thumb;
+                asset.image_data.preview = finished.preview;
+                if !finished.errors.is_empty() {
+                    asset
+                        .image_data
+                        .errors
+                        .get_or_insert_with(Vec::new)
+                        .extend(finished.errors);
+                }
+            }
+        }
+        IngestMessage {
+            key: finished.key,
+            error: failed,
+        }
+    }
+}
+
+fn process_preview(raw: RawPreview) -> FinishedPreview {
+    let mut errors: Vec<ImageProcessingError> = vec![];
+    let (thumb, preview) = match raw.bytes {
+        Err(error) => {
+            errors.push(error);
+            (None, None)
+        }
+        Ok(jpeg) => {
+            let thumb = make_thumbnail_from_jpeg_bytes(&jpeg)
+                .map_err(|e| errors.push(format!("thumbnail generation failed: {e}").into()))
+                .ok();
+            let preview = make_preview_from_jpeg_bytes(&jpeg)
+                .map_err(|e| errors.push(format!("preview generation failed: {e}").into()))
+                .ok();
+            (thumb, preview)
+        }
+    };
+    FinishedPreview {
+        sequence: raw.sequence,
+        key: raw.key,
+        thumb,
+        preview,
+        errors,
     }
 }
 
@@ -535,8 +670,8 @@ fn decoder_preview_jpeg(path: &Path) -> Result<Vec<u8>, ImageProcessingError> {
 mod tests {
     use super::*;
     use crate::{
-        FileInfo, ImportOptions, LocalTarget, Target, TargetId, TargetKind, TriageState,
-        VerifiedReplica, plan_import,
+        FileInfo, ImportOptions, LocalTarget, Target, TargetKind, TriageState, VerifiedReplica,
+        plan_import,
     };
 
     #[test]
@@ -709,34 +844,152 @@ mod tests {
         assert!(read_source_bytes(FileKind::Raw, &fake, None).is_err());
     }
 
+    fn keys_of(engine: &Engine) -> Vec<AssetKey> {
+        let mut keys: Vec<AssetKey> = engine
+            .scan_response
+            .read()
+            .unwrap()
+            .assets
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort_by(|a, b| a.stem.cmp(&b.stem));
+        keys
+    }
+
+    /// A card of `count` real RAW files: hard links, so it costs no disk space.
+    fn linked_card(dir: &Path, count: usize) {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_exif_read/IMG_1939.CR2");
+        std::fs::create_dir_all(dir).unwrap();
+        for i in 0..count {
+            let link = dir.join(format!("IMG_{i:04}.CR2"));
+            std::fs::hard_link(&fixture, &link)
+                .or_else(|_| std::fs::copy(&fixture, &link).map(|_| ()))
+                .unwrap();
+        }
+    }
+
     #[test]
-    fn scanning_names_opens_no_photo_and_enriching_streams_headers() {
+    fn scanning_names_opens_no_photo() {
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_exif_read");
         let mut engine = Engine::new(EngineConfig::default());
         engine.scan_names(&source, &ScanOptions::default());
-        {
-            let scan = engine.scan_response.read().unwrap();
-            assert_eq!(scan.assets.len(), 3);
-            assert!(
-                scan.assets
-                    .values()
-                    .all(|a| a.exif_data.captured_at.is_none())
-            );
-            assert_eq!(scan.file_meta.len(), 4);
-        }
-
-        let mut seen = 0;
-        engine.enrich_streaming(|_, data| {
-            assert!(data.captured_at.is_some());
-            seen += 1;
-        });
-        assert_eq!(seen, 3);
         let scan = engine.scan_response.read().unwrap();
+        assert_eq!(scan.assets.len(), 3);
         assert!(
             scan.assets
                 .values()
-                .all(|a| a.exif_data.captured_at.is_some())
+                .all(|a| a.exif_data.captured_at.is_none())
         );
+        assert_eq!(scan.file_meta.len(), 4);
+    }
+
+    #[test]
+    fn every_thumbnail_arrives_before_any_preview_each_in_display_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        linked_card(tmp.path(), 12);
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.scan_names(tmp.path(), &ScanOptions::default());
+        let order = keys_of(&engine);
+
+        let events: Vec<LoadEvent> = engine
+            .start_loading(order.clone(), Arc::new(AtomicUsize::new(0)))
+            .iter()
+            .collect();
+
+        let headers: Vec<&AssetKey> = events
+            .iter()
+            .filter_map(|event| match event {
+                LoadEvent::Header { key, .. } => Some(key),
+                _ => None,
+            })
+            .collect();
+        let previews: Vec<&AssetKey> = events
+            .iter()
+            .filter_map(|event| match event {
+                LoadEvent::Preview(message) => Some(&message.key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers, order.iter().collect::<Vec<_>>());
+        assert_eq!(previews, order.iter().collect::<Vec<_>>());
+        let last_header = events
+            .iter()
+            .rposition(|event| matches!(event, LoadEvent::Header { .. }))
+            .unwrap();
+        let first_preview = events
+            .iter()
+            .position(|event| matches!(event, LoadEvent::Preview(_)))
+            .unwrap();
+        assert!(last_header < first_preview);
+        assert!(matches!(events.last(), Some(LoadEvent::PreviewsDone)));
+    }
+
+    #[test]
+    fn jumping_ahead_pulls_those_photos_forward_and_loses_none() {
+        let mut work = OrderedWork::new(30);
+        assert_eq!(work.next(0), Some((0, 0)));
+        assert_eq!(work.next(1), Some((1, 1)));
+        // The photographer jumps to 20: the window goes first.
+        let jumped: Vec<usize> = (0..FOCUS_WINDOW.min(10))
+            .map(|_| work.next(20).unwrap().1)
+            .collect();
+        assert_eq!(jumped, (20..30).collect::<Vec<_>>());
+        // With the window done, the rest continue in order, each exactly once.
+        let rest: Vec<usize> = std::iter::from_fn(|| work.next(20).map(|(_, p)| p)).collect();
+        assert_eq!(rest, (2..20).collect::<Vec<_>>());
+        assert_eq!(work.next(0), None);
+    }
+
+    #[test]
+    fn thumbnails_reach_the_first_screen_quickly_on_a_slow_card_while_copying() {
+        // 20 MB/s, one channel: a real SD card. This took about a minute before the
+        // loader went in display order and the copy gave way to it.
+        let tmp = tempfile::tempdir().unwrap();
+        let card = tmp.path().join("card");
+        linked_card(&card, 60);
+        let mut engine = Engine::new(EngineConfig {
+            simulated_card_speed: Some(20_000_000),
+            ..Default::default()
+        });
+        engine.scan_names(&card, &ScanOptions::default());
+        let options = ImportOptions {
+            use_file_dates: true,
+            ..Default::default()
+        };
+        let plan = plan_import(&engine.scan_response, &card, &options, None).unwrap();
+        let target = Arc::new(LocalTarget::new(
+            TargetId(1),
+            Target {
+                root: tmp.path().join("photos"),
+                kind: TargetKind::LocalNvme,
+                write_permits: 4,
+            },
+        ));
+        let session = engine.start_session(target, vec![], None, vec![]);
+        for file in plan.files {
+            session.queue.push(file);
+        }
+        let order = keys_of(&engine);
+        let started = std::time::Instant::now();
+        let events = engine.start_loading(order.clone(), Arc::new(AtomicUsize::new(0)));
+
+        let mut seen = vec![];
+        while seen.len() < 24 {
+            match events
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+            {
+                LoadEvent::Header { key, .. } => seen.push(key),
+                other => panic!("{other:?}"),
+            }
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(seen, order[..24]);
+        assert!(elapsed.as_secs_f64() < 2.0, "{elapsed:?}");
+        session.queue.stop();
+        session.wait();
     }
 
     #[test]

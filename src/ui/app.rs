@@ -3,7 +3,11 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -13,12 +17,12 @@ use eframe::egui::{
 };
 use ingot_core::{
     AssetKey, DEFAULT_SENSITIVITY, DRIVE_ROOT_FOLDER, DateFolders, DriveConfig, DriveCredentials,
-    DriveTarget, Engine, EngineConfig, ExtensionCase, FileInfo, Fingerprint, ImportHistory,
-    ImportOptions, ImportQueue, LocalTarget, NameTemplate, Organize, PlannedFile, RemovalPlan,
-    ReplicaLocation, ReplicationEvent, ReplicationReport, ReplicationTarget, ScanOptions,
-    Selection, SweepReport, Target, TargetId, TargetKind, TriageState, UploadFile, VerifiedReplica,
-    execute_removal, execute_sweep, plan_import, plan_removal, plan_sweep, planned_relative,
-    preview, upload_blocking,
+    DriveTarget, Engine, EngineConfig, ExtensionCase, FileInfo, Fingerprint, ImportHandle,
+    ImportHistory, ImportOptions, ImportQueue, LoadEvent, LocalTarget, NameTemplate, Organize,
+    PlannedFile, RemovalPlan, ReplicaLocation, ReplicationEvent, ReplicationReport,
+    ReplicationTarget, ScanOptions, Selection, SweepReport, Target, TargetId, TargetKind,
+    TriageState, UploadFile, VerifiedReplica, execute_removal, execute_sweep, plan_import,
+    plan_removal, plan_sweep, planned_relative, preview, upload_blocking,
 };
 use ingot_develop::{DevelopParams, DevelopedImage, PreviewBase, WhiteBalance};
 
@@ -80,9 +84,7 @@ enum Msg {
         ignored: usize,
         errors: usize,
     },
-    Header(AssetKey, Option<u16>, Option<chrono::NaiveDateTime>),
-    Preview(AssetKey),
-    PreviewsDone,
+    Load(LoadEvent),
     Hashed(AssetKey, Fingerprint, Vec<u32>, bool),
     Full(AssetKey, Result<egui::ColorImage, String>),
     Base(AssetKey, Result<Arc<PreviewBase>, String>),
@@ -96,6 +98,7 @@ enum Msg {
     },
     SweepDone(Result<SweepReport, String>),
     Finalized(FinalizeResult),
+    Stopped(FinalizeResult),
 }
 
 /// What a finalized import did, for the report at the end.
@@ -199,6 +202,12 @@ enum Phase {
     /// The choice is made: finishing what was chosen and taking back the rest.
     Finalizing,
     Finalized,
+    /// Stop was confirmed and the copy is winding down.
+    Stopping {
+        remove_copies: bool,
+    },
+    /// Nothing is copying. Culling carries on, and it can be resumed or finalized.
+    Stopped,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -228,10 +237,17 @@ struct Session {
     planned: HashMap<PathBuf, PlannedFile>,
     targets: Vec<TargetInfo>,
     local_targets: usize,
+    primary: Arc<dyn ReplicationTarget>,
+    secondaries: Vec<Arc<dyn ReplicationTarget>>,
     /// Only gets files at Finalize, because Ingot never deletes from Drive.
     drive: Option<Arc<dyn ReplicationTarget>>,
     phase: Phase,
     keep: HashSet<PathBuf>,
+}
+
+/// The confirmation shown before Stop.
+struct StopDialog {
+    remove_copies: bool,
 }
 
 /// The confirmation shown before Finalize.
@@ -263,6 +279,8 @@ pub struct IngotApp {
     scanning: bool,
     previews_done: bool,
     previews_ready: usize,
+    headers_ready: usize,
+    headers_done: bool,
     ignored: usize,
     scan_errors: usize,
     status: Option<String>,
@@ -301,6 +319,11 @@ pub struct IngotApp {
     session: Option<Session>,
     finalize: Option<FinalizeDialog>,
     finalize_result: Option<FinalizeResult>,
+    stop_dialog: Option<StopDialog>,
+    stop_result: Option<FinalizeResult>,
+    /// The photo being looked at, for the loader to pull forward.
+    load_focus: Arc<AtomicUsize>,
+    engine_config: EngineConfig,
     save_open: bool,
     remover: Remover,
     drive_override: Option<Arc<dyn ReplicationTarget>>,
@@ -336,6 +359,8 @@ impl IngotApp {
             scanning: false,
             previews_done: false,
             previews_ready: 0,
+            headers_ready: 0,
+            headers_done: false,
             ignored: 0,
             scan_errors: 0,
             status: None,
@@ -370,6 +395,10 @@ impl IngotApp {
             session: None,
             finalize: None,
             finalize_result: None,
+            stop_dialog: None,
+            stop_result: None,
+            load_focus: Arc::new(AtomicUsize::new(0)),
+            engine_config: EngineConfig::default(),
             save_open: false,
             remover: execute_removal,
             drive_override: None,
@@ -417,6 +446,8 @@ impl IngotApp {
         self.scanning = true;
         self.previews_done = false;
         self.previews_ready = 0;
+        self.headers_ready = 0;
+        self.headers_done = false;
         self.view = View::Grid;
         self.status = None;
         self.survey.clear();
@@ -424,8 +455,9 @@ impl IngotApp {
         self.copy = CopyProgress::default();
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let history_path = self.paths.history.clone();
+        let config = self.engine_config.clone();
         std::thread::spawn(move || {
-            let mut engine = Engine::new(EngineConfig::default());
+            let mut engine = Engine::new(config);
             engine.scan_names(&folder, &ScanOptions::default());
             let (ignored, errors) = {
                 let scan = engine
@@ -471,7 +503,11 @@ impl IngotApp {
             .session
             .as_ref()
             .is_some_and(|session| session.phase == Phase::Copying);
-        if finalizing || (copying && pending > 0) {
+        let stopping = self
+            .session
+            .as_ref()
+            .is_some_and(|session| matches!(session.phase, Phase::Stopping { .. }));
+        if finalizing || stopping || (copying && pending > 0) {
             self.status = Some("Finalize this import or wait for it to finish first.".into());
             self.form.error = self.status.clone();
             return false;
@@ -552,7 +588,7 @@ impl IngotApp {
         }
 
         // The history is written at Finalize: it records what was kept.
-        let handle = engine.start_session(primary, secondaries, None, vec![]);
+        let handle = engine.start_session(Arc::clone(&primary), secondaries.clone(), None, vec![]);
         let id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |at| at.as_millis() as u64);
@@ -580,6 +616,8 @@ impl IngotApp {
             planned: HashMap::new(),
             targets,
             local_targets,
+            primary,
+            secondaries,
             drive,
             phase: Phase::Copying,
             keep: HashSet::new(),
@@ -603,6 +641,31 @@ impl IngotApp {
         });
         self.queue_photos(&everything);
 
+        self.forward_progress(handle);
+
+        // The loader follows the grid's order, which is fixed from here on.
+        let order: Vec<AssetKey> = self.library.as_ref().map_or(vec![], |library| {
+            library
+                .photos
+                .iter()
+                .map(|photo| photo.key.clone())
+                .collect()
+        });
+        self.load_focus.store(0, Ordering::Relaxed);
+        let events = engine.start_loading(order, Arc::clone(&self.load_focus));
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            for event in events.iter() {
+                if tx.send(Msg::Load(event)).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            }
+        });
+        Ok(())
+    }
+
+    fn forward_progress(&self, handle: ImportHandle) {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
             for event in handle.progress.iter() {
@@ -612,22 +675,83 @@ impl IngotApp {
             let _ = tx.send(Msg::CopyDone(handle.wait()));
             ctx.request_repaint();
         });
+    }
 
+    /// Stop was confirmed. Culling isn't touched: only the copy winds down.
+    fn stop_import(&mut self, remove_copies: bool) {
+        if let Some(session) = &mut self.session {
+            session.queue.stop();
+            session.phase = Phase::Stopping { remove_copies };
+        }
+    }
+
+    /// The copy has stopped. Takes back the copies, if that was chosen.
+    fn finish_stop(&mut self, remove_copies: bool) {
+        let Some(library) = &self.library else {
+            return;
+        };
+        let flushed = library.sidecars_flushed();
+        if remove_copies {
+            library_stop_sidecars(self.library.as_mut());
+        }
+        let Some(library) = &self.library else {
+            return;
+        };
+        let replicas = library.replicas.clone();
+        let remover = self.remover;
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
-            engine.enrich_streaming(|key, data| {
-                let _ = tx.send(Msg::Header(key.clone(), data.orientation, data.captured_at));
-                ctx.request_repaint();
-            });
-            for event in engine.ingest().iter() {
-                let ingot_core::IngestEvent::Preview(message) = event;
-                let _ = tx.send(Msg::Preview(message.key));
-                ctx.request_repaint();
+            let _ = flushed.recv();
+            let mut result = FinalizeResult::default();
+            if remove_copies {
+                let plan = plan_removal(&replicas, &HashSet::new());
+                result.already_there = plan.already_there.len();
+                let removal = remover(&plan);
+                result.sidecars_trashed = removal.sidecars_trashed.len();
+                for (path, why) in &removal.failures {
+                    result.problems.push(format!("{}: {why}", path.display()));
+                }
+                result.trashed = removal.trashed;
             }
-            let _ = tx.send(Msg::PreviewsDone);
+            let _ = tx.send(Msg::Stopped(result));
             ctx.request_repaint();
         });
-        Ok(())
+    }
+
+    /// Picks up a stopped import: the files not copied yet go back on a new queue, and
+    /// each keeps the name it was given. What's already copied isn't read again.
+    fn resume_import(&mut self) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        let handle = {
+            let Some(session) = &mut self.session else {
+                return;
+            };
+            let handle = engine.start_session(
+                Arc::clone(&session.primary),
+                session.secondaries.clone(),
+                None,
+                vec![],
+            );
+            session.queue = Arc::clone(&handle.queue);
+            session.phase = Phase::Copying;
+            handle
+        };
+        self.copy.started = Some(Instant::now());
+        self.copy.bytes = 0;
+        self.forward_progress(handle);
+        let waiting: Vec<usize> = self.library.as_mut().map_or(vec![], |library| {
+            library.sidecar_keep = None;
+            (0..library.photos.len())
+                .filter(|index| {
+                    let key = &library.photos[*index].key;
+                    library.decisions(key).1 != TriageState::Rejected
+                        && !library.already_imported.contains(key)
+                })
+                .collect()
+        });
+        self.queue_photos(&waiting);
     }
 
     /// Puts photos' files on the copy queue. Uses only what the folder listing already
@@ -722,6 +846,13 @@ impl IngotApp {
     /// The choice is confirmed. Stops queued copies of everything else and lets the
     /// copy finish. The rest happens when it reports in (`finish_finalize`).
     fn confirm_finalize(&mut self, keep_unflagged: bool) {
+        let stopped = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.phase == Phase::Stopped);
+        if stopped {
+            self.resume_import();
+        }
         let Some(library) = &mut self.library else {
             return;
         };
@@ -757,6 +888,8 @@ impl IngotApp {
             return;
         };
         let flushed = library.sidecars_flushed();
+        // From every run of this import, not just the last: it may have been resumed.
+        let replicas = library.replicas.clone();
         let keep = session.keep.clone();
         let destination = session.destination.clone();
         let planned = session.planned.clone();
@@ -800,7 +933,7 @@ impl IngotApp {
                 }
             }
 
-            let plan = plan_removal(&report.verified, &keep);
+            let plan = plan_removal(&replicas, &keep);
             result.already_there = plan.already_there.len();
             let removal = remover(&plan);
             result.sidecars_trashed = removal.sidecars_trashed.len();
@@ -813,7 +946,7 @@ impl IngotApp {
             let uses_drive = drive.is_some();
             if let Some(drive) = drive {
                 let mut files = vec![];
-                for replica in &report.verified {
+                for replica in &replicas {
                     let ReplicaLocation::Local(local) = replica.location() else {
                         continue;
                     };
@@ -851,8 +984,10 @@ impl IngotApp {
 
             // Only what was kept, and only once it is everywhere it should be.
             let mut reached: HashMap<&Path, usize> = HashMap::new();
-            for replica in &report.verified {
-                *reached.entry(replica.source()).or_default() += 1;
+            for replica in &replicas {
+                if matches!(replica.location(), ReplicaLocation::Local(_)) {
+                    *reached.entry(replica.source()).or_default() += 1;
+                }
             }
             let done: Vec<_> = reached
                 .iter()
@@ -934,17 +1069,25 @@ impl IngotApp {
                         }
                     }
                 }
-                Msg::Header(key, orientation, captured) => {
-                    if let Some(library) = &mut self.library {
-                        library.apply_header(&key, orientation, captured);
+                Msg::Load(event) => match event {
+                    LoadEvent::Header {
+                        key,
+                        orientation,
+                        captured_at,
+                    } => {
+                        self.headers_ready += 1;
+                        if let Some(library) = &mut self.library {
+                            library.apply_header(&key, orientation, captured_at);
+                        }
+                        self.request_hash(&key, false);
                     }
-                    self.request_hash(&key, false);
-                }
-                Msg::Preview(key) => {
-                    self.previews_ready += 1;
-                    self.request_hash(&key, true);
-                }
-                Msg::PreviewsDone => self.previews_done = true,
+                    LoadEvent::HeadersDone => self.headers_done = true,
+                    LoadEvent::Preview(message) => {
+                        self.previews_ready += 1;
+                        self.request_hash(&message.key, true);
+                    }
+                    LoadEvent::PreviewsDone => self.previews_done = true,
+                },
                 Msg::Hashed(key, print, histogram, from_thumb) => {
                     if let Some(library) = &mut self.library {
                         library.set_histogram(&key, histogram);
@@ -1015,7 +1158,22 @@ impl IngotApp {
                     }
                 },
                 Msg::CopyDone(report) => {
-                    self.finish_finalize(report);
+                    let phase = self.session.as_ref().map(|session| session.phase);
+                    match phase {
+                        Some(Phase::Finalizing) => self.finish_finalize(report),
+                        Some(Phase::Stopping { remove_copies }) => self.finish_stop(remove_copies),
+                        // A session left behind by New import, once it was done.
+                        _ => {}
+                    }
+                }
+                Msg::Stopped(result) => {
+                    if let Some(library) = &mut self.library {
+                        library.forget_trashed(&result.trashed);
+                    }
+                    if let Some(session) = &mut self.session {
+                        session.phase = Phase::Stopped;
+                    }
+                    self.stop_result = Some(result);
                 }
                 Msg::Finalized(result) => {
                     if let Some(library) = &mut self.library {
@@ -1077,6 +1235,8 @@ impl IngotApp {
         self.sweep.is_some()
             || self.finalize.is_some()
             || self.finalize_result.is_some()
+            || self.stop_dialog.is_some()
+            || self.stop_result.is_some()
             || self.save_open
     }
 
@@ -1393,6 +1553,11 @@ impl IngotApp {
         self.drain_messages();
         self.images.collect(&ctx);
         self.handle_keys(&ctx);
+        if let Some(library) = &self.library
+            && let Some(index) = library.visible.get(library.focus)
+        {
+            self.load_focus.store(*index, Ordering::Relaxed);
+        }
         if self.session.is_some() {
             self.sync_develop();
         }
@@ -1420,6 +1585,8 @@ impl IngotApp {
         }
         self.finalize_window(&ctx);
         self.finalize_result_window(&ctx);
+        self.stop_window(&ctx);
+        self.stop_result_window(&ctx);
         self.save_window(&ctx);
         self.sweep_window(&ctx);
         self.help_window(&ctx);
@@ -1429,6 +1596,7 @@ impl IngotApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let counts = self.library.as_ref().map(Library::import_counts);
         let phase = self.session.as_ref().map(|session| session.phase);
+        let mut resume = false;
         egui::Panel::top("top")
             .exact_size(46.0)
             .frame(
@@ -1516,12 +1684,12 @@ impl IngotApp {
                             return;
                         };
                         let finalize = match phase {
-                            Some(Phase::Copying) => Some("Finalize import"),
+                            Some(Phase::Copying | Phase::Stopped) => Some("Finalize import"),
                             Some(Phase::Finalizing) => Some("Finalizing…"),
                             _ => None,
                         };
                         if let Some(label) = finalize {
-                            let enabled = phase == Some(Phase::Copying);
+                            let enabled = matches!(phase, Some(Phase::Copying | Phase::Stopped));
                             if ui
                                 .add_enabled_ui(enabled, |ui| {
                                     button(ui, label, ButtonKind::Primary)
@@ -1536,6 +1704,24 @@ impl IngotApp {
                                     keep_unflagged: false,
                                 });
                             }
+                        }
+                        match phase {
+                            Some(Phase::Copying)
+                                if counts.pending() > 0
+                                    && button(ui, "Stop import", ButtonKind::Normal)
+                                        .on_hover_text("Stop copying. Your photos stay open.")
+                                        .clicked() =>
+                            {
+                                self.stop_dialog = Some(StopDialog {
+                                    remove_copies: false,
+                                });
+                            }
+                            Some(Phase::Stopped)
+                                if button(ui, "Resume copying", ButtonKind::Normal).clicked() =>
+                            {
+                                resume = true;
+                            }
+                            _ => {}
                         }
                         if ui
                             .add_enabled_ui(counts.rejects > 0, |ui| {
@@ -1567,6 +1753,9 @@ impl IngotApp {
                     });
                 });
             });
+        if resume {
+            self.resume_import();
+        }
     }
 
     /// The design's ingest bar: status, then a track per destination.
@@ -1586,7 +1775,7 @@ impl IngotApp {
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     let phase = self.session.as_ref().map(|session| session.phase);
-                    let running = phase == Some(Phase::Finalizing)
+                    let running = matches!(phase, Some(Phase::Finalizing | Phase::Stopping { .. }))
                         || (phase == Some(Phase::Copying) && counts.pending() > 0);
                     let (dot, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
                     ui.painter().circle_filled(
@@ -1598,6 +1787,8 @@ impl IngotApp {
                         (true, _) => "Listing".to_string(),
                         (_, Some(Phase::Finalizing)) => "Finalizing".to_string(),
                         (_, Some(Phase::Finalized)) => "Finalized".to_string(),
+                        (_, Some(Phase::Stopping { .. })) => "Stopping".to_string(),
+                        (_, Some(Phase::Stopped)) => "Stopped".to_string(),
                         (_, Some(Phase::Copying)) if running => "Ingesting".to_string(),
                         (_, Some(Phase::Copying)) => "Copied, choose and finalize".to_string(),
                         _ => "Idle".to_string(),
@@ -1613,6 +1804,14 @@ impl IngotApp {
                         ui.separator();
                     }
                     self.target_tracks(ui, counts.files);
+                    if self.session.is_some() && !self.previews_done {
+                        let loading = if self.headers_done {
+                            format!("Previews {}/{}", self.previews_ready, counts.photos)
+                        } else {
+                            format!("Thumbnails {}/{}", self.headers_ready, counts.photos)
+                        };
+                        ui.label(RichText::new(loading).color(INK_2).size(11.0));
+                    }
                     if self.copy.failed > 0 {
                         let errors = self.copy.last_errors.join("\n");
                         ui.label(
@@ -3496,6 +3695,112 @@ impl IngotApp {
         }
     }
 
+    /// Confirms Stop. Reads nothing from disk.
+    fn stop_window(&mut self, ctx: &egui::Context) {
+        let Some(mut remove_copies) = self.stop_dialog.as_ref().map(|d| d.remove_copies) else {
+            return;
+        };
+        let Some(library) = &self.library else {
+            return;
+        };
+        let plan = plan_removal(&library.replicas, &HashSet::new());
+        let paths: Vec<String> = plan
+            .paths()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        let pending = library.import_counts().pending();
+        let mut close = false;
+        let mut confirm = false;
+        egui::Modal::new(egui::Id::unique("stop")).show(ctx, |ui| {
+            ui.set_width(500.0);
+            ui.label(RichText::new("Stop import").size(17.0).strong().color(INK));
+            ui.label(
+                RichText::new(
+                    "Stops copying. Your photos stay open and you can keep culling. You can resume later.",
+                )
+                .color(INK_3)
+                .size(12.0),
+            );
+            ui.add_space(10.0);
+            big_stats(
+                ui,
+                &[
+                    (pending.to_string(), "files not copied", INK),
+                    (paths.len().to_string(), "copies made so far", INK),
+                ],
+            );
+            ui.add_space(8.0);
+            ui.checkbox(&mut remove_copies, "Also move the copies made so far to the Trash");
+            if remove_copies {
+                egui::ScrollArea::vertical()
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        for path in &paths {
+                            ui.label(RichText::new(path).monospace().size(10.5).color(INK_2));
+                        }
+                    });
+                ui.label(
+                    RichText::new(
+                        "Only copies this import wrote, and only if unchanged. Files that were already there and the source stay.",
+                    )
+                    .color(INK_3)
+                    .small(),
+                );
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if button(ui, "Keep copying", ButtonKind::Normal).clicked() {
+                    close = true;
+                }
+                if button(ui, "Stop import", ButtonKind::Danger).clicked() {
+                    confirm = true;
+                }
+            });
+        });
+        if confirm {
+            self.stop_dialog = None;
+            self.stop_import(remove_copies);
+        } else if close {
+            self.stop_dialog = None;
+        } else if let Some(dialog) = &mut self.stop_dialog {
+            dialog.remove_copies = remove_copies;
+        }
+    }
+
+    fn stop_result_window(&mut self, ctx: &egui::Context) {
+        let Some(result) = &self.stop_result else {
+            return;
+        };
+        let copies = self
+            .library
+            .as_ref()
+            .map_or(0, |library| library.import_counts().copied);
+        let mut close = false;
+        egui::Modal::new(egui::Id::unique("stopped")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.label(RichText::new("Import stopped").size(17.0).strong().color(INK));
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!(
+                    "{copies} files are copied and verified. {} copies went to the Trash. Nothing is half written. Keep culling, press Resume copying to continue, or Finalize.",
+                    result.trashed.len()
+                ))
+                .color(INK_2),
+            );
+            for problem in &result.problems {
+                ui.label(RichText::new(problem).color(REJECT).small());
+            }
+            ui.add_space(10.0);
+            if button(ui, "Done", ButtonKind::Primary).clicked() {
+                close = true;
+            }
+        });
+        if close {
+            self.stop_result = None;
+        }
+    }
+
     fn save_window(&mut self, ctx: &egui::Context) {
         if !self.save_open {
             return;
@@ -3725,6 +4030,13 @@ fn spawn_environment_thread(gdrive: PathBuf, tx: mpsc::Sender<Msg>, ctx: egui::C
             std::thread::sleep(Duration::from_secs(2));
         }
     });
+}
+
+/// While copies are being taken back, no sidecar may be written next to them.
+fn library_stop_sidecars(library: Option<&mut Library>) {
+    if let Some(library) = library {
+        library.sidecar_keep = Some(HashSet::new());
+    }
 }
 
 /// Fingerprints images already in memory, so clustering never adds a card read.
@@ -4500,6 +4812,152 @@ mod tests {
         assert_eq!(files_in(&second), ["IMG_1939.CR2"]);
     }
 
+    /// The real flow on a simulated 20 MB/s card, where the copy of these 77 MB takes
+    /// seconds. Warm fixtures alone hid the bug where pictures never seemed to come.
+    fn imported_on_slow_card(tmp: &TempDir, dest: &Path) -> Harness<'static, IngotApp> {
+        imported_on_card_at(tmp, dest, 20_000_000)
+    }
+
+    /// Stop tests use a slower card. After the first copy lands, this leaves about 6 s
+    /// for the stop to arrive, even with the whole suite loading the machine.
+    fn imported_on_card_at(
+        tmp: &TempDir,
+        dest: &Path,
+        bytes_per_second: u64,
+    ) -> Harness<'static, IngotApp> {
+        let mut harness = harness(tmp, None);
+        harness.state_mut().remover = delete_for_test;
+        harness.state_mut().engine_config = EngineConfig {
+            simulated_card_speed: Some(bytes_per_second),
+            ..Default::default()
+        };
+        harness.state_mut().form.destination = dest.display().to_string();
+        harness.state_mut().choose_source(fixture());
+        wait_until(&mut harness, "start", |app| app.session.is_some());
+        harness
+    }
+
+    #[test]
+    fn thumbnails_show_in_the_grid_while_the_copy_is_still_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("photos");
+        let mut harness = imported_on_slow_card(&tmp, &dest);
+        wait_until(&mut harness, "thumbnails", |app| app.headers_done);
+        // A texture reached the grid for each photo on screen, not just the store.
+        let textures = {
+            let app = harness.state_mut();
+            let photos = app.library.as_ref().unwrap().photos.clone();
+            let ctx = app.ctx.clone();
+            let mut count = 0;
+            for _ in 0..200 {
+                app.images.collect(&ctx);
+                count = photos
+                    .iter()
+                    .filter(|photo| app.texture_for(photo, false).is_some())
+                    .count();
+                if count == photos.len() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            count
+        };
+        assert_eq!(textures, 3);
+        let counts = harness.state().library.as_ref().unwrap().import_counts();
+        assert!(counts.pending() > 0, "the copy had already finished");
+        assert!(!harness.state().previews_done);
+    }
+
+    #[test]
+    fn stopping_keeps_finished_copies_and_culling_and_can_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("photos");
+        let mut harness = imported_on_card_at(&tmp, &dest, 8_000_000);
+        wait_until(&mut harness, "one copy", |app| {
+            app.library.as_ref().unwrap().import_counts().copied >= 1
+        });
+        harness.state_mut().stop_import(false);
+        wait_until(&mut harness, "stopped", |app| {
+            app.session.as_ref().unwrap().phase == Phase::Stopped
+        });
+        harness.state_mut().stop_result = None;
+        let (copied, kept) = {
+            let library = harness.state().library.as_ref().unwrap();
+            (library.import_counts().copied, files_in(&dest).len())
+        };
+        assert!(copied < 4, "{copied}");
+        assert_eq!(kept, copied);
+        assert!(
+            std::fs::read_dir(&dest)
+                .unwrap()
+                .flatten()
+                .all(|entry| { entry.path().extension().is_none_or(|x| x != "tmp") })
+        );
+
+        // Culling isn't affected, and the photos are still open.
+        harness.key_press(Key::Num3);
+        harness.step();
+        let library = harness.state().library.as_ref().unwrap();
+        assert_eq!(library.import_counts().rated, 1);
+        assert_eq!(library.photos.len(), 3);
+
+        // Resuming copies only what is missing.
+        harness.state_mut().resume_import();
+        assert_eq!(phase(&harness), Phase::Copying);
+        wait_until(&mut harness, "the rest", all_copied);
+        assert_eq!(files_in(&dest).len(), 4);
+        let library = harness.state().library.as_ref().unwrap();
+        assert!(
+            library
+                .replicas
+                .iter()
+                .all(|replica| replica.newly_written())
+        );
+    }
+
+    #[test]
+    fn stopping_can_take_back_the_copies_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("photos");
+        let mut harness = imported_on_card_at(&tmp, &dest, 8_000_000);
+        wait_until(&mut harness, "one copy", |app| {
+            app.library.as_ref().unwrap().import_counts().copied >= 1
+        });
+        harness.state_mut().stop_import(true);
+        wait_until(&mut harness, "stopped", |app| {
+            app.session.as_ref().unwrap().phase == Phase::Stopped
+        });
+        assert!(files_in(&dest).is_empty());
+        assert!(
+            !harness
+                .state()
+                .stop_result
+                .as_ref()
+                .unwrap()
+                .trashed
+                .is_empty()
+        );
+        assert_eq!(files_in(&fixture()).len(), 4);
+    }
+
+    #[test]
+    fn finalize_after_a_stop_finishes_what_was_chosen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("photos");
+        let mut harness = imported_on_slow_card(&tmp, &dest);
+        pick(&mut harness, "IMG_1939.CR2");
+        harness.state_mut().stop_import(false);
+        wait_until(&mut harness, "stopped", |app| {
+            app.session.as_ref().unwrap().phase == Phase::Stopped
+        });
+        harness.state_mut().stop_result = None;
+        harness.state_mut().confirm_finalize(false);
+        wait_until(&mut harness, "finalize", |app| {
+            app.session.as_ref().unwrap().phase == Phase::Finalized
+        });
+        assert_eq!(files_in(&dest), ["IMG_1939.CR2"]);
+    }
+
     #[test]
     fn the_finalize_dialog_shows_what_will_be_removed() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4787,8 +5245,18 @@ mod tests {
         harness.state_mut().form.organize = 2;
         shoot(&mut harness, "launchpad");
 
+        harness.state_mut().engine_config.simulated_card_speed = Some(20_000_000);
         harness.state_mut().choose_source(fixture());
         wait_until(&mut harness, "start", |app| app.session.is_some());
+        wait_until(&mut harness, "thumbnails", |app| app.headers_ready >= 1);
+        let image = {
+            for _ in 0..8 {
+                harness.step();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            harness.render().unwrap()
+        };
+        image.save(dir.join("loading.png")).unwrap();
         wait_until(&mut harness, "previews", |app| app.previews_done);
         harness.key_press(Key::Num4);
         harness.key_press(Key::P);

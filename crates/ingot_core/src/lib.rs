@@ -27,17 +27,17 @@ pub use cluster::{
     ClusterItem, DEFAULT_SENSITIVITY, Fingerprint, MAX_GROUP_GAP_SECONDS, cluster_any_order,
     cluster_ranges, looks_alike,
 };
-pub use engine::{Engine, EngineConfig, ImportHandle, IngestEvent, upload_blocking};
+pub use engine::{Engine, EngineConfig, ImportHandle, IngestEvent, LoadEvent, upload_blocking};
 pub use import::{
     DateFolders, DuplicateKey, ExtensionCase, ImportHistory, ImportOptions, ImportPlan,
     NameTemplate, Organize, PlannedFile, Selection, plan_import, planned_relative,
 };
 pub use metadata::{enrich_assets, get_embedded_preview_location, read_embedded_preview};
 pub use replicate::{
-    CardGate, CardPermit, CopyEngine, DRIVE_ROOT_FOLDER, DriveConfig, DriveCredentials,
-    DriveTarget, FileInfo, ImportQueue, LocalTarget, ReplicaLocation, ReplicationEvent,
-    ReplicationFailure, ReplicationReport, ReplicationTarget, TargetId, UploadFile,
-    VerifiedReplica, drive_login,
+    CardGate, CardPermit, CopyEngine, DEFAULT_READ_CHUNK, DRIVE_ROOT_FOLDER, DriveConfig,
+    DriveCredentials, DriveTarget, FileInfo, ImportQueue, LocalTarget, ReplicaLocation,
+    ReplicationEvent, ReplicationFailure, ReplicationReport, ReplicationTarget, TargetId,
+    UploadFile, VerifiedReplica, drive_login,
 };
 pub use route::{Target, TargetKind};
 pub use scan::{Collision, FileMeta, ScanOptions, ScanResponse, scan_source, scan_source_dir};

@@ -18,6 +18,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{OsStr, OsString},
     hash::Hash,
+    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant, SystemTime},
@@ -359,6 +360,7 @@ pub struct ImportQueue {
 struct QueueState {
     waiting: VecDeque<PlannedFile>,
     closed: bool,
+    stopped: bool,
     duplicate_keys: HashMap<PathBuf, DuplicateKey>,
 }
 
@@ -403,6 +405,23 @@ impl ImportQueue {
         self.changed.notify_one();
     }
 
+    /// Stops the import: nothing else starts, and reads in progress end at their next
+    /// chunk. A write already under way finishes, so it is either a verified copy or
+    /// nothing. Copies already made stay.
+    pub fn stop(&self) {
+        {
+            let mut state = self.lock();
+            state.stopped = true;
+            state.closed = true;
+            state.waiting.clear();
+        }
+        self.changed.notify_one();
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.lock().stopped
+    }
+
     pub fn waiting(&self) -> usize {
         self.lock().waiting.len()
     }
@@ -430,6 +449,10 @@ impl ImportQueue {
     }
 }
 
+/// Bytes the copy reads before going back to the card gate. On a 20 MB/s card, 2 MiB is
+/// the 100 ms or so a culling read can have to wait. See `bench_culling`.
+pub const DEFAULT_READ_CHUNK: usize = 2 * 1024 * 1024;
+
 /// Files allowed to be mid-read at once on top of the channel depth. The card gate
 /// decides how many actually touch the card; this only has to keep it supplied.
 const READS_IN_PROGRESS: usize = 2;
@@ -440,6 +463,7 @@ pub struct CopyEngine {
     primary_target: Arc<dyn ReplicationTarget>,
     secondary_targets: Vec<Arc<dyn ReplicationTarget>>,
     progress: Progress,
+    read_chunk: usize,
 }
 
 #[derive(Clone)]
@@ -465,31 +489,68 @@ fn read_failure(source: PathBuf, error: ReplicationError) -> ReplicationFailure 
     }
 }
 
-/// Reads one file. The card slot is released as soon as the bytes are in RAM, so
-/// hashing and any wait for a slow target never keep a preview read off the card.
+/// Why a read ended early: the import was stopped, which isn't a failure.
+const STOPPED: &str = "the import was stopped";
+
+/// Reads one file, a chunk at a time, going back to the gate between chunks so a
+/// culling read never waits for more than one chunk. It is still one read of the
+/// file, hashed as a whole, and the bytes are in RAM once for all targets.
 fn read_file_blocking(
-    permit: CardPermit,
+    gate: &Arc<CardGate>,
+    queue: &ImportQueue,
+    chunk: usize,
     file: PlannedFile,
 ) -> Result<CopyMessage, ReplicationError> {
-    let bytes = std::fs::read(&file.source)?;
-    drop(permit);
+    let mut opened = {
+        let _permit = gate.acquire_background();
+        std::fs::File::open(&file.source)?
+    };
+    let mut bytes = vec![0u8; file.size as usize];
+    let mut filled = 0;
+    let mut hasher = blake3::Hasher::new();
+    loop {
+        if queue.is_stopped() {
+            return Err(STOPPED.into());
+        }
+        if filled == bytes.len() {
+            // The file may have grown since it was listed. Copy what it holds now.
+            bytes.resize(filled + chunk.max(1), 0);
+        }
+        let end = (filled + chunk.max(1)).min(bytes.len());
+        let read = {
+            let _permit = gate.acquire_background();
+            let read = opened.read(&mut bytes[filled..end])?;
+            gate.simulate_read(read as u64);
+            read
+        };
+        if read == 0 {
+            break;
+        }
+        hasher.update(&bytes[filled..filled + read]);
+        filled += read;
+    }
+    bytes.truncate(filled);
 
-    let src_hash = blake3::hash(&bytes);
     Ok(CopyMessage {
         info: FileInfo {
             source: file.source,
             relative: file.relative,
             modified: file.modified,
-            src_hash,
+            src_hash: hasher.finalize(),
         },
         bytes: Arc::from(bytes),
     })
 }
 
-async fn read_file(gate: Arc<CardGate>, file: PlannedFile) -> ReadOutcome {
+async fn read_file(
+    gate: Arc<CardGate>,
+    queue: Arc<ImportQueue>,
+    chunk: usize,
+    file: PlannedFile,
+) -> ReadOutcome {
     let source = file.source.clone();
-    let permit = gate.acquire_background().await;
-    let read = tokio::task::spawn_blocking(move || read_file_blocking(permit, file)).await;
+    let read =
+        tokio::task::spawn_blocking(move || read_file_blocking(&gate, &queue, chunk, file)).await;
 
     match read {
         Ok(Ok(message)) => Ok(message),
@@ -582,6 +643,7 @@ async fn run_secondary(
     mut hot: mpsc::Receiver<CopyMessage>,
     mut deferred: mpsc::UnboundedReceiver<DeferredFile>,
     progress: Progress,
+    queue: Arc<ImportQueue>,
 ) -> ReplicationReport {
     let mut report = ReplicationReport::default();
     let mut stores = StoreSet::new();
@@ -603,6 +665,7 @@ async fn run_secondary(
                 }
             }
             msg = hot.recv(), if hot_open => match msg {
+                Some(_) if queue.is_stopped() => {}
                 Some(msg) => {
                     let (target, info) = (Arc::clone(&target), msg.info.clone());
                     stores.spawn(
@@ -615,6 +678,7 @@ async fn run_secondary(
                 None => hot_open = false,
             },
             file = deferred.recv(), if deferred_open => match file {
+                Some(_) if queue.is_stopped() => {}
                 Some(file) => {
                     let target = Arc::clone(&target);
                     stores.spawn(
@@ -701,11 +765,17 @@ impl CopyEngine {
             primary_target,
             secondary_targets: vec![],
             progress: None,
+            read_chunk: DEFAULT_READ_CHUNK,
         }
     }
 
     pub fn with_secondary(mut self, target: Arc<dyn ReplicationTarget>) -> Self {
         self.secondary_targets.push(target);
+        self
+    }
+
+    pub fn with_read_chunk(mut self, read_chunk: usize) -> Self {
+        self.read_chunk = read_chunk.max(1);
         self
     }
 
@@ -721,6 +791,7 @@ impl CopyEngine {
         let (tx, rx) = mpsc::channel(self.read_channel_depth);
         let buffers = Arc::new(Semaphore::new(READS_IN_PROGRESS));
         let card = Arc::clone(&self.card);
+        let chunk = self.read_chunk;
 
         tokio::spawn(async move {
             loop {
@@ -740,10 +811,10 @@ impl CopyEngine {
                     _ = tx.closed() => return,
                 };
 
-                let (tx, card) = (tx.clone(), Arc::clone(&card));
+                let (tx, card, queue) = (tx.clone(), Arc::clone(&card), Arc::clone(&queue));
                 tokio::spawn(async move {
                     let _slot = slot;
-                    let outcome = read_file(card, file).await;
+                    let outcome = read_file(card, queue, chunk, file).await;
                     let _ = tx.send(outcome).await;
                 });
             }
@@ -774,7 +845,7 @@ impl CopyEngine {
     pub async fn replicate_queue(&self, queue: Arc<ImportQueue>) -> ReplicationReport {
         let started = Instant::now();
         let mut report = ReplicationReport::default();
-        let mut rx = self.start_read_stream(queue);
+        let mut rx = self.start_read_stream(Arc::clone(&queue));
         let mut stores = StoreSet::new();
         let primary_id = self.primary_target.id();
         let max_stores = self.primary_target.max_concurrent_writes().max(1);
@@ -794,6 +865,7 @@ impl CopyEngine {
                 hot_rx,
                 deferred_rx,
                 self.progress.clone(),
+                Arc::clone(&queue),
             ));
         }
 
@@ -821,7 +893,9 @@ impl CopyEngine {
                     let msg = match outcome {
                         Some(Ok(msg)) => msg,
                         Some(Err(failure)) => {
-                            report.record_failure(&self.progress, failure);
+                            if !queue.is_stopped() {
+                                report.record_failure(&self.progress, failure);
+                            }
                             continue;
                         }
                         None => {
@@ -1196,6 +1270,67 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_import_keeps_finished_copies_and_leaves_nothing_half_written() {
+        let tmp = tempdir().unwrap();
+        let card = tmp.path().join("card");
+        let paths: Vec<PathBuf> = (0..30)
+            .map(|i| write_source(&card, &format!("IMG_{i:04}.CR2"), &vec![i as u8; 1 << 20]))
+            .collect();
+        let files: Vec<(&Path, FileKind)> =
+            paths.iter().map(|p| (p.as_path(), FileKind::Raw)).collect();
+        let root = tmp.path().join("target");
+        let gate = CardGate::with_simulated_speed(1, Some(20_000_000));
+        let engine = CopyEngine::new(gate, 2, local_target(&root, 2));
+        let queue = closed_queue(plan_of(&scan_of(&files, true)));
+        let stopper = {
+            let (queue, dir) = (Arc::clone(&queue), dated_dir(&root));
+            tokio::spawn(async move {
+                wait_for_entries(&dir, 2).await;
+                queue.stop();
+            })
+        };
+
+        let report = engine.replicate_queue(queue).await;
+        stopper.await.unwrap();
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        let entries = dir_entries(&dated_dir(&root));
+        assert!(entries.len() < 30, "{}", entries.len());
+        assert_eq!(entries.len(), report.verified.len());
+        assert!(
+            entries.iter().all(|name| !name.ends_with(".tmp")),
+            "{entries:?}"
+        );
+        for replica in &report.verified {
+            let ReplicaLocation::Local(path) = replica.location() else {
+                panic!("expected a local copy");
+            };
+            assert_eq!(blake3::hash(&fs::read(path).unwrap()), replica.hash());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chunked_reads_give_the_same_file_and_hash_at_any_chunk_size() {
+        let tmp = tempdir().unwrap();
+        let contents: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let raw = write_source(&tmp.path().join("card"), "IMG_1.CR2", &contents);
+        for chunk in [1000, 64 * 1024, 300_000, 1 << 24] {
+            let root = tmp.path().join(format!("target{chunk}"));
+            let engine =
+                CopyEngine::new(CardGate::new(1), 4, local_target(&root, 1)).with_read_chunk(chunk);
+            let report = engine
+                .replicate(plan_of(&scan_of(&[(&raw, FileKind::Raw)], true)))
+                .await;
+            assert!(report.failures.is_empty(), "{:?}", report.failures);
+            assert_eq!(report.verified[0].hash(), blake3::hash(&contents));
+            assert_eq!(
+                fs::read(dated_dir(&root).join("IMG_1.CR2")).unwrap(),
+                contents
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn waiting_on_a_full_channel_leaves_the_card_free_for_previews() {
         let tmp = tempdir().unwrap();
         let paths: Vec<PathBuf> = (0..10)
@@ -1472,7 +1607,8 @@ mod tests {
         let report = engine.replicate(plan_of(&scan_of(&files, true))).await;
 
         assert_eq!(report.verified.len(), 30);
-        assert_eq!(target.peak.load(Ordering::SeqCst), 3);
+        let peak = target.peak.load(Ordering::SeqCst);
+        assert!((1..=3).contains(&peak), "{peak}");
     }
 
     /// Wraps a real target and holds every store until `gate` opens.

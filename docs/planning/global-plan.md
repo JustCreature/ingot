@@ -231,6 +231,12 @@ The naive `spawn one task per target` fan-out (Step 2) has a flaw: it ties the c
 
 Name and destination first. Choosing the source starts copying everything and opens the grid. The photographer chooses with the Pick flag while it runs; Reject holds a photo's unread files back. Finalize, after a confirmation that lists what goes, stops queued copies of unchosen files, finishes what is in progress, moves copies this import newly wrote of unchosen files to the Trash, finishes the chosen rest, then uploads kept files to Drive. Drive waits because Ingot never deletes from it.
 
+### Loading order and card priority (decided 2026-10-30, after the owner's third test)
+
+Stage 1: the header thumbnail of every photo. Stage 2: the preview of every photo, from the JPEG or the JPEG embedded in the RAW. Both run strictly in display order, with up to 12 photos after the focus pulled forward; parallel decoding is put back in order before publishing. Stage 3, on demand only: full size on zoom, or the RAW on develop. This replaces the `par_iter` reader tier.
+
+Card priority is strict: on-demand, then stages 1 and 2, then copy. The copy holds one slot, gets it only when no culling read is waiting or running or just finished (10 ms), and reads 2 MiB at a time. So on a card the copy effectively begins once stages 1 and 2 finish, or whenever they pause on the CPU tier. Stop import ends the queue and reads in progress at their next chunk; writes under way finish, so a file is either a verified copy or nothing. Resume starts a new queue with the files still missing.
+
 ### Step 4 — Import options (Lightroom parity)
 
 Status of each Lightroom Classic import option, from Adobe's help and from memory of the dialog (Adobe's options page refused automated access, so re-check against the app).
