@@ -300,6 +300,53 @@ impl ReplicationReport {
     }
 }
 
+/// A copy on local disk to send to another target, carrying the card's hash so a
+/// damaged local copy fails verification instead of spreading.
+pub struct UploadFile {
+    pub info: FileInfo,
+    pub local: PathBuf,
+}
+
+/// Sends local copies to one target, as many at once as it allows. The card isn't
+/// involved. Used for Google Drive, which only gets photos once they are chosen,
+/// because Ingot can't take anything back from it.
+pub async fn upload_copies(
+    target: Arc<dyn ReplicationTarget>,
+    files: Vec<UploadFile>,
+    progress: Option<crossbeam_channel::Sender<ReplicationEvent>>,
+) -> ReplicationReport {
+    let started = Instant::now();
+    let mut report = ReplicationReport::default();
+    let mut stores = StoreSet::new();
+    let max_stores = target.max_concurrent_writes().max(1);
+    for file in files {
+        while stores.len() >= max_stores {
+            if let Some((pending, result)) = stores.next().await {
+                report.record_store(&progress, target.id(), pending.info.source, result);
+            }
+        }
+        let target = Arc::clone(&target);
+        stores.spawn(
+            PendingStore {
+                info: file.info.clone(),
+                deferred_to: vec![],
+            },
+            async move {
+                let deferred = DeferredFile {
+                    info: file.info,
+                    primary_location: file.local,
+                };
+                store_from_primary(&*target, deferred).await
+            },
+        );
+    }
+    while let Some((pending, result)) = stores.next().await {
+        report.record_store(&progress, target.id(), pending.info.source, result);
+    }
+    report.primary_done_after = started.elapsed();
+    report
+}
+
 /// The files an import still has to read. It can change while the copy runs: a
 /// photographer ticks and unticks photos, and a file is only out of reach once its
 /// read has started.
@@ -1284,6 +1331,37 @@ mod tests {
 
         queue.close();
         running.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn uploading_sends_only_what_is_listed_and_checks_it_against_the_card() {
+        let tmp = tempdir().unwrap();
+        let good = write_source(tmp.path(), "good.CR2", b"the card held this");
+        let damaged = write_source(tmp.path(), "damaged.CR2", b"bit rot");
+        let unlisted = write_source(tmp.path(), "unlisted.CR2", b"never chosen");
+        let root = tmp.path().join("drive");
+        let upload = |local: &Path, card: &[u8]| UploadFile {
+            info: file_info(
+                local.file_name().unwrap().to_str().unwrap(),
+                blake3::hash(card),
+            ),
+            local: local.to_path_buf(),
+        };
+
+        let report = upload_copies(
+            local_target(&root, 2),
+            vec![
+                upload(&good, b"the card held this"),
+                upload(&damaged, b"what the card really held"),
+            ],
+            None,
+        )
+        .await;
+
+        assert_eq!(report.verified.len(), 1);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(dir_entries(&dated_dir(&root)), ["good.CR2"]);
+        assert!(unlisted.exists());
     }
 
     #[tokio::test]

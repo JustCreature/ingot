@@ -11,9 +11,9 @@ use std::{
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use eframe::egui::{Key, Modifiers};
 use ingot_core::{
-    AssetKey, ClusterItem, DEFAULT_SENSITIVITY, FileKind, Fingerprint, ReplicaLocation,
-    ScanResponse, SidecarOutcome, TargetId, TriageKey, TriageRecord, TriageState, TriageStore,
-    VerifiedReplica, cluster_ranges, write_sidecar,
+    AssetKey, CaptureInfo, ClusterItem, DEFAULT_SENSITIVITY, FileKind, Fingerprint,
+    ReplicaLocation, ScanResponse, SidecarOutcome, TargetId, TriageKey, TriageRecord, TriageState,
+    TriageStore, VerifiedReplica, cluster_ranges, write_sidecar,
 };
 use ingot_develop::DevelopParams;
 
@@ -40,8 +40,7 @@ pub enum Filter {
     Rejected,
     Unflagged,
     Stars(u8),
-    Ticked,
-    NotTicked,
+    StarsDown(u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,7 +59,7 @@ pub enum Command {
     Loupe,
     Develop,
     Clusters,
-    Tick,
+    Survey,
     Zoom,
     BeforeAfter,
     ToggleAutoAdvance,
@@ -68,6 +67,7 @@ pub enum Command {
     Import,
     CopySettings,
     PasteSettings,
+    SelectAll,
     Help,
     Back,
 }
@@ -81,6 +81,7 @@ pub fn command_for(key: Key, modifiers: Modifiers) -> Option<Command> {
             (Key::I, true) => Some(C::Import),
             (Key::C, true) => Some(C::CopySettings),
             (Key::V, true) => Some(C::PasteSettings),
+            (Key::A, false) => Some(C::SelectAll),
             _ => None,
         };
     }
@@ -91,7 +92,7 @@ pub fn command_for(key: Key, modifiers: Modifiers) -> Option<Command> {
         Key::Num3 => C::Rate(3),
         Key::Num4 => C::Rate(4),
         Key::Num5 => C::Rate(5),
-        Key::P => C::Pick,
+        Key::P | Key::Space => C::Pick,
         Key::X => C::Reject,
         Key::U => C::Unflag,
         Key::ArrowRight => C::Next,
@@ -104,7 +105,7 @@ pub fn command_for(key: Key, modifiers: Modifiers) -> Option<Command> {
         Key::E | Key::Enter => C::Loupe,
         Key::D => C::Develop,
         Key::L => C::Clusters,
-        Key::T => C::Tick,
+        Key::N => C::Survey,
         Key::Z => C::Zoom,
         Key::Backslash => C::BeforeAfter,
         Key::A => C::ToggleAutoAdvance,
@@ -115,25 +116,27 @@ pub fn command_for(key: Key, modifiers: Modifiers) -> Option<Command> {
     })
 }
 
-/// How far the import has got, for the always-visible count.
+/// How far the import has got, for the ingest bar and the Finalize dialog.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ImportCounts {
-    /// Ticked photos, and their files and bytes: what this import will bring in.
     pub photos: usize,
     pub files: usize,
     pub bytes: u64,
-    /// Ticked files on every target.
+    pub picks: usize,
+    pub rejects: usize,
+    pub rated: usize,
+    /// Files on every local target.
     pub copied: usize,
-    /// Ticked files that failed on some target.
     pub failed: usize,
-    /// Unticked photos whose copy stays, because it was made before the untick.
-    pub kept: usize,
+    /// Files of rejected photos not copied yet, which the copy leaves for last.
+    pub held: usize,
 }
 
 impl ImportCounts {
-    /// Ticked files still on their way.
+    /// Files still on their way.
     pub fn pending(&self) -> usize {
-        self.files.saturating_sub(self.copied + self.failed)
+        self.files
+            .saturating_sub(self.copied + self.failed + self.held)
     }
 }
 
@@ -153,15 +156,21 @@ pub struct Library {
     pub filter: Filter,
     pub auto_advance: bool,
     pub replicas: Vec<VerifiedReplica>,
-    /// Photos the import will bring in. Everything else is only looked at.
-    pub ticked: HashSet<AssetKey>,
+    /// Photos chosen with Cmd-click or Shift-click, as indexes into `photos`. Flags and
+    /// ratings apply to all of them when there is more than one.
+    pub selected: HashSet<usize>,
+    anchor: usize,
+    /// Set by Finalize: only these files may get sidecars from then on, because the
+    /// rest are about to be taken back.
+    pub sidecar_keep: Option<HashSet<PathBuf>>,
+    histograms: HashMap<AssetKey, Vec<u32>>,
     /// Photos the import history says were already brought in.
     pub already_imported: HashSet<AssetKey>,
     /// How many targets a file has to reach to count as copied.
     pub target_count: usize,
     pub sensitivity: f32,
     warnings: Arc<Mutex<Vec<String>>>,
-    sidecars: mpsc::Sender<(PathBuf, TriageRecord)>,
+    sidecars: mpsc::Sender<SidecarJob>,
     file_copies: HashMap<PathBuf, FileCopy>,
     fingerprints: HashMap<AssetKey, (Fingerprint, bool)>,
     clusters: Vec<Range<usize>>,
@@ -170,14 +179,25 @@ pub struct Library {
     triage: Option<TriageStore>,
 }
 
+enum SidecarJob {
+    Write(PathBuf, TriageRecord),
+    /// Answers once every earlier write is done.
+    Flush(mpsc::Sender<()>),
+}
+
 /// Sidecars go to the destination disk, which may be slow, so they never block the
 /// keypress that changed them.
-fn spawn_sidecar_writer(
-    warnings: Arc<Mutex<Vec<String>>>,
-) -> mpsc::Sender<(PathBuf, TriageRecord)> {
-    let (tx, rx) = mpsc::channel::<(PathBuf, TriageRecord)>();
+fn spawn_sidecar_writer(warnings: Arc<Mutex<Vec<String>>>) -> mpsc::Sender<SidecarJob> {
+    let (tx, rx) = mpsc::channel::<SidecarJob>();
     std::thread::spawn(move || {
-        for (copy, record) in rx {
+        for job in rx {
+            let (copy, record) = match job {
+                SidecarJob::Write(copy, record) => (copy, record),
+                SidecarJob::Flush(done) => {
+                    let _ = done.send(());
+                    continue;
+                }
+            };
             let warning = match write_sidecar(&copy, &record) {
                 Ok(SidecarOutcome::Written(_)) => continue,
                 Ok(SidecarOutcome::LeftForeignSidecar(path)) => {
@@ -282,7 +302,6 @@ impl Library {
             .enumerate()
             .map(|(index, photo)| (photo.key.clone(), index))
             .collect();
-        let ticked = photos.iter().map(|photo| photo.key.clone()).collect();
 
         let mut library = Library {
             store,
@@ -292,7 +311,10 @@ impl Library {
             filter: Filter::All,
             auto_advance: true,
             replicas: vec![],
-            ticked,
+            selected: HashSet::new(),
+            anchor: 0,
+            sidecar_keep: None,
+            histograms: HashMap::new(),
             already_imported: HashSet::new(),
             target_count: 1,
             sensitivity: DEFAULT_SENSITIVITY,
@@ -331,8 +353,7 @@ impl Library {
             Filter::Rejected => state == TriageState::Rejected,
             Filter::Unflagged => state == TriageState::Pending,
             Filter::Stars(minimum) => rating >= minimum,
-            Filter::Ticked => self.ticked.contains(key),
-            Filter::NotTicked => !self.ticked.contains(key),
+            Filter::StarsDown(maximum) => rating <= maximum,
         }
     }
 
@@ -369,25 +390,38 @@ impl Library {
         self.focus = position.min(self.visible.len().saturating_sub(1));
     }
 
-    /// Applies a rating or flag to the focused photo, saves it, and updates the
-    /// sidecars of any copies. Never blocks on the copy: only this photo's entry is
-    /// locked, and only for the assignment.
-    fn change(&mut self, advance: bool, apply: impl FnOnce(&mut u8, &mut TriageState)) {
-        let Some(photo) = self.focused().cloned() else {
+    /// The photos an action applies to: the selection if there is one, else the focus.
+    pub fn action_targets(&self) -> Vec<usize> {
+        if self.selected.len() > 1 {
+            let mut targets: Vec<usize> = self.selected.iter().copied().collect();
+            targets.sort_unstable();
+            return targets;
+        }
+        self.visible.get(self.focus).copied().into_iter().collect()
+    }
+
+    fn change(&mut self, advance: bool, apply: impl Fn(&mut u8, &mut TriageState)) {
+        let targets = self.action_targets();
+        if targets.is_empty() {
             return;
-        };
+        }
         {
             let mut scan = self.store.write().unwrap_or_else(|e| e.into_inner());
-            if let Some(asset) = scan.assets.get_mut(&photo.key) {
-                apply(&mut asset.rating, &mut asset.state);
+            for index in &targets {
+                if let Some(asset) = scan.assets.get_mut(&self.photos[*index].key) {
+                    apply(&mut asset.rating, &mut asset.state);
+                }
             }
         }
-        self.save(&photo);
+        for index in &targets {
+            let photo = self.photos[*index].clone();
+            self.save(&photo);
+        }
         let position_key = self.visible.get(self.focus).copied();
         self.refresh_visible();
-        // Moving on only makes sense if the photo is still in the list; if the filter
-        // removed it, the next one is already in focus.
-        if advance && self.visible.get(self.focus).copied() == position_key {
+        // Moving on only makes sense for a single photo still in the list; if the
+        // filter removed it, the next one is already in focus.
+        if advance && targets.len() == 1 && self.visible.get(self.focus).copied() == position_key {
             self.move_focus(1);
         }
     }
@@ -396,8 +430,66 @@ impl Library {
         self.change(advance, |rating, _| *rating = stars.min(5));
     }
 
+    /// Sets a flag, or clears it if every target already has it, as in the design.
     pub fn flag(&mut self, flag: TriageState, advance: bool) {
-        self.change(advance, |_, state| *state = flag);
+        let targets = self.action_targets();
+        let all_same = !targets.is_empty()
+            && targets
+                .iter()
+                .all(|index| self.decisions(&self.photos[*index].key).1 == flag);
+        let wanted = if all_same { TriageState::Pending } else { flag };
+        self.change(advance, move |_, state| *state = wanted);
+    }
+
+    /// A click in the grid: plain selects one, Cmd adds or removes, Shift takes a range.
+    pub fn click(&mut self, position: usize, command: bool, shift: bool) {
+        let Some(index) = self.visible.get(position).copied() else {
+            return;
+        };
+        self.focus = position;
+        if shift {
+            let (low, high) = (self.anchor.min(position), self.anchor.max(position));
+            if !command {
+                self.selected.clear();
+            }
+            for at in low..=high.min(self.visible.len().saturating_sub(1)) {
+                self.selected.insert(self.visible[at]);
+            }
+            return;
+        }
+        self.anchor = position;
+        if command {
+            if !self.selected.remove(&index) {
+                self.selected.insert(index);
+            }
+            return;
+        }
+        self.selected.clear();
+        self.selected.insert(index);
+    }
+
+    pub fn select_all(&mut self) {
+        self.selected = self.visible.iter().copied().collect();
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+        if let Some(index) = self.visible.get(self.focus).copied() {
+            self.selected.insert(index);
+        }
+        self.anchor = self.focus;
+    }
+
+    /// Photos for the compare view: the selection, or else the first few.
+    pub fn survey_positions(&self) -> Vec<usize> {
+        let positions: Vec<usize> = (0..self.visible.len())
+            .filter(|position| self.selected.contains(&self.visible[*position]))
+            .collect();
+        if positions.len() > 1 {
+            positions
+        } else {
+            (0..self.visible.len().min(9)).collect()
+        }
     }
 
     pub fn develop_params(&self, photo: &Photo) -> DevelopParams {
@@ -456,13 +548,18 @@ impl Library {
             .replicas
             .iter()
             .filter(|replica| photo.files.iter().any(|file| file == replica.source()))
+            .filter(|replica| {
+                self.sidecar_keep
+                    .as_ref()
+                    .is_none_or(|keep| keep.contains(replica.source()))
+            })
             .filter_map(|replica| match replica.location() {
                 ReplicaLocation::Local(path) if path != replica.source() => Some(path.clone()),
                 _ => None,
             })
             .collect();
         for copy in copies {
-            let _ = self.sidecars.send((copy, record.clone()));
+            let _ = self.sidecars.send(SidecarJob::Write(copy, record.clone()));
         }
     }
 
@@ -527,45 +624,129 @@ impl Library {
 
     pub fn import_counts(&self) -> ImportCounts {
         let mut counts = ImportCounts::default();
+        let scan = self.store.read().unwrap_or_else(|e| e.into_inner());
         for photo in &self.photos {
-            if self.ticked.contains(&photo.key) {
-                counts.photos += 1;
-                counts.files += photo.files.len();
-                counts.bytes += photo.size;
-                for file in &photo.files {
-                    if self.is_copied(file) {
-                        counts.copied += 1;
-                    } else if self.file_copies.get(file).is_some_and(|copy| copy.failed) {
-                        counts.failed += 1;
-                    }
+            let (rating, state) = scan
+                .assets
+                .get(&photo.key)
+                .map_or((0, TriageState::Pending), |asset| {
+                    (asset.rating, asset.state)
+                });
+            counts.photos += 1;
+            counts.files += photo.files.len();
+            counts.bytes += photo.size;
+            counts.picks += usize::from(state == TriageState::Accepted);
+            counts.rejects += usize::from(state == TriageState::Rejected);
+            counts.rated += usize::from(rating > 0);
+            for file in &photo.files {
+                if self.is_copied(file) {
+                    counts.copied += 1;
+                } else if self.file_copies.get(file).is_some_and(|copy| copy.failed) {
+                    counts.failed += 1;
+                } else if state == TriageState::Rejected
+                    || self.already_imported.contains(&photo.key)
+                {
+                    counts.held += 1;
                 }
-            } else if self.photo_copied(photo) {
-                counts.kept += 1;
             }
         }
         counts
     }
 
-    pub fn set_ticked(&mut self, key: &AssetKey, ticked: bool) {
-        if ticked {
-            self.ticked.insert(key.clone());
-        } else {
-            self.ticked.remove(key);
-        }
-        if matches!(self.filter, Filter::Ticked | Filter::NotTicked) {
-            self.refresh_visible();
+    /// The files Finalize keeps: the picks, plus unflagged photos if asked.
+    pub fn files_to_keep(&self, keep_unflagged: bool) -> HashSet<PathBuf> {
+        let scan = self.store.read().unwrap_or_else(|e| e.into_inner());
+        self.photos
+            .iter()
+            .filter(|photo| {
+                let state = scan
+                    .assets
+                    .get(&photo.key)
+                    .map_or(TriageState::Pending, |asset| asset.state);
+                state == TriageState::Accepted || (keep_unflagged && state == TriageState::Pending)
+            })
+            .flat_map(|photo| photo.files.iter().cloned())
+            .collect()
+    }
+
+    /// Answers once every sidecar queued so far has been written.
+    pub fn sidecars_flushed(&self) -> mpsc::Receiver<()> {
+        let (done, flushed) = mpsc::channel();
+        let _ = self.sidecars.send(SidecarJob::Flush(done));
+        flushed
+    }
+
+    /// Rewrites the sidecars of every culled photo that has copies.
+    pub fn save_all_sidecars(&mut self) {
+        for photo in self.photos.clone() {
+            self.save(&photo);
         }
     }
 
-    /// Ticks everything, leaving out what was already imported if asked.
-    pub fn tick_all(&mut self, skip_already_imported: bool) {
-        self.ticked = self
-            .photos
+    /// Copies of this file that reached this target.
+    pub fn reached(&self, file: &Path, target: TargetId) -> bool {
+        self.file_copies
+            .get(file)
+            .is_some_and(|copy| copy.targets.contains(&target))
+    }
+
+    /// Files that reached a target, for its progress bar.
+    pub fn target_done(&self, target: TargetId) -> usize {
+        self.file_copies
+            .values()
+            .filter(|copy| copy.targets.contains(&target))
+            .count()
+    }
+
+    /// Forgets copies that were moved to the Trash.
+    pub fn forget_trashed(&mut self, trashed: &[PathBuf]) {
+        let gone: Vec<(PathBuf, TargetId)> = self
+            .replicas
             .iter()
-            .filter(|photo| !(skip_already_imported && self.already_imported.contains(&photo.key)))
-            .map(|photo| photo.key.clone())
+            .filter_map(|replica| match replica.location() {
+                ReplicaLocation::Local(path) if trashed.contains(path) => {
+                    Some((replica.source().to_path_buf(), replica.target()))
+                }
+                _ => None,
+            })
             .collect();
-        self.refresh_visible();
+        for (source, target) in gone {
+            if let Some(copy) = self.file_copies.get_mut(&source) {
+                copy.targets.remove(&target);
+            }
+        }
+        self.replicas.retain(|replica| match replica.location() {
+            ReplicaLocation::Local(path) => !trashed.contains(path),
+            ReplicaLocation::Remote(_) => true,
+        });
+    }
+
+    pub fn capture(&self, key: &AssetKey) -> CaptureInfo {
+        let scan = self.store.read().unwrap_or_else(|e| e.into_inner());
+        scan.assets
+            .get(key)
+            .map(|asset| asset.exif_data.capture.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_histogram(&mut self, key: &AssetKey, histogram: Vec<u32>) {
+        self.histograms.insert(key.clone(), histogram);
+    }
+
+    pub fn histogram(&self, key: &AssetKey) -> Option<&[u32]> {
+        self.histograms.get(key).map(Vec::as_slice)
+    }
+
+    /// Counts of photos for the filter rows, without taking the lock per photo.
+    pub fn filter_counts(&self) -> [usize; 4] {
+        let scan = self.store.read().unwrap_or_else(|e| e.into_inner());
+        let count = |state| scan.assets.values().filter(|a| a.state == state).count();
+        [
+            scan.assets.len(),
+            count(TriageState::Accepted),
+            count(TriageState::Pending),
+            count(TriageState::Rejected),
+        ]
     }
 
     pub fn mark_already_imported(&mut self, files: &HashSet<PathBuf>) {
@@ -646,16 +827,6 @@ impl Library {
             .unwrap_or_else(PoisonError::into_inner)
             .push(warning);
     }
-
-    pub fn counts(&self) -> (usize, usize, usize) {
-        let scan = self.store.read().unwrap_or_else(|e| e.into_inner());
-        let count = |state| scan.assets.values().filter(|a| a.state == state).count();
-        (
-            scan.assets.len(),
-            count(TriageState::Accepted),
-            count(TriageState::Rejected),
-        )
-    }
 }
 
 #[cfg(test)]
@@ -732,7 +903,7 @@ mod tests {
         library.flag(TriageState::Accepted, false);
         let key = library.focused().unwrap().key.clone();
         assert_eq!(library.decisions(&key), (4, TriageState::Accepted));
-        assert_eq!(library.counts(), (3, 1, 0));
+        assert_eq!(library.import_counts().picks, 1);
     }
 
     #[test]
@@ -796,52 +967,83 @@ mod tests {
         library.move_focus(1);
         library.rate(5, true);
         library.flag(TriageState::Rejected, true);
-        assert_eq!(library.counts(), (3, 0, 0));
+        assert_eq!(library.import_counts().rejects, 0);
     }
 
     #[test]
-    fn counts_follow_the_ticks_instantly() {
+    fn counts_follow_picks_and_rejects_instantly() {
         let (_tmp, mut library) = library_of(&THREE);
         let counts = library.import_counts();
-        assert_eq!((counts.photos, counts.files), (3, 3));
+        assert_eq!((counts.photos, counts.files, counts.picks), (3, 3, 0));
         assert_eq!(counts.bytes, 3 * b"not a real photo".len() as u64);
+        assert_eq!(counts.pending(), 3);
 
-        let key = library.photos[0].key.clone();
-        library.set_ticked(&key, false);
-        assert_eq!(library.import_counts().photos, 2);
-        library.ticked.clear();
-        assert_eq!(library.import_counts().files, 0);
-        library.tick_all(false);
-        assert_eq!(library.import_counts().files, 3);
+        library.flag(TriageState::Accepted, false);
+        library.jump(1);
+        library.flag(TriageState::Rejected, false);
+        let counts = library.import_counts();
+        assert_eq!((counts.picks, counts.rejects, counts.held), (1, 1, 1));
+        assert_eq!(counts.pending(), 2);
     }
 
     #[test]
-    fn a_pair_ticks_as_one_photo_and_counts_both_files() {
-        let (_tmp, library) = library_of(&["A.CR2", "A.JPG", "B.JPG"]);
+    fn a_pair_is_one_photo_with_both_files() {
+        let (_tmp, mut library) = library_of(&["A.CR2", "A.JPG", "B.JPG"]);
         let counts = library.import_counts();
         assert_eq!((counts.photos, counts.files), (2, 3));
+        library.flag(TriageState::Accepted, false);
+        assert_eq!(library.files_to_keep(false).len(), 2);
     }
 
     #[test]
-    fn already_imported_photos_can_be_left_unticked() {
+    fn finalize_keeps_picks_and_unflagged_only_when_asked() {
         let (_tmp, mut library) = library_of(&THREE);
-        let first = library.photos[0].files[0].clone();
-        library.mark_already_imported(&HashSet::from([first]));
-        library.tick_all(true);
-        assert_eq!(library.import_counts().photos, 2);
-        library.tick_all(false);
-        assert_eq!(library.import_counts().photos, 3);
+        library.flag(TriageState::Accepted, false);
+        library.jump(1);
+        library.flag(TriageState::Rejected, false);
+        assert_eq!(library.files_to_keep(false).len(), 1);
+        assert_eq!(library.files_to_keep(true).len(), 2);
     }
 
     #[test]
-    fn the_ticked_filter_lists_what_will_be_imported() {
+    fn flagging_again_clears_the_flag() {
         let (_tmp, mut library) = library_of(&THREE);
-        let key = library.photos[1].key.clone();
-        library.set_ticked(&key, false);
-        library.set_filter(Filter::Ticked);
+        library.flag(TriageState::Accepted, false);
+        library.flag(TriageState::Accepted, false);
+        assert_eq!(library.import_counts().picks, 0);
+    }
+
+    #[test]
+    fn flags_and_ratings_apply_to_the_whole_selection() {
+        let (_tmp, mut library) = library_of(&THREE);
+        library.click(0, false, false);
+        library.click(2, false, true);
+        assert_eq!(library.selected.len(), 3);
+        library.rate(2, false);
+        library.flag(TriageState::Accepted, true);
+        let counts = library.import_counts();
+        assert_eq!((counts.picks, counts.rated), (3, 3));
+        // A batch doesn't move the focus on.
+        assert_eq!(library.focus, 2);
+
+        library.click(1, true, false);
+        assert_eq!(library.selected.len(), 2);
+        library.click(1, false, false);
+        assert_eq!(library.selected.len(), 1);
+        library.select_all();
+        assert_eq!(library.survey_positions().len(), 3);
+        library.clear_selection();
+        assert_eq!(library.selected.len(), 1);
+    }
+
+    #[test]
+    fn star_filters_work_in_both_directions() {
+        let (_tmp, mut library) = library_of(&THREE);
+        library.rate(4, false);
+        library.set_filter(Filter::StarsDown(2));
         assert_eq!(library.visible.len(), 2);
-        library.set_filter(Filter::NotTicked);
-        assert_eq!(focused_name(&library), "B.JPG");
+        library.set_filter(Filter::Stars(3));
+        assert_eq!(library.visible.len(), 1);
     }
 
     #[test]

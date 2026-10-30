@@ -98,6 +98,11 @@ pub enum SidecarOutcome {
     LeftForeignSidecar(PathBuf),
 }
 
+/// Whether the sidecar at this path is one Ingot wrote. Anything unreadable is not.
+pub fn is_own_sidecar(path: &Path) -> bool {
+    fs::read_to_string(path).is_ok_and(|text| text.contains(CREATOR_MARK))
+}
+
 /// The sidecar for a photo: `IMG_1.xmp` beside `IMG_1.CR2`, Lightroom's convention,
 /// which a RAW and JPEG of the same stem share.
 pub fn sidecar_path(photo: &Path) -> PathBuf {

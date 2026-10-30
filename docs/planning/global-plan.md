@@ -227,6 +227,10 @@ The naive `spawn one task per target` fan-out (Step 2) has a flaw: it ties the c
 - **In-flight stores are capped at `max_concurrent_writes()`.** Spawning a store per message would drain the channel into tasks queued on the write semaphore, each holding a file buffer, which removes both the backpressure and the RAM bound.
 - **A read slot, not a card permit, is held until the bytes are in the channel**, so a full channel stops card reads while the card stays free for previews (`CardGate`).
 
+### Import flow (decided 2026-10-30, after the owner's two tests)
+
+Name and destination first. Choosing the source starts copying everything and opens the grid. The photographer chooses with the Pick flag while it runs; Reject holds a photo's unread files back. Finalize, after a confirmation that lists what goes, stops queued copies of unchosen files, finishes what is in progress, moves copies this import newly wrote of unchosen files to the Trash, finishes the chosen rest, then uploads kept files to Drive. Drive waits because Ingot never deletes from it.
+
 ### Step 4 — Import options (Lightroom parity)
 
 Status of each Lightroom Classic import option, from Adobe's help and from memory of the dialog (Adobe's options page refused automated access, so re-check against the app).
@@ -243,7 +247,7 @@ Status of each Lightroom Classic import option, from Adobe's help and from memor
 | Organize: into one folder, by original folders, by date | Built; into one folder is the default |
 | Date formats | Built: any chrono format, not just a fixed list |
 | Rename templates, custom text, start number, extension case | Built |
-| Filter: new photos / select individual photos | Built: duplicate history, `Selection.paths` (CLI has kinds and date range; hand-picking waits for the UI) |
+| Filter: new photos / select individual photos | Built: duplicate history; in the app, choosing is the Pick flag and Finalize (CLI has kinds and date range) |
 | Don't import suspected duplicates | Built: name + capture time + size |
 | Make a second copy | Built, repeatable, same layout as the destination |
 | Build previews: minimal, embedded, standard | One mode, or `--no-previews`; tiers wait for the UI |

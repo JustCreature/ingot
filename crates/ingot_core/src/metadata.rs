@@ -13,7 +13,7 @@ use std::path::Path;
 
 use chrono::NaiveDateTime;
 
-use crate::asset::{AssetKey, ExifAssetData, PhotoAsset, PreviewStrip};
+use crate::asset::{AssetKey, CaptureInfo, ExifAssetData, PhotoAsset, PreviewStrip};
 
 pub(crate) type MetadataError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -78,6 +78,40 @@ pub fn read_embedded_preview(path: &Path, strip: PreviewStrip) -> Result<Vec<u8>
     file.read_exact(&mut buf)?;
 
     Ok(buf)
+}
+
+fn get_capture_info(exif: &exif::Exif) -> CaptureInfo {
+    let text = |tag: exif::Tag| {
+        exif.get_field(tag, exif::In::PRIMARY).map(|field| {
+            field
+                .display_value()
+                .with_unit(exif)
+                .to_string()
+                .trim_matches('"')
+                .trim()
+                .to_string()
+        })
+    };
+    let pixels = match (
+        text(exif::Tag::PixelXDimension),
+        text(exif::Tag::PixelYDimension),
+    ) {
+        (Some(x), Some(y)) => Some(format!(
+            "{} x {}",
+            x.trim_end_matches(" pixels"),
+            y.trim_end_matches(" pixels")
+        )),
+        _ => None,
+    };
+    CaptureInfo {
+        camera: text(exif::Tag::Model),
+        lens: text(exif::Tag::LensModel),
+        focal: text(exif::Tag::FocalLength),
+        aperture: text(exif::Tag::FNumber),
+        shutter: text(exif::Tag::ExposureTime),
+        iso: text(exif::Tag::PhotographicSensitivity),
+        pixels,
+    }
 }
 
 fn get_thumbnail(exif: &exif::Exif) -> Option<Vec<u8>> {
@@ -164,6 +198,7 @@ pub(crate) fn extract_exif_data(exif: &exif::Exif) -> ExifAssetData {
             .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
             .and_then(|field| field.value.get_uint(0))
             .and_then(|value| u16::try_from(value).ok()),
+        capture: get_capture_info(exif),
         thumbnail: get_thumbnail(exif),
         embedded_preview_file_location: get_embedded_preview_location(exif),
     }
@@ -268,6 +303,16 @@ mod tests {
             strip.offset + strip.len as u64 > EXIF_HEADER_PREFIX_LEN,
             "preview data must lie beyond the header read"
         );
+    }
+
+    #[test]
+    fn capture_details_come_from_the_header() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/test_exif_read/IMG_1800.JPG");
+        let data = read_exif_data(&path).unwrap();
+        assert!(data.capture.camera.is_some(), "{:?}", data.capture);
+        assert!(data.capture.shutter.is_some(), "{:?}", data.capture);
+        assert!(!data.capture.camera.unwrap().contains('"'));
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::metadata::read_exif_data;
 use crate::preview::{compress, make_preview_from_jpeg_bytes, make_thumbnail_from_jpeg_bytes};
 use crate::replicate::{
     CardGate, CopyEngine, ImportQueue, ReplicationEvent, ReplicationFailure, ReplicationReport,
-    ReplicationTarget, TargetId,
+    ReplicationTarget, TargetId, UploadFile, upload_copies,
 };
 use crate::scan::{ScanOptions, ScanResponse, scan_source};
 use crate::{FileKind, PreviewStrip, enrich_assets, read_embedded_preview};
@@ -453,6 +453,30 @@ impl Engine {
                 });
             });
         });
+    }
+}
+
+/// Runs [`upload_copies`] on its own runtime and blocks until it is done. Call it off
+/// the UI thread.
+pub fn upload_blocking(
+    target: Arc<dyn ReplicationTarget>,
+    files: Vec<UploadFile>,
+    progress: Option<crossbeam_channel::Sender<ReplicationEvent>>,
+) -> ReplicationReport {
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(upload_copies(target, files, progress)),
+        Err(err) => {
+            let mut report = ReplicationReport::default();
+            report.failures.push(ReplicationFailure {
+                source: None,
+                target: None,
+                error: format!("could not start the upload runtime: {err}").into(),
+            });
+            report
+        }
     }
 }
 

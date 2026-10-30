@@ -6,6 +6,7 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 chrono = "0.4.45"
+crossbeam-channel = "0.5.17"
 dirs = "7.0.0"
 eframe = { version = "0.37.0", features = ["persistence"] }
 ingot_core = { path = "crates/ingot_core" }

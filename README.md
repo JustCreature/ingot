@@ -1,20 +1,20 @@
 # Ingot
 
-A fast RAW + JPEG photo importer and culling app, written in Rust. Insert a card and start rating right away while your photos copy to local disks and Google Drive in the background.
+A fast RAW + JPEG photo importer and culling app, written in Rust. Choose where photos go, pick the card, and start choosing images right away while everything copies in the background. Finalize keeps your picks and takes back the rest.
 
 > **Status: early.** The app works end to end, but it has only been tried on Canon CR2 and JPEG files. Real card imports and real Google Drive uploads haven't been run yet. See [Limits](#limits).
 
 ## What it does
 
-- **Import first.** Pick the card, then the destination and options. No photo is opened until then, and copying starts the moment the card is first read.
-- **Tick what comes in.** Every photo has a tick, and only ticked photos are copied. Ticks keep working during the copy: a photo not yet read leaves the queue, one ticked later joins it, and a copy already made stays. The count and destination are always on screen.
-- **Cull while copying.** Ratings and flags never wait on the copy. Preview reads go ahead of copy reads on the card, and the copy still gets regular turns.
+- **Destination, then source.** Name the import and choose the destination and options. Choosing the card is what starts it: everything begins copying and the grid opens.
+- **Choose in the grid.** Pick (`P`) the images you want. Rejecting (`X`) holds a photo back from the copy until you change your mind. Ratings and flags never wait on the copy, and preview reads go ahead of copy reads on the card.
+- **Finalize.** Stops queued copies of what you didn't choose, finishes the rest, and moves copies this import made of unchosen photos to the Trash. It shows the list first, and you can keep unflagged photos too.
 - **Clusters.** Similar photos are grouped automatically. A sensitivity slider goes from "same scene" to "same subject position" and regroups instantly.
 - **Verified copies.** Every file is read from the card once, written to a temp file, checked by hash, and only then given its real name. An existing file is never overwritten.
 - **Import options like Lightroom's.** Into a subfolder; one folder, original folders or by date; rename templates; duplicate skipping; second copies; filters; dry run.
-- **Google Drive backup.** Uploads carry on after the card is finished, using the local copy. Ingot only ever works inside its own `__ingot_backups` folder and has no code that deletes from Drive.
+- **Google Drive backup.** Uploads wait for Finalize and send only what you kept, using the local copy, because Ingot never deletes from Drive. It only ever works inside its own `__ingot_backups` folder.
 - **RAW develop.** A scene-referred pipeline ported from [darktable](https://github.com/darktable-org/darktable), with Lightroom-style sliders.
-- **Safe cleanup.** Rejected copies go to the Trash, only with proof that they are verified copies. The source is never touched.
+- **Safe removal.** A copy only goes with proof that this import wrote it, only if it is unchanged, and only to the Trash. Files that were already there, and the source, are never touched.
 
 ## Install
 
@@ -30,7 +30,7 @@ make setup-local        # installs jpeg-turbo, cmake and nasm with Homebrew
 
 ```sh
 cargo run --release                                  # open the app
-cargo run --release -- /Volumes/EOS_DIGITAL/DCIM     # go straight to importing a card or folder
+cargo run --release -- /Volumes/EOS_DIGITAL/DCIM     # offer this card or folder as the source
 ```
 
 Press `/` in the app to see the shortcuts.
@@ -38,12 +38,13 @@ Press `/` in the app to see the shortcuts.
 | Keys | Action |
 |---|---|
 | `0`–`5` | Rating |
-| `P` / `X` / `U` | Pick / reject / clear flag |
+| `P` or `Space` / `X` / `U` | Pick / reject / clear flag |
 | `Shift` + any of those | Also move to the next photo |
 | `A` | Move on after a flag, on or off |
 | Arrow keys, `Home`, `End` | Move |
 | `G` / `L` / `E` or `Enter` / `D` | Grid / clusters / loupe / develop |
-| `T` | Tick or untick for import |
+| `N` | Compare the selection |
+| `Cmd`-click, `Shift`-click, `Cmd+A` | Select several; flags and ratings apply to all |
 | `Z` | Zoom to 1:1 |
 | `\` | Before and after |
 | `Cmd+Shift+C` / `Cmd+Shift+V` | Copy / paste develop settings |
@@ -69,7 +70,6 @@ Use `cargo run --release --` in place of `ingot` when running from the repo. `in
 ## Limits
 
 - **Formats:** all 29 file types [rawler](https://github.com/dnglab/dnglab) reads are recognised, but only CR2 has been tried on real files. X-Trans and linear DNG can't be developed yet, though they import and copy.
-- **Thumbnails appear after you start.** The import screen lists photos by name, because reading a thumbnail means touching the file, and that waits for a destination.
 - **Dates in the app** come from each file's modified time, which is known without opening it. On a card that is the capture time. A folder whose files were re-saved or copied without keeping their dates would be filed and grouped by the later date.
 - **Videos** are skipped. The app and command line show how many files were left out.
 - **Not built yet:** highlight reconstruction, denoise, lens correction, color balance, tone curve, HSL, crop, presets, collections and a catalog.
