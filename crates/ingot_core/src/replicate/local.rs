@@ -1,7 +1,8 @@
 //! Replication onto a locally mounted filesystem.
 //!
 //! A destination file is only ever created from a temp file that has already been
-//! verified, and this module never removes or replaces a destination file. A file
+//! verified, and this module never removes or replaces a destination file (`sweep.rs`
+//! holds the one narrow, proof-gated exception, and only moves to the Trash). A file
 //! already there with the same contents counts as copied; one with different
 //! contents is left alone and the new file is stored under a numbered name.
 

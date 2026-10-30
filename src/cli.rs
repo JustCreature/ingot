@@ -69,6 +69,10 @@ fn date(value: &str) -> Result<NaiveDate, Usage> {
         .map_err(|_| Usage(format!("not a YYYY-MM-DD date: {value}")))
 }
 
+pub fn imports_path() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join("ingot").join("imports.json"))
+}
+
 pub fn triage_path() -> Option<PathBuf> {
     Some(dirs::data_dir()?.join("ingot").join("triage.jsonl"))
 }

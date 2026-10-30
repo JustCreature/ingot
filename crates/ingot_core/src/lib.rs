@@ -5,6 +5,7 @@
 //! re-exported here only where they form part of the public surface.
 
 mod asset;
+mod cluster;
 mod engine;
 mod import;
 mod metadata;
@@ -19,22 +20,31 @@ mod triage;
 mod test_support;
 
 pub use asset::{
-    AssetFiles, AssetKey, ExifAssetData, FileKind, PhotoAsset, PreviewStrip, TriageState,
+    AssetFiles, AssetKey, CaptureInfo, ExifAssetData, FileKind, PhotoAsset, PreviewStrip,
+    TriageState,
 };
-pub use engine::{Engine, EngineConfig, ImportHandle, IngestEvent};
+pub use cluster::{
+    ClusterItem, DEFAULT_SENSITIVITY, Fingerprint, MAX_GROUP_GAP_SECONDS, cluster_any_order,
+    cluster_ranges, looks_alike,
+};
+pub use engine::{Engine, EngineConfig, ImportHandle, IngestEvent, LoadEvent, upload_blocking};
 pub use import::{
     DateFolders, DuplicateKey, ExtensionCase, ImportHistory, ImportOptions, ImportPlan,
-    NameTemplate, Organize, PlannedFile, Selection, plan_import,
+    NameTemplate, Organize, PlannedFile, Selection, plan_import, planned_relative,
 };
 pub use metadata::{enrich_assets, get_embedded_preview_location, read_embedded_preview};
 pub use replicate::{
-    CardGate, CardPermit, CopyEngine, DRIVE_ROOT_FOLDER, DriveConfig, DriveCredentials,
-    DriveTarget, FileInfo, LocalTarget, ReplicaLocation, ReplicationEvent, ReplicationFailure,
-    ReplicationReport, ReplicationTarget, TargetId, VerifiedReplica, drive_login,
+    CardGate, CardPermit, CopyEngine, DEFAULT_READ_CHUNK, DRIVE_ROOT_FOLDER, DriveConfig,
+    DriveCredentials, DriveTarget, FileInfo, ImportQueue, LocalTarget, ReplicaLocation,
+    ReplicationEvent, ReplicationFailure, ReplicationReport, ReplicationTarget, TargetId,
+    UploadFile, VerifiedReplica, drive_login,
 };
 pub use route::{Target, TargetKind};
-pub use scan::{Collision, ScanOptions, ScanResponse, scan_source, scan_source_dir};
-pub use sweep::{SweepPlan, SweepReport, execute_sweep, plan_sweep};
+pub use scan::{Collision, FileMeta, ScanOptions, ScanResponse, scan_source, scan_source_dir};
+pub use sweep::{
+    RemovalPlan, SweepPlan, SweepReport, execute_removal, execute_sweep, plan_removal, plan_sweep,
+};
 pub use triage::{
-    SidecarOutcome, TriageKey, TriageRecord, TriageStore, sidecar_path, write_sidecar,
+    SidecarOutcome, TriageKey, TriageRecord, TriageStore, is_own_sidecar, sidecar_path,
+    write_sidecar,
 };

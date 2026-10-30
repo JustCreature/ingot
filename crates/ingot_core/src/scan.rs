@@ -7,6 +7,7 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use crate::asset::{AssetKey, FileKind, PhotoAsset};
@@ -27,6 +28,15 @@ pub struct ScanResponse {
     /// Files that are not photos this engine understands, such as videos. Kept so
     /// an import can say what it did not copy.
     pub ignored: Vec<PathBuf>,
+    /// Size and modified time of each photo file, from the directory walk. Having
+    /// these means planning an import doesn't have to go back to a slow card.
+    pub file_meta: HashMap<PathBuf, FileMeta>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileMeta {
+    pub size: u64,
+    pub modified: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +61,7 @@ pub fn scan_source(source: &Path, options: &ScanOptions) -> ScanResponse {
     let mut collisions: Vec<Collision> = vec![];
     let mut errors: Vec<walkdir::Error> = vec![];
     let mut ignored: Vec<PathBuf> = vec![];
+    let mut file_meta: HashMap<PathBuf, FileMeta> = HashMap::new();
     let mut walk = walkdir::WalkDir::new(source);
     if !options.include_subfolders {
         walk = walk.max_depth(1);
@@ -89,6 +100,16 @@ pub fn scan_source(source: &Path, options: &ScanOptions) -> ScanResponse {
                 };
 
                 let path = e.path().to_path_buf();
+                // Directory data only, so no photo content is read here.
+                if let Ok(metadata) = e.metadata() {
+                    file_meta.insert(
+                        path.clone(),
+                        FileMeta {
+                            size: metadata.len(),
+                            modified: metadata.modified().ok(),
+                        },
+                    );
+                }
                 match asset_map.entry(key) {
                     Entry::Occupied(mut o) => {
                         if let Err(displaced) = o.get_mut().files.insert(kind, path) {
@@ -115,6 +136,7 @@ pub fn scan_source(source: &Path, options: &ScanOptions) -> ScanResponse {
         collisions,
         errors,
         ignored,
+        file_meta,
     }
 }
 

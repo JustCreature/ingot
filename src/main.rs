@@ -47,6 +47,7 @@ fn run_ui(folder: Option<std::path::PathBuf>) -> AppResult {
         ui::AppPaths {
             triage: cli::triage_path().ok_or("no app data folder on this system")?,
             history: cli::history_path().ok_or("no app data folder on this system")?,
+            imports: cli::imports_path().ok_or("no app data folder on this system")?,
             gdrive: cli::gdrive_credentials_path().ok_or("no app data folder on this system")?,
         },
         folder,

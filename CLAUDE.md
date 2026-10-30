@@ -21,7 +21,12 @@ Requirements from the project owner. None of these may be weakened without askin
 
 - **Never overwrite an existing file** on a target. Temp files and Ingot's own sidecars and state are the only exceptions.
 - **Google Drive: only ever inside `__ingot_backups`.** The folder name is a constant with no setting, parents are the `ContainedFolder` type, and no delete, move, rename or update call may exist in that code. Never commit an OAuth client: the repo is public.
-- **Culling never waits on copying.** No lock held across I/O; preview reads go first on the card; a backed-up copy must not hold a card slot.
+- **Culling never waits on copying, and the user must not notice the copy.** No lock held across I/O. Card priority is strict: on-demand reads, then thumbs and previews, then copy (`CardGate`). The copy reads in chunks and holds one slot at most.
+- **Pictures load strictly in display order, in stages:** every header thumbnail, then every preview, with on-demand full size or RAW above both. Focus pulls nearby photos forward; the rest stay in order.
+- **The import flow:** name and destination first; choosing the source starts copying everything and opens the grid; choosing happens in the grid while it runs; Finalize stops queued copies of unchosen files, removes copies already made of them, and finishes the rest.
+- **Removal is proof-gated.** The one code path that removes from a target is `sweep.rs`: only a file this import newly wrote (`VerifiedReplica::newly_written`), hash re-checked, never the source, and to the Trash. A file already there or changed since stays.
+- **Drive gets nothing before Finalize,** because Ingot never deletes from Drive.
+- **Nothing that reads the card or hashes runs on the UI thread.**
 - **Never touch the source card** when deleting or writing sidecars. Source deletion is out of scope for v1.
 - **Don't unmount or touch the user's device programmatically** for benchmarks. Ask them to run `sudo purge` or re-seat the card. (`--eject` runs only when the user asks.)
 
@@ -37,24 +42,26 @@ src/
     app.rs               everything drawn, and the background work it starts
     library.rs           culling logic and the key map; no drawing, so testable
     images.rs            JPEG decoding off the UI thread, LRU texture cache
+    imports.rs           the named import list in the left panel, persisted
 crates/ingot_core/       engine library, no UI dependencies
   src/
-    engine.rs            Engine: scan, ingest (previews), start_import, read_full_jpeg
+    engine.rs            Engine: scan, start_session, start_loading (ordered stages), read_full_jpeg
     scan.rs              walk and pair files into assets, classify extensions
     asset.rs             PhotoAsset, AssetKey, TriageState
     metadata.rs          bounded EXIF header read, embedded preview location
     preview.rs           turbojpeg decode, resize, encode
-    import.rs            ImportOptions, rename templates, plan_import, ImportHistory
+    import.rs            ImportOptions, rename templates, plan_import, planned_relative, ImportHistory
+    cluster.rs           Fingerprint (pHash + color grid), looks_alike, cluster_ranges
     triage.rs            TriageStore (append-only JSONL), XMP sidecars
-    sweep.rs             plan_sweep / execute_sweep: rejected copies to the Trash
+    sweep.rs             plan_sweep, plan_removal and their execute_*: copies to the Trash, proof-gated
     route.rs             Target configuration
     replicate/
       mod.rs             CopyEngine, ReplicationTarget, VerifiedReplica, claims
-      gate.rs            CardGate: shared card reads, previews first
+      gate.rs            CardGate: strict card priority, simulated slow card
       local.rs           LocalTarget: temp, verify, no-replace publish
       drive.rs           DriveTarget: pacer, resumable upload, ContainedFolder
       drive_auth.rs      desktop sign-in (PKCE), token refresh
-  examples/              bench_enrich, bench_preview, bench_ingest, bench_read_threads, bench_replicate
+  examples/              bench_enrich, bench_preview, bench_ingest, bench_read_threads, bench_replicate, bench_cluster, bench_culling
   testdata/test_exif_read/  real Canon CR2 and JPEG fixtures
 crates/ingot_develop/    RAW develop engine, darktable ports marked in each file
   src/
@@ -94,7 +101,7 @@ Build tools: `make setup-local` (jpeg-turbo, cmake, nasm). PRs need CI green: fm
 Mistakes actually made on this project, and what they taught. Add to this list when something goes wrong.
 
 **Data safety**
-- An early `LocalTarget` called `remove_file(dst)` when verification failed, which could delete a good file already there. Verify the temp file *before* giving it the real name, and have no code path that removes a destination.
+- An early `LocalTarget` called `remove_file(dst)` when verification failed, which could delete a good file already there. Verify the temp file *before* giving it the real name, and have no code path that removes a destination except the proof-gated one in `sweep.rs`.
 - Routing by `file_stem` gave a RAW and its JPEG the same destination, so one replaced the other. Keep the real file name and test a RAW+JPEG pair.
 - `rename` silently replaces an existing file, even after a check. Publish with `hard_link`, which fails atomically; exFAT has no hard links, so fall back to check-then-rename there.
 - Treating "destination exists" as a failure blocked re-runs and lost photos that merely shared a name. Compare by hash: same is done, different gets `-2`.
@@ -123,7 +130,27 @@ Mistakes actually made on this project, and what they taught. Add to this list w
 - A local pass doesn't prove CI passes: only trust the green run on the PR.
 - This environment can't capture the screen, so `render_views` draws each view to PNG instead. Headless runs don't prove how the app feels to use.
 
+**Loading pictures**
+- The user saw a grid of names and no pictures on a real card, while every test passed. The cause, reproduced with a simulated 20 MB/s card (300 photos, copying): headers were read in `HashMap` order, so most landed off-screen, and each run of 4 waited behind a whole 30 MB copy read because of a "copy gets a turn" rule added to help the copy. First thumbnail on the first screen took 11 s, the first screen wasn't full after 120 s, all headers took 272 s, and previews only began after that.
+- **A test on warm fixtures proves nothing about a card.** Three local files load instantly in any order. `CardGate::with_simulated_speed` and `bench_culling` exist for this; hard links make a large card of real RAW files that takes no disk space. Measure a user-visible moment, such as the first screen full.
+- `par_iter` and `HashMap` iteration have no useful order. When a person watches work arrive, order is a requirement: take work from an ordered queue, and put parallel results back in order before publishing.
+- Fairness to the copy was the wrong goal. Check which side the user feels. Priorities need a limit on how long the top waits behind the bottom, which is why the copy reads in chunks.
+- A stop test passed alone and failed in the full suite, because under load the simulated 4 s copy finished before the stop arrived. If a test races real time, give it margin that survives a loaded machine, and run the whole suite, not just the test.
+- Two copy reads on a serial card made a zoom wait two chunks. The measurement showed this (100 ms read + 2 x chunk); the code looked fine.
+
+**Import flow**
+- "Show where files go" took a very long time on a card, because `plan_import` statted every file and ran on the UI thread, and a card answers each stat slowly. The fix is at the root: the folder walk keeps sizes and dates, planning reads only those, and a test deletes the card before planning to prove it. Check every UI call for what it can reach on disk. The same audit found `find_cards` statting volumes every frame, a sweep hashing on the UI thread, and sidecars syncing on a keypress.
+- **Confirm the flow against the design and the user's mental model before building it.** The flow was built wrong twice: first opening photos and asking where to copy afterwards, then a separate import screen with ticks and a Start button. The user wanted destination, then source starts the copy, then choose in the grid, then Finalize. Both wrong versions passed every test. Walk through the steps in words and get a yes first, and read the design's flow, not just its options. A selection concept that the design already has (the Pick flag) beats a new one (ticks).
+- Counting "pending" as every file not copied blocked the next import after Finalize, because removed files never finish. Any count that gates an action must know the current phase.
+- Choosing a Drive-style target that can't undo must change the order of work, not just add a warning: uploads wait for Finalize.
+- A row's id built from its label clashed when two imports had the same default name. egui's debug marker for a clash is a glyph the harness panics on, which is how it surfaced.
+- The stores loop only settled finished writes when the next file arrived. Fine for a batch, but an idle queue would have held progress and secondaries forever. `select!` on both.
+- A photo's date, identity and destination must not change as information arrives. Headers come later than the listing, so they all use the file date, and EXIF is only displayed.
+- History written at the end of a run would lose everything if a long session crashed. Write it per file.
+
 **UI (egui)**
+- A long label in a central panel can widen it over a side panel, which then looks clipped. Truncate. Only the rendered PNG showed this.
+- The test harness fails on unlabelled inputs. Use `.labelled_by(label.id)`; screen readers need it too.
 - The default font has no `★`, `⌘`, `←` or `⚠`. In the real app these become boxes; the test harness panics on them, which is how it was found. Draw shapes or use words.
 - Windows need several frames before they appear in tests (a sizing pass comes first), and a window's title can have the same label as its button.
 - Don't assume a texture fits: 6240 px exceeds the 2048 limit seen in tests. `fit_texture` shrinks to the real maximum.
@@ -170,7 +197,11 @@ These are deliberate design decisions, not suggestions. Preserve them in any imp
 
 ## Status
 
-**Current state (2026-10-30):** the app works end to end: import, cull, develop, trash rejected copies. Phases 3 and 4 are built apart from what "Not built" lists. Waiting on the owner's first hands-on test. 138 tests, plus 2 ignored ones that need a GPU or touch the Trash.
+**Current state (2026-10-30):** the app works end to end: import, cull, cluster, develop, trash rejected copies. Phases 3, 4 and 5 are built apart from what "Not built" lists. The owner tested the first app build; the import-first flow and clusters are that feedback, and await a second test.
+
+**Import flow (`src/ui/app.rs`, `ImportQueue`, `Engine::start_session`, `sweep.rs`):** launchpad (name, destination, options, then source). Choosing the source lists the folder, then starts copy, header reads and previews together, and opens the grid. Selection is the Pick flag, so nothing is selected by default; Reject takes unread files off the live `ImportQueue`, as the design's "held". Finalize confirms with the removal list, closes the queue, then in the background flushes sidecars, trashes unchosen copies (`plan_removal`, `execute_removal`), uploads kept files to Drive (`upload_blocking`), and writes the history for what was kept. Nothing reaches the history until then, so re-importing after a crash finds identical files already there, which then won't be removed. Imports and their names persist in `imports.json`; past ones are listed but can't be opened yet. Measured on 10,000 files on the internal SSD: listing 77 ms, planning 23 ms (`bench_cluster`).
+
+**Clusters (`cluster.rs`, `View::Clusters`, key `L`):** fingerprints come from the header thumbnail, replaced by the grid thumbnail when it arrives, so clustering adds no card read. Groups break between neighbors in capture order where color or structure differ by more than sensitivity allows, or the gap exceeds 30 minutes. Limits only tighten as sensitivity rises, so groups only split. Measured (`bench_cluster`, i7-1068NG7): 1.2 ms per 512 px fingerprint, 0.34 ms to regroup 10,000 photos. The thresholds were tuned on synthetic bursts and 3 real photos only, so expect to retune them on a real shoot.
 
 **Built (`crates/ingot_core/src/replicate/`):** `ReplicationTarget` trait, `LocalTarget`, `VerifiedReplica`, `CopyEngine::replicate`, `ReplicationReport`; `examples/bench_replicate.rs`. Details in global-plan Phase 3 Step 2b. 
 
@@ -184,7 +215,9 @@ These are deliberate design decisions, not suggestions. Preserve them in any imp
 
 **Develop engine (`crates/ingot_develop`, 2026-10-30):** ports darktable's scene-referred order: raw prepare, white balance, clip highlights, RCD demosaic, exposure, color matrix to Rec.2020, sigmoid, sRGB. Decoding is rawler. `ingot develop <raw> <out.jpg>`. Measured on 24 MP Canon CR2, i7-1068NG7: decode 0.35 s, develop 1.5 s, 560 MB peak. Bayer only: X-Trans and linear DNG return an error. Only CR2 has been tried on real files. Remaining darktable work: highlight reconstruction, PPG border, X-Trans, denoise, sharpening, color balance, lens correction, and more.
 
-**App (`src/ui/`, 2026-10-30):** `cargo run --release` opens it. Grid, loupe with 1:1, develop with Lightroom-style sliders, import dialog, trash sweep, Lightroom hotkeys (`/` lists them). `INGOT_SHOTS=<dir> cargo test --bin ingot render_views -- --ignored` renders each view to PNG. Sidecars are written beside copies only, never on the source; decisions live in `triage.jsonl` in the app data folder.
+**App (`src/ui/`, 2026-10-30):** `cargo run --release` opens it. Grid, loupe with 1:1, develop with Lightroom-style sliders, import dialog, trash sweep, Lightroom hotkeys (`/` lists them). `INGOT_SHOTS=<dir> cargo test --bin ingot render_views -- --ignored` renders each view to PNG, the import screen and clusters included. Sidecars are written beside copies only, never on the source; decisions live in `triage.jsonl` in the app data folder.
+
+**Design differences left:** grid thumbnails fit rather than crop (deliberate, a culler needs the whole frame); no icons on buttons and rows, no icon rail or sidebar layouts, no toggle switches, no shimmer placeholders; system fonts rather than Hanken Grotesk and JetBrains Mono; past imports can't be opened; the source column has no device details; Develop is an added view.
 
 **Not built:** highlight reconstruction, denoise, lens correction, color balance, tone curve, HSL, crop, X-Trans and linear DNG develop, video import, saved presets, collections, catalog. Sidecars aren't read back on open. Untested for real: card imports, Google Drive, RAW formats other than CR2. Highlights, shadows, levels, saturation and vibrance are Ingot's own simple versions, not darktable ports.
 

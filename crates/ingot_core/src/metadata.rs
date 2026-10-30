@@ -13,7 +13,7 @@ use std::path::Path;
 
 use chrono::NaiveDateTime;
 
-use crate::asset::{AssetKey, ExifAssetData, PhotoAsset, PreviewStrip};
+use crate::asset::{AssetKey, CaptureInfo, ExifAssetData, PhotoAsset, PreviewStrip};
 
 pub(crate) type MetadataError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -24,7 +24,7 @@ pub(crate) type MetadataError = Box<dyn std::error::Error + Send + Sync>;
 /// 128 KiB gives headroom for other bodies without dragging the big preview into
 /// the metadata read. JPEG EXIF (APP1) sits at the very front, so the same budget
 /// covers it. ~273x less I/O than slurping a 35 MB CR2.
-const EXIF_HEADER_PREFIX_LEN: u64 = 128 * 1024;
+pub(crate) const EXIF_HEADER_PREFIX_LEN: u64 = 128 * 1024;
 
 /// Locate (don't read) the full-size embedded preview in a TIFF-like container
 /// (CR2): a single-strip JPEG referenced by `StripOffsets`/`StripByteCounts` in
@@ -80,6 +80,40 @@ pub fn read_embedded_preview(path: &Path, strip: PreviewStrip) -> Result<Vec<u8>
     Ok(buf)
 }
 
+fn get_capture_info(exif: &exif::Exif) -> CaptureInfo {
+    let text = |tag: exif::Tag| {
+        exif.get_field(tag, exif::In::PRIMARY).map(|field| {
+            field
+                .display_value()
+                .with_unit(exif)
+                .to_string()
+                .trim_matches('"')
+                .trim()
+                .to_string()
+        })
+    };
+    let pixels = match (
+        text(exif::Tag::PixelXDimension),
+        text(exif::Tag::PixelYDimension),
+    ) {
+        (Some(x), Some(y)) => Some(format!(
+            "{} x {}",
+            x.trim_end_matches(" pixels"),
+            y.trim_end_matches(" pixels")
+        )),
+        _ => None,
+    };
+    CaptureInfo {
+        camera: text(exif::Tag::Model),
+        lens: text(exif::Tag::LensModel),
+        focal: text(exif::Tag::FocalLength),
+        aperture: text(exif::Tag::FNumber),
+        shutter: text(exif::Tag::ExposureTime),
+        iso: text(exif::Tag::PhotographicSensitivity),
+        pixels,
+    }
+}
+
 fn get_thumbnail(exif: &exif::Exif) -> Option<Vec<u8>> {
     let thumb_offset_field =
         exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)?;
@@ -133,6 +167,11 @@ pub(crate) fn read_exif_header(asset: &PhotoAsset) -> Option<exif::Exif> {
     read_exif_header_from_path(path, EXIF_HEADER_PREFIX_LEN)
 }
 
+/// The header read for one file, with no lock or asset needed.
+pub(crate) fn read_exif_data(path: &Path) -> Option<ExifAssetData> {
+    read_exif_header_from_path(path, EXIF_HEADER_PREFIX_LEN).map(|exif| extract_exif_data(&exif))
+}
+
 /// Read at most `max_bytes` from the head of `path` and parse it as an EXIF
 /// container. `take(max_bytes).read_to_end` caps the read *and* tolerates files
 /// shorter than the budget (no `UnexpectedEof`); `with_capacity` makes it a
@@ -159,6 +198,7 @@ pub(crate) fn extract_exif_data(exif: &exif::Exif) -> ExifAssetData {
             .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
             .and_then(|field| field.value.get_uint(0))
             .and_then(|value| u16::try_from(value).ok()),
+        capture: get_capture_info(exif),
         thumbnail: get_thumbnail(exif),
         embedded_preview_file_location: get_embedded_preview_location(exif),
     }
@@ -263,6 +303,16 @@ mod tests {
             strip.offset + strip.len as u64 > EXIF_HEADER_PREFIX_LEN,
             "preview data must lie beyond the header read"
         );
+    }
+
+    #[test]
+    fn capture_details_come_from_the_header() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/test_exif_read/IMG_1800.JPG");
+        let data = read_exif_data(&path).unwrap();
+        assert!(data.capture.camera.is_some(), "{:?}", data.capture);
+        assert!(data.capture.shutter.is_some(), "{:?}", data.capture);
+        assert!(!data.capture.camera.unwrap().contains('"'));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 mod app;
 mod images;
+mod imports;
 mod library;
 
 use std::path::PathBuf;
@@ -13,6 +14,7 @@ pub use app::IngotApp;
 pub struct AppPaths {
     pub triage: PathBuf,
     pub history: PathBuf,
+    pub imports: PathBuf,
     pub gdrive: PathBuf,
 }
 

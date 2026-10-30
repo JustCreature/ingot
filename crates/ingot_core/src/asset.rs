@@ -105,11 +105,24 @@ pub struct ImageData {
 /// to it, so the metadata pass stays header-only. The bytes feed the CPU stage
 /// via a separate seek-read. Add a new property by adding a field here plus a
 /// line in `metadata::extract_exif_data`.
+/// Shooting details for the inspector. Text as the camera recorded it.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureInfo {
+    pub camera: Option<String>,
+    pub lens: Option<String>,
+    pub focal: Option<String>,
+    pub aperture: Option<String>,
+    pub shutter: Option<String>,
+    pub iso: Option<String>,
+    pub pixels: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExifAssetData {
     pub captured_at: Option<NaiveDateTime>,
     /// The EXIF orientation value, 1 to 8. Embedded previews aren't rotated.
     pub orientation: Option<u16>,
+    pub capture: CaptureInfo,
     pub thumbnail: Option<Vec<u8>>,
     pub embedded_preview_file_location: Option<PreviewStrip>,
 }
@@ -132,6 +145,7 @@ impl PhotoAsset {
             exif_data: ExifAssetData {
                 captured_at: None,
                 orientation: None,
+                capture: CaptureInfo::default(),
                 thumbnail: None,
                 embedded_preview_file_location: None,
             },
