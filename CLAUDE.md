@@ -13,7 +13,132 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-**Ingot** — a high-performance RAW+JPEG photo ingestion and triage engine, written in **Rust**. It competes with Photo Mechanic / FastRawViewer: ingest a camera card fast, let the photographer rate and cull *immediately* while files replicate to multiple storage targets in the background.
+**Ingot** — a high-performance RAW+JPEG photo ingestion, triage and develop app, written in **Rust**. It competes with Photo Mechanic / FastRawViewer / Lightroom: ingest a camera card fast, let the photographer rate and cull *immediately* while files replicate to multiple storage targets in the background.
+
+## Hard rules
+
+Requirements from the project owner. None of these may be weakened without asking.
+
+- **Never overwrite an existing file** on a target. Temp files and Ingot's own sidecars and state are the only exceptions.
+- **Google Drive: only ever inside `__ingot_backups`.** The folder name is a constant with no setting, parents are the `ContainedFolder` type, and no delete, move, rename or update call may exist in that code. Never commit an OAuth client: the repo is public.
+- **Culling never waits on copying.** No lock held across I/O; preview reads go first on the card; a backed-up copy must not hold a card slot.
+- **Never touch the source card** when deleting or writing sidecars. Source deletion is out of scope for v1.
+- **Don't unmount or touch the user's device programmatically** for benchmarks. Ask them to run `sudo purge` or re-seat the card. (`--eject` runs only when the user asks.)
+
+## Repo structure
+
+```
+Cargo.toml               workspace root and the `ingot` binary package
+src/
+  main.rs                entry point, CLI commands
+  cli.rs                 argument parsing and help text
+  ui/
+    mod.rs               window setup, AppPaths
+    app.rs               everything drawn, and the background work it starts
+    library.rs           culling logic and the key map; no drawing, so testable
+    images.rs            JPEG decoding off the UI thread, LRU texture cache
+crates/ingot_core/       engine library, no UI dependencies
+  src/
+    engine.rs            Engine: scan, ingest (previews), start_import, read_full_jpeg
+    scan.rs              walk and pair files into assets, classify extensions
+    asset.rs             PhotoAsset, AssetKey, TriageState
+    metadata.rs          bounded EXIF header read, embedded preview location
+    preview.rs           turbojpeg decode, resize, encode
+    import.rs            ImportOptions, rename templates, plan_import, ImportHistory
+    triage.rs            TriageStore (append-only JSONL), XMP sidecars
+    sweep.rs             plan_sweep / execute_sweep: rejected copies to the Trash
+    route.rs             Target configuration
+    replicate/
+      mod.rs             CopyEngine, ReplicationTarget, VerifiedReplica, claims
+      gate.rs            CardGate: shared card reads, previews first
+      local.rs           LocalTarget: temp, verify, no-replace publish
+      drive.rs           DriveTarget: pacer, resumable upload, ContainedFolder
+      drive_auth.rs      desktop sign-in (PKCE), token refresh
+  examples/              bench_enrich, bench_preview, bench_ingest, bench_read_threads, bench_replicate
+  testdata/test_exif_read/  real Canon CR2 and JPEG fixtures
+crates/ingot_develop/    RAW develop engine, darktable ports marked in each file
+  src/
+    sensor.rs            rawler decode, raw prepare (black, white, crop)
+    demosaic.rs          RCD, port of darktable's rcd.c
+    sigmoid.rs           tone curve, port of darktable's sigmoid.c
+    sharpen.rs           unsharp mask, port of darktable's sharpen.c
+    color.rs             color matrices, sRGB
+    pipeline.rs          DevelopParams, develop, PreviewBase (fast slider path), orientation
+  examples/develop.rs    timing harness
+docs/
+  planning/global-plan.md  the architectural plan; read it first
+  guides/google-drive.md   Drive setup
+  design/                  UI design; use html_Ingot_v2.html, ingot_v2/ holds the source
+  sessions/, lessons/      history from earlier phases
+.github/workflows/ci.yml   fmt, clippy, build and test on Apple Silicon and Intel
+```
+
+## Commands
+
+```sh
+cargo run --release                     # the app
+cargo run --release -- import --help    # (or `help`) the command line
+cargo test --workspace                  # the develop tests take about a minute in debug
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+INGOT_SHOTS=<dir> cargo test --bin ingot render_views -- --ignored   # render each view to PNG
+cargo test -p ingot_core really_moves -- --ignored                   # adds one file to the real Trash
+cargo run --release -p ingot_core --example bench_replicate -- <source> <target_root> [secondary_root]
+cargo run --release -p ingot_develop --example develop -- <raw> <new.ppm>
+```
+
+Build tools: `make setup-local` (jpeg-turbo, cmake, nasm). PRs need CI green: fmt, clippy and tests on both Mac architectures.
+
+## Learnings
+
+Mistakes actually made on this project, and what they taught. Add to this list when something goes wrong.
+
+**Data safety**
+- An early `LocalTarget` called `remove_file(dst)` when verification failed, which could delete a good file already there. Verify the temp file *before* giving it the real name, and have no code path that removes a destination.
+- Routing by `file_stem` gave a RAW and its JPEG the same destination, so one replaced the other. Keep the real file name and test a RAW+JPEG pair.
+- `rename` silently replaces an existing file, even after a check. Publish with `hard_link`, which fails atomically; exFAT has no hard links, so fall back to check-then-rename there.
+- Treating "destination exists" as a failure blocked re-runs and lost photos that merely shared a name. Compare by hash: same is done, different gets `-2`.
+- A file the scanner displaced in a collision was silently never copied. When a list decides what gets backed up, check what falls off it, and report skipped files.
+- Importing a folder into itself makes a "copy" that *is* the source. The sweep compares canonical paths for that reason.
+- Copying loads each whole file into RAM, which is fine for photos and dangerous for videos. Don't add videos before streaming copy exists.
+
+**Concurrency**
+- Holding a card read permit while blocked on a full channel starves preview reads, which blocks culling. Hold a permit only for the read. A separate slot provides the backpressure.
+- Buffer slots released on channel send were counted on top of the channel's own capacity, so more files sat in RAM than documented. A test that counts reads against the stated bound caught it. Test limits, don't just state them.
+- Spawning a store task per message drains the channel into tasks queued on a semaphore, each holding a file. That removes both backpressure and the RAM bound. Cap in-flight tasks before spawning.
+- `Engine::scan` once held the write lock through 14 s of card I/O. Build outside the lock, then swap.
+- Saving and syncing a sidecar on every slider tick would stall a drag. Render on every tick and save on release.
+- Two source files can route to one name. Claims must *wait*, not skip to the next name, or a re-run writes duplicates of itself.
+- Hash on one thread: a parallel hash takes CPU from preview generation and gains nothing against a slow disk.
+
+**Measuring and verifying**
+- A benchmark sweep was invalid because zsh's `set -- $cfg` doesn't split words, so every run used the same settings. Print the parameters a run actually used, and distrust identical results.
+- Synthetic numbers on an internal SSD say nothing about a card. Always state what was measured on.
+- Green tests are not enough for image code. All 26 develop tests passed while photos came out sideways, because `rawler` reports `Normal` orientation for CR2 and the real value is only in EXIF. Look at real output, and compare against the camera's own JPEG of the same shot (there is a test for this).
+- `rtk` filters test output, and can hide failures and counts. Use `rtk proxy cargo test` when the result matters.
+- `tail` on `cargo add` hid a failed add. Check the manifest afterwards. Feature names also change between versions (`rustls-tls` became `rustls`, and `query` and `form` became features in reqwest 0.13).
+- Python `str.replace` edits silently do nothing once `cargo fmt` has reflowed the code. `assert old in s` first.
+- A fake `HOME` breaks rustup. Build first, then set `HOME` only for the built binary.
+- Unpinned `stable` in CI got a newer clippy than local, and a lint from inside the `async_trait` macro failed the first PR run. `rust-toolchain.toml` pins one version for both; bump it in its own PR.
+- A local pass doesn't prove CI passes: only trust the green run on the PR.
+- This environment can't capture the screen, so `render_views` draws each view to PNG instead. Headless runs don't prove how the app feels to use.
+
+**UI (egui)**
+- The default font has no `★`, `⌘`, `←` or `⚠`. In the real app these become boxes; the test harness panics on them, which is how it was found. Draw shapes or use words.
+- Windows need several frames before they appear in tests (a sizing pass comes first), and a window's title can have the same label as its button.
+- Don't assume a texture fits: 6240 px exceeds the 2048 limit seen in tests. `fit_texture` shrinks to the real maximum.
+- Keep the context from the current frame. A context stored at startup was not the one the harness ran.
+- Portrait previews need the EXIF orientation applied: embedded JPEGs aren't rotated, and re-encoding drops the tag.
+
+**Google Drive**
+- Drive allows duplicate names, so two uploads can create two folders with one name. Resolve folders under a lock and cache the ids.
+- Pacer state must start a full burst in the past, or the first calls of a run are throttled for nothing (a test caught this).
+- The access token goes to the upload address, so check that its host is the expected one.
+- The mock server only behaves the way we assumed Google does. Only a real account proves it.
+
+**Licensing and sources**
+- Check the licence and read the README before planning around a project. `lightcraft` was described as a decompile, and its own docs say clean-room MIT/Apache. darktable's GPL-3 forced a real decision: a Rust rewrite is still a derivative, so Ingot became GPL-3.
+- Port with attribution in each file and in `NOTICE`, and say which parts are ports and which are Ingot's own.
 
 ## Licence
 
@@ -25,12 +150,6 @@ GPL-3.0-or-later (MIT until commit 6bc36c7). `crates/ingot_develop` ports darkta
 - **Measurement over intuition.** Performance questions are settled with benchmarks (`crates/ingot_core/examples/`), not guesses. Optimal I/O concurrency is a device property.
 - Phase status, artifacts, and measured numbers are tracked in the `## Status` section of this file.
 
-## Where things live
-
-- `docs/planning/global-plan.md` — **the architectural plan (v2). Read this first** for the full phase breakdown, data structures, crate choices, and rationale. (Note: the empty `global-plan.md` at repo root is a stray file; the real plan is under `docs/planning/`.)
-- `docs/design/` — the UI design. **Rely on the standalone `docs/design/html_Ingot_v2.html`.** The unpacked `docs/design/ingot_v2/` (`.jsx`, `styles.css`, `data.js`, images) is the source bundle — consult it only on the first pass or when you need a specific detail.
-- `docs/sessions/phase-N/` and `docs/lessons/phase-N/` — historical session logs and reports from earlier phases.
-
 ## Architecture invariants (from the plan)
 
 These are deliberate design decisions, not suggestions. Preserve them in any implementation:
@@ -41,8 +160,8 @@ These are deliberate design decisions, not suggestions. Preserve them in any imp
 - **Read-once, fan-out copy.** Read each source file once and fan out to all targets; never re-read per target. Write to temp, then atomic-rename.
 - **Two semaphore tiers.** Cap source-card *reads* (1–2) separately from per-target *writes*. Concurrency only helps across *distinct physical devices* — saturating one card/disk is a device property, not a thread-count property.
 - **Streaming UI.** Each photo streams to the grid the instant it is processed; the UI never waits for a batch. At scale this needs a virtualized grid + LRU texture cache (the 24 GB RGBA problem) and a 1:1 loupe view for focus checking.
-- **Ratings → XMP for both files, never EXIF, never pixel rewrites.** There is no standard EXIF rating tag; write `xmp:Rating` sidecars (`Rejected → -1`, else `0..5`) for both the CR2 and the JPEG. Keep stars (0–5) and accept/reject as separate internal concepts.
-- **Crate roles are split deliberately:** `kamadak-exif` *reads* dates only (it cannot write or extract full previews); a writer crate (`little_exif`/`img-parts` or `rexiv2`) handles XMP; RAW-only previews would need `rawler`/`rawloader`/`libraw`. Prefer `rusqlite` over `sled`; store preview blobs as files on disk with paths in the DB. Size Rayon pools with `std::thread::available_parallelism()`.
+- **Ratings → XMP sidecars, never EXIF, never pixel rewrites.** There is no standard EXIF rating tag; write `xmp:Rating` (`Rejected → -1`, else `0..5`) in one `IMG_1.xmp` shared by a RAW and JPEG of the same stem, beside the copies. Keep stars (0–5) and accept/reject as separate internal concepts.
+- **Crate roles are split deliberately:** `kamadak-exif` reads header metadata only; `rawler` decodes sensor data and finds previews the CR2 fast path can't; turbojpeg handles JPEG. Prefer `rusqlite` over `sled` if a catalog is added; store preview blobs as files on disk with paths in the DB. Size Rayon pools with `std::thread::available_parallelism()`.
 
 ## Two scoping decisions — RESOLVED 2026-06-08
 
@@ -51,7 +170,7 @@ These are deliberate design decisions, not suggestions. Preserve them in any imp
 
 ## Status
 
-**Current phase:** Phase 3 — Asynchronous I/O Engine. Copying to local folders and Google Drive works through `ingot import` (2026-10-30); not yet measured on a real card.
+**Current state (2026-10-30):** the app works end to end: import, cull, develop, trash rejected copies. Phases 3 and 4 are built apart from what "Not built" lists. Waiting on the owner's first hands-on test. 138 tests, plus 2 ignored ones that need a GPU or touch the Trash.
 
 **Built (`crates/ingot_core/src/replicate/`):** `ReplicationTarget` trait, `LocalTarget`, `VerifiedReplica`, `CopyEngine::replicate`, `ReplicationReport`; `examples/bench_replicate.rs`. Details in global-plan Phase 3 Step 2b. 
 
@@ -68,8 +187,6 @@ These are deliberate design decisions, not suggestions. Preserve them in any imp
 **App (`src/ui/`, 2026-10-30):** `cargo run --release` opens it. Grid, loupe with 1:1, develop with Lightroom-style sliders, import dialog, trash sweep, Lightroom hotkeys (`/` lists them). `INGOT_SHOTS=<dir> cargo test --bin ingot render_views -- --ignored` renders each view to PNG. Sidecars are written beside copies only, never on the source; decisions live in `triage.jsonl` in the app data folder.
 
 **Not built:** highlight reconstruction, denoise, lens correction, color balance, tone curve, HSL, crop, X-Trans and linear DNG develop, video import, saved presets, collections, catalog. Sidecars aren't read back on open. Untested for real: card imports, Google Drive, RAW formats other than CR2. Highlights, shadows, levels, saturation and vibrance are Ingot's own simple versions, not darktable ports.
-
-**Project layout:** Cargo workspace. `/Cargo.toml` = workspace root **and** the `ingot` binary package; `/src/main.rs` = the app (constructs an `Engine`, drains `ingest()`). `crates/ingot_core/` = the engine library (UI-dep-free). Public API: `Engine`/`EngineConfig`/`IngestEvent` + `scan_source_dir`/`enrich_assets`/`get_embedded_preview_location`/`read_embedded_preview`/`plan_import`/`CopyEngine` + model types (`PreviewStrip` etc.). Run app: `cargo run -- import <source> --dest <folder>`; tests: `cargo test --workspace`; benches: `cargo run --release -p ingot_core --example bench_{enrich,preview,ingest,read_threads}` (ingest/read_threads default to `/Volumes/EOS_DIGITAL/DCIM`).
 
 **Phase-2 step-4 measured numbers (879-asset Canon card, 8 cores):** scan+enrich cold 14.4 s (61 fps) / warm 0.07 s; ingest cold **154 s (6 fps)** / warm **~26 s (33 fps)**; read-only cold **2≈8 threads ≈ 158 s ≈ 20 MB/s**. **Read-bound on card** (cold≫warm 6×, cold-ingest≈cold-read, 2≈8). Card ceiling is device-fixed; concurrency can't beat it → cap `card_read_permits` 1–2 (frees CPU threads, zero throughput cost). Only cold lever = fewer bytes (embedded-for-pairs ✓). On SSD/NVMe → flips CPU-bound (~33 fps). Streaming = time-to-interaction ~14 s, not 154 s.
 

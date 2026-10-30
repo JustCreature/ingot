@@ -223,9 +223,9 @@ The naive `spawn one task per target` fan-out (Step 2) has a flaw: it ties the c
 **Built (2026-10-30) in `replicate/`.** Decisions made during implementation:
 
 - **Verify before publish.** The temp file is hashed *before* the rename, so a destination path only ever holds verified bytes and the code never has to remove a destination file.
-- **Never overwrite.** An existing destination is a recorded failure. Each `LocalTarget` also claims a destination while writing it, so two source files routed to the same path can't race. This only protects against other writers in the same process.
+- **Never overwrite.** A file already there with the same hash counts as done; a different one is kept and the new file gets `-2`. Each `LocalTarget` claims a destination while working on it, and publishes with a hard link, which fails atomically on an existing name, even against other processes (exFAT falls back to check-then-rename).
 - **In-flight stores are capped at `max_concurrent_writes()`.** Spawning a store per message would drain the channel into tasks queued on the write semaphore, each holding a file buffer, which removes both the backpressure and the RAM bound.
-- **Read permits are held until the bytes are in the channel**, so a full channel stops card reads.
+- **A read slot, not a card permit, is held until the bytes are in the channel**, so a full channel stops card reads while the card stays free for previews (`CardGate`).
 
 ### Step 4 — Import options (Lightroom parity)
 

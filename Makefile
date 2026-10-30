@@ -1,6 +1,12 @@
 setup-local:
 	brew install jpeg-turbo cmake nasm
 
+ci:
+	cargo fmt --all --check
+	cargo clippy --workspace --all-targets --locked -- -D warnings
+	cargo build --release --locked
+	cargo test --workspace --locked
+
 lint-check:
 	cargo clippy --workspace --all-targets -- -D warnings
 

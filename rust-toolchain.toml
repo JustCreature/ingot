@@ -1,0 +1,6 @@
+# The same compiler and clippy locally and in CI, so a new Rust release can't fail a
+# PR by itself. Bump this on purpose, in its own PR.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
