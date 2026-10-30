@@ -8,10 +8,13 @@ mod color;
 mod demosaic;
 mod pipeline;
 mod sensor;
+mod sharpen;
 mod sigmoid;
 
 pub use demosaic::{BayerPattern, demosaic_rcd};
-pub use pipeline::{DevelopParams, DevelopedImage, WhiteBalance, develop, develop_file};
+pub use pipeline::{
+    DevelopParams, DevelopedImage, PreviewBase, WhiteBalance, develop, develop_file,
+};
 pub use sensor::{SensorImage, load_sensor};
 pub use sigmoid::Sigmoid;
 

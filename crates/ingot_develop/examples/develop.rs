@@ -4,7 +4,7 @@
 
 use std::{fs::File, io::Write, path::Path, time::Instant};
 
-use ingot_develop::{DevelopParams, develop, load_sensor};
+use ingot_develop::{DevelopParams, PreviewBase, develop, load_sensor};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -21,6 +21,16 @@ fn main() {
         "wb {:?}, orientation {:?}",
         sensor.camera_wb, sensor.orientation
     );
+
+    let t = Instant::now();
+    let base = PreviewBase::new(&sensor, 1600).expect("preview failed");
+    let built = t.elapsed();
+    let t = Instant::now();
+    for _ in 0..10 {
+        base.render(&DevelopParams::default())
+            .expect("render failed");
+    }
+    println!("preview base {built:.2?}, render {:.2?}", t.elapsed() / 10);
 
     let t = Instant::now();
     let image = develop(sensor, &DevelopParams::default()).expect("develop failed");
