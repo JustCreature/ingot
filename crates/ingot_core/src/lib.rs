@@ -26,8 +26,9 @@ pub use import::{
 };
 pub use metadata::{enrich_assets, get_embedded_preview_location, read_embedded_preview};
 pub use replicate::{
-    CardGate, CardPermit, CopyEngine, FileInfo, LocalTarget, ReplicaLocation, ReplicationEvent,
-    ReplicationFailure, ReplicationReport, ReplicationTarget, TargetId, VerifiedReplica,
+    CardGate, CardPermit, CopyEngine, DRIVE_ROOT_FOLDER, DriveConfig, DriveCredentials,
+    DriveTarget, FileInfo, LocalTarget, ReplicaLocation, ReplicationEvent, ReplicationFailure,
+    ReplicationReport, ReplicationTarget, TargetId, VerifiedReplica, drive_login,
 };
 pub use route::{Target, TargetKind};
 pub use scan::{Collision, ScanOptions, ScanResponse, scan_source, scan_source_dir};

@@ -4,9 +4,13 @@
 //! primary target through a bounded channel, so the number of file buffers in
 //! RAM stays bounded no matter how slow the primary is.
 
+mod drive;
+mod drive_auth;
 mod gate;
 mod local;
 
+pub use drive::{DRIVE_ROOT_FOLDER, DriveConfig, DriveTarget};
+pub use drive_auth::{DriveCredentials, drive_login};
 pub use gate::{CardGate, CardPermit};
 pub use local::LocalTarget;
 

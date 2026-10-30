@@ -227,6 +227,30 @@ The naive `spawn one task per target` fan-out (Step 2) has a flaw: it ties the c
 - **In-flight stores are capped at `max_concurrent_writes()`.** Spawning a store per message would drain the channel into tasks queued on the write semaphore, each holding a file buffer, which removes both the backpressure and the RAM bound.
 - **Read permits are held until the bytes are in the channel**, so a full channel stops card reads.
 
+### Step 4 — Import options (Lightroom parity)
+
+Status of each Lightroom Classic import option, from Adobe's help and from memory of the dialog (Adobe's options page refused automated access, so re-check against the app).
+
+| Lightroom option | Ingot |
+|---|---|
+| Copy | Built |
+| Add (leave in place) | Built as `--add`: previews only, no catalog yet |
+| Move | Not built: it deletes from the source, and source deletion is out of scope for v1 |
+| Copy as DNG | Not built: needs RAW writing |
+| Include subfolders | Built |
+| Eject after import | Built |
+| Into subfolder | Built |
+| Organize: into one folder, by original folders, by date | Built; into one folder is the default |
+| Date formats | Built: any chrono format, not just a fixed list |
+| Rename templates, custom text, start number, extension case | Built |
+| Filter: new photos / select individual photos | Built: duplicate history, `Selection.paths` (CLI has kinds and date range; hand-picking waits for the UI) |
+| Don't import suspected duplicates | Built: name + capture time + size |
+| Make a second copy | Built, repeatable, same layout as the destination |
+| Build previews: minimal, embedded, standard | One mode, or `--no-previews`; tiers wait for the UI |
+| Build previews: 1:1, smart previews | Not built: needs RAW decoding |
+| Add to collection, develop settings, metadata, keywords | Not built: needs a catalog and XMP (Phase 4) |
+| Saved import presets | Not built: wait for the UI |
+
 ### Step 3 — Safe deletion sweep
 
 Deletion is the part where a path-construction bug erases a wedding, so make safety a **type-level invariant**: the deletion function cannot be *called* without proof of a verified copy.

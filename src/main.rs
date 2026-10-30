@@ -10,10 +10,10 @@ use std::{
     time::Instant,
 };
 
-use cli::{ImportArgs, Usage};
+use cli::{Command as CliCommand, ImportArgs, Usage};
 use ingot_core::{
-    Engine, EngineConfig, ImportHistory, LocalTarget, ReplicationEvent, ReplicationTarget,
-    ScanOptions, Target, TargetId, TargetKind, plan_import,
+    DriveConfig, DriveCredentials, DriveTarget, Engine, EngineConfig, ImportHistory, LocalTarget,
+    ReplicationEvent, ReplicationTarget, ScanOptions, Target, TargetId, TargetKind, plan_import,
 };
 
 fn main() -> ExitCode {
@@ -25,20 +25,46 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match parsed {
-        None => {
+    let outcome = match parsed {
+        CliCommand::Help => {
             println!("{}", cli::HELP);
-            ExitCode::SUCCESS
+            return ExitCode::SUCCESS;
         }
-        Some(import) => match run_import(import) {
-            Ok(code) => code,
-            Err(err) => {
-                eprintln!("error: {err}");
-                ExitCode::FAILURE
-            }
-        },
-    }
+        CliCommand::Import(import) => run_import(*import),
+        CliCommand::GdriveLogin => run_gdrive_login(),
+    };
+    outcome.unwrap_or_else(|err| {
+        eprintln!("error: {err}");
+        ExitCode::FAILURE
+    })
 }
+
+type AppResult = Result<ExitCode, Box<dyn std::error::Error + Send + Sync>>;
+
+fn run_gdrive_login() -> AppResult {
+    let client_id = std::env::var("INGOT_GDRIVE_CLIENT_ID").map_err(|_| {
+        "set INGOT_GDRIVE_CLIENT_ID to your Google OAuth client id (see docs/guides/google-drive.md)"
+    })?;
+    let client_secret = std::env::var("INGOT_GDRIVE_CLIENT_SECRET").ok();
+    let path = cli::gdrive_credentials_path().ok_or("no app data folder on this system")?;
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(ingot_core::drive_login(
+            client_id,
+            client_secret,
+            path.clone(),
+            |url| {
+                println!("Opening your browser to sign in. If it doesn't open, visit:\n{url}");
+                let _ = Command::new("open").arg(url).status();
+            },
+        ))?;
+    println!("Signed in. Saved to {}", path.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+const GDRIVE_TARGET_ID: u32 = 100;
 
 fn local_target(id: u32, root: &Path) -> Arc<dyn ReplicationTarget> {
     Arc::new(LocalTarget::new(
@@ -51,7 +77,7 @@ fn local_target(id: u32, root: &Path) -> Arc<dyn ReplicationTarget> {
     ))
 }
 
-fn run_import(args: ImportArgs) -> Result<ExitCode, Box<dyn std::error::Error + Send + Sync>> {
+fn run_import(args: ImportArgs) -> AppResult {
     let mut engine = Engine::new(EngineConfig::default());
     let scan_started = Instant::now();
     engine.scan_with(
@@ -122,19 +148,27 @@ fn run_import(args: ImportArgs) -> Result<ExitCode, Box<dyn std::error::Error + 
 
     let total_files = plan.files.len();
     let total_bytes: u64 = plan.files.iter().map(|file| file.size).sum();
-    let targets = args.second_copies.len() + 1;
+    let targets = args.second_copies.len() + 1 + usize::from(args.gdrive);
     println!(
         "copying {total_files} files, {:.1} GB, to {targets} target(s)",
         total_bytes as f64 / 1e9
     );
 
     let primary = local_target(1, destination);
-    let secondaries = args
+    let mut secondaries: Vec<Arc<dyn ReplicationTarget>> = args
         .second_copies
         .iter()
         .enumerate()
         .map(|(index, root)| local_target(index as u32 + 2, root))
         .collect();
+    if args.gdrive {
+        let path = cli::gdrive_credentials_path().ok_or("no app data folder on this system")?;
+        secondaries.push(Arc::new(DriveTarget::new(
+            TargetId(GDRIVE_TARGET_ID),
+            DriveConfig::default(),
+            DriveCredentials::load(&path)?,
+        )?));
+    }
 
     let started = Instant::now();
     let import = engine.start_import(plan, primary, secondaries, history);
