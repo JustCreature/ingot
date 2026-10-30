@@ -195,6 +195,26 @@ mod tests {
         assert!(plan.to_trash.is_empty());
     }
 
+    /// Puts a small file in the real Trash, so it isn't part of the normal run:
+    /// `cargo test -p ingot_core really_moves -- --ignored`
+    #[tokio::test]
+    #[ignore = "adds a file to the user's Trash"]
+    async fn really_moves_a_rejected_copy_to_the_trash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (card, dest) = (tmp.path().join("card"), tmp.path().join("dest"));
+        write_card(&card);
+        let (engine, report) = imported(&card, &dest).await;
+        reject(&engine, "img_2");
+
+        let plan = plan_sweep(&engine.scan_response, &report.verified).unwrap();
+        let outcome = execute_sweep(&plan);
+
+        assert_eq!(outcome.trashed.len(), 1, "{:?}", outcome.failures);
+        assert!(!dest.join("IMG_2.JPG").exists());
+        assert!(dest.join("IMG_1.JPG").exists());
+        assert!(card.join("IMG_2.JPG").exists());
+    }
+
     #[tokio::test]
     async fn a_copy_changed_after_import_is_kept() {
         let tmp = tempfile::tempdir().unwrap();

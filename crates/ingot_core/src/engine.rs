@@ -140,6 +140,34 @@ impl Engine {
         Arc::clone(&self.scan_response)
     }
 
+    /// Reads the largest JPEG of an asset for 1:1 viewing, ahead of copy reads on the
+    /// card. Blocks, so call it off the UI thread.
+    pub fn read_full_jpeg(&self, key: &AssetKey) -> Result<Vec<u8>, ImageProcessingError> {
+        let (kind, path, strip) = {
+            let scan = self
+                .scan_response
+                .read()
+                .map_err(|err| format!("scan store lock poisoned: {err}"))?;
+            let asset = scan
+                .assets
+                .get(key)
+                .ok_or("photo is no longer in the library")?;
+            let (kind, path) = asset.files.get_prioritized();
+            (
+                kind,
+                path.to_path_buf(),
+                asset.exif_data.embedded_preview_file_location,
+            )
+        };
+        let _permit = self.card.acquire_priority();
+        read_source_bytes(kind, &path, strip)
+    }
+
+    /// A card slot for reading a whole RAW for develop, ahead of copy reads.
+    pub fn card_permit(&self) -> crate::CardPermit {
+        self.card.acquire_priority()
+    }
+
     /// Starts copying `plan` in the background and returns at once. Holds no lock
     /// on the store, and previews go first on the card, so triage is never waiting
     /// on the copy. `primary` paces the card and should be the fastest local disk.
