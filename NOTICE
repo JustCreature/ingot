@@ -1,0 +1,18 @@
+Ingot
+Copyright (C) 2026 Nikita Zavartsev and contributors.
+
+Ingot is free software: you can redistribute it and/or modify it under the terms
+of the GNU General Public License as published by the Free Software Foundation,
+either version 3 of the License, or (at your option) any later version. See LICENSE.
+
+Earlier versions of Ingot, up to commit 6bc36c7, were released under the MIT License.
+
+Third-party material
+
+crates/ingot_develop ports image processing code from darktable
+(https://github.com/darktable-org/darktable), Copyright the darktable developers,
+licensed under GPL-3.0-or-later. Each ported file says what it came from and that
+it was modified.
+
+Ingot depends on rawler (https://github.com/dnglab/dnglab), LGPL-2.1, for decoding
+camera RAW files.
