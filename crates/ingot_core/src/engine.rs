@@ -5,18 +5,19 @@
 //! `cpu_threads`). Those resources are shared across all in-flight assets, so
 //! they must live on an instance, not in free functions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
 
-use crate::asset::{AssetKey, ImageProcessingError};
-use crate::import::{DuplicateKey, ImportHistory, ImportPlan};
+use crate::asset::{AssetKey, ExifAssetData, ImageProcessingError};
+use crate::import::{ImportHistory, ImportPlan};
+use crate::metadata::read_exif_data;
 use crate::preview::{compress, make_preview_from_jpeg_bytes, make_thumbnail_from_jpeg_bytes};
 use crate::replicate::{
-    CardGate, CopyEngine, ReplicationEvent, ReplicationFailure, ReplicationReport,
-    ReplicationTarget,
+    CardGate, CopyEngine, ImportQueue, ReplicationEvent, ReplicationFailure, ReplicationReport,
+    ReplicationTarget, TargetId,
 };
 use crate::scan::{ScanOptions, ScanResponse, scan_source};
 use crate::{FileKind, PreviewStrip, enrich_assets, read_embedded_preview};
@@ -84,6 +85,8 @@ pub struct Engine {
 /// A running import. It carries on in the background whether or not anyone reads
 /// its progress.
 pub struct ImportHandle {
+    /// Add or take back files while the import runs. Close it to let the import end.
+    pub queue: Arc<ImportQueue>,
     pub progress: crossbeam_channel::Receiver<ReplicationEvent>,
     finished: std::thread::JoinHandle<ReplicationReport>,
 }
@@ -117,6 +120,7 @@ impl Engine {
                 collisions: vec![],
                 errors: vec![],
                 ignored: vec![],
+                file_meta: HashMap::new(),
             })),
         }
     }
@@ -168,6 +172,39 @@ impl Engine {
         self.card.acquire_priority()
     }
 
+    /// Walks a folder for names, sizes and dates. Opens no photo, so this can happen
+    /// before the photographer has chosen where the copies go.
+    pub fn scan_names(&mut self, source: &Path, options: &ScanOptions) {
+        *self.scan_response.write().unwrap() = scan_source(source, options);
+    }
+
+    /// Reads each photo's header, ahead of copy reads, and stores what it finds with a
+    /// brief lock per photo. `on_each` runs after each one, so the UI gets its tiny
+    /// thumbnails as they arrive.
+    pub fn enrich_streaming(&self, mut on_each: impl FnMut(&AssetKey, &ExifAssetData)) {
+        let work: Vec<(AssetKey, PathBuf)> = {
+            let scan = self.scan_response.read().unwrap();
+            scan.assets
+                .iter()
+                .map(|(key, asset)| {
+                    let (_, path) = asset.files.get_prioritized();
+                    (key.clone(), path.to_path_buf())
+                })
+                .collect()
+        };
+        for (key, path) in work {
+            let data = {
+                let _permit = self.card.acquire_priority();
+                read_exif_data(&path)
+            };
+            let Some(data) = data else { continue };
+            if let Some(asset) = self.scan_response.write().unwrap().assets.get_mut(&key) {
+                asset.exif_data = data.clone();
+            }
+            on_each(&key, &data);
+        }
+    }
+
     /// Starts copying `plan` in the background and returns at once. Holds no lock
     /// on the store, and previews go first on the card, so triage is never waiting
     /// on the copy. `primary` paces the card and should be the fastest local disk.
@@ -179,66 +216,106 @@ impl Engine {
         secondaries: Vec<Arc<dyn ReplicationTarget>>,
         history: Option<ImportHistory>,
     ) -> ImportHandle {
+        let handle = self.start_session(primary, secondaries, history, plan.failures);
+        for file in plan.files {
+            handle.queue.push(file);
+        }
+        handle.queue.close();
+        handle
+    }
+
+    /// Starts an import whose files come through `queue` on the returned handle, so
+    /// photos can be ticked and unticked while it runs. It runs until the queue is
+    /// closed. A file goes into `history` as soon as it is on every target, so a
+    /// crash in a long session loses nothing already copied.
+    pub fn start_session(
+        &self,
+        primary: Arc<dyn ReplicationTarget>,
+        secondaries: Vec<Arc<dyn ReplicationTarget>>,
+        history: Option<ImportHistory>,
+        failures: Vec<ReplicationFailure>,
+    ) -> ImportHandle {
+        let (raw_progress_tx, raw_progress) = crossbeam_channel::unbounded();
         let (progress_tx, progress) = crossbeam_channel::unbounded();
         let target_count = secondaries.len() + 1;
+        let queue = ImportQueue::new();
         let mut copy = CopyEngine::new(
             Arc::clone(&self.card),
             self.config.read_channel_depth,
             primary,
         )
-        .with_progress(progress_tx);
+        .with_progress(raw_progress_tx);
         for secondary in secondaries {
             copy = copy.with_secondary(secondary);
         }
 
-        let finished = std::thread::spawn(move || {
-            let keys: HashMap<PathBuf, DuplicateKey> = plan
-                .files
-                .iter()
-                .map(|file| (file.source.clone(), file.duplicate_key.clone()))
-                .collect();
-            let runtime = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(err) => {
-                    let mut report = ReplicationReport::default();
-                    report.failures.push(ReplicationFailure {
-                        source: None,
-                        target: None,
-                        error: format!("could not start the import runtime: {err}").into(),
-                    });
-                    return report;
+        // Watches every event on its way to the consumer, and keeps the history current.
+        let recorder = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || {
+                let mut history = history;
+                let mut reached: HashMap<PathBuf, HashSet<TargetId>> = HashMap::new();
+                let mut errors: Vec<ReplicationFailure> = vec![];
+                for event in raw_progress.iter() {
+                    if let ReplicationEvent::Verified { source, target, .. } = &event {
+                        let targets = reached.entry(source.clone()).or_default();
+                        targets.insert(*target);
+                        if targets.len() == target_count
+                            && let Some(history) = &mut history
+                            && let Some(key) = queue.duplicate_key(source)
+                            && let Err(error) = history.record([key])
+                        {
+                            errors.push(ReplicationFailure {
+                                source: Some(source.clone()),
+                                target: None,
+                                error: format!("could not update the import history: {error}")
+                                    .into(),
+                            });
+                        }
+                    }
+                    let _ = progress_tx.send(event);
                 }
-            };
-            let mut report = runtime.block_on(copy.replicate(plan));
+                errors
+            })
+        };
 
-            if let Some(mut history) = history {
-                let mut copies: HashMap<&Path, usize> = HashMap::new();
-                for replica in &report.verified {
-                    *copies.entry(replica.source()).or_default() += 1;
+        let finished = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(err) => {
+                        let mut report = ReplicationReport::default();
+                        report.failures.push(ReplicationFailure {
+                            source: None,
+                            target: None,
+                            error: format!("could not start the import runtime: {err}").into(),
+                        });
+                        return report;
+                    }
+                };
+                let mut report = runtime.block_on(copy.replicate_queue(queue));
+                report.failures.extend(failures);
+                // Dropping the engine closes the progress channel, which ends the recorder.
+                drop(copy);
+                if let Ok(errors) = recorder.join() {
+                    report.failures.extend(errors);
                 }
-                let done: Vec<DuplicateKey> = copies
-                    .into_iter()
-                    .filter(|(_, count)| *count == target_count)
-                    .filter_map(|(source, _)| keys.get(source).cloned())
-                    .collect();
-                if let Err(error) = history.record(done) {
-                    report.failures.push(ReplicationFailure {
-                        source: None,
-                        target: None,
-                        error: format!("could not update the import history: {error}").into(),
-                    });
-                }
-            }
-            report
-        });
+                report
+            })
+        };
 
-        ImportHandle { progress, finished }
+        ImportHandle {
+            queue,
+            progress,
+            finished,
+        }
     }
 
-    pub fn ingest(&mut self) -> crossbeam_channel::Receiver<IngestEvent> {
+    pub fn ingest(&self) -> crossbeam_channel::Receiver<IngestEvent> {
         let (tx, rx): (
             crossbeam_channel::Sender<IngestEvent>,
             crossbeam_channel::Receiver<IngestEvent>,
@@ -606,6 +683,81 @@ mod tests {
         std::fs::write(&fake, b"not a raw file at all").unwrap();
 
         assert!(read_source_bytes(FileKind::Raw, &fake, None).is_err());
+    }
+
+    #[test]
+    fn scanning_names_opens_no_photo_and_enriching_streams_headers() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_exif_read");
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.scan_names(&source, &ScanOptions::default());
+        {
+            let scan = engine.scan_response.read().unwrap();
+            assert_eq!(scan.assets.len(), 3);
+            assert!(
+                scan.assets
+                    .values()
+                    .all(|a| a.exif_data.captured_at.is_none())
+            );
+            assert_eq!(scan.file_meta.len(), 4);
+        }
+
+        let mut seen = 0;
+        engine.enrich_streaming(|_, data| {
+            assert!(data.captured_at.is_some());
+            seen += 1;
+        });
+        assert_eq!(seen, 3);
+        let scan = engine.scan_response.read().unwrap();
+        assert!(
+            scan.assets
+                .values()
+                .all(|a| a.exif_data.captured_at.is_some())
+        );
+    }
+
+    #[test]
+    fn a_session_records_history_file_by_file_while_still_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let card = tmp.path().join("card");
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::write(card.join("IMG_1.JPG"), b"first").unwrap();
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.scan_names(&card, &ScanOptions::default());
+        let options = ImportOptions {
+            use_file_dates: true,
+            ..Default::default()
+        };
+        let history_path = tmp.path().join("history.jsonl");
+        let plan = plan_import(&engine.scan_response, &card, &options, None).unwrap();
+        let target = Arc::new(LocalTarget::new(
+            TargetId(1),
+            Target {
+                root: tmp.path().join("photos"),
+                kind: TargetKind::LocalNvme,
+                write_permits: 1,
+            },
+        ));
+        let session = engine.start_session(
+            target,
+            vec![],
+            Some(ImportHistory::open(history_path.clone()).unwrap()),
+            vec![],
+        );
+        session.queue.push(plan.files[0].clone());
+
+        let event = session
+            .progress
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(event, ReplicationEvent::Verified { .. }));
+
+        // Not closed yet, and a crash now wouldn't lose the record.
+        let on_disk = ImportHistory::open(history_path).unwrap();
+        assert!(on_disk.contains(&plan.files[0].duplicate_key));
+
+        session.queue.close();
+        let report = session.wait();
+        assert_eq!(report.verified.len(), 1);
     }
 
     #[test]

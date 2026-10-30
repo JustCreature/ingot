@@ -133,6 +133,11 @@ pub(crate) fn read_exif_header(asset: &PhotoAsset) -> Option<exif::Exif> {
     read_exif_header_from_path(path, EXIF_HEADER_PREFIX_LEN)
 }
 
+/// The header read for one file, with no lock or asset needed.
+pub(crate) fn read_exif_data(path: &Path) -> Option<ExifAssetData> {
+    read_exif_header_from_path(path, EXIF_HEADER_PREFIX_LEN).map(|exif| extract_exif_data(&exif))
+}
+
 /// Read at most `max_bytes` from the head of `path` and parse it as an EXIF
 /// container. `take(max_bytes).read_to_end` caps the read *and* tolerates files
 /// shorter than the budget (no `UnexpectedEof`); `with_capacity` makes it a

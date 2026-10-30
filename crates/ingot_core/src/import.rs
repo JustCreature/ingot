@@ -5,7 +5,7 @@
 //! handed to the copy engine. Every target stores a file at the same relative path.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs, io,
     io::Write,
     path::{Component, Path, PathBuf},
@@ -20,7 +20,7 @@ use chrono::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AssetKey, FileKind, PhotoAsset, ScanResponse,
+    AssetKey, FileKind, FileMeta, PhotoAsset, ScanResponse,
     replicate::{ReplicationError, ReplicationFailure},
 };
 
@@ -199,6 +199,10 @@ pub struct ImportOptions {
     pub selection: Selection,
     /// Leaves out files the import history has already seen on every target.
     pub skip_suspected_duplicates: bool,
+    /// Dates files by their modified time, from the directory walk, instead of EXIF.
+    /// For an import that starts before any file has been opened, so a photo's folder
+    /// and name don't change depending on whether its header has been read yet.
+    pub use_file_dates: bool,
 }
 
 impl Default for ImportOptions {
@@ -212,6 +216,7 @@ impl Default for ImportOptions {
             extension_case: ExtensionCase::AsIs,
             selection: Selection::default(),
             skip_suspected_duplicates: true,
+            use_file_dates: false,
         }
     }
 }
@@ -294,6 +299,8 @@ pub struct ImportPlan {
     pub skipped_duplicates: Vec<PathBuf>,
     /// Files that could not be planned, such as ones that can't be read.
     pub failures: Vec<ReplicationFailure>,
+    /// The first sequence number this plan didn't use, for planning more files later.
+    pub next_number: u64,
 }
 
 struct PlannedAsset {
@@ -302,7 +309,9 @@ struct PlannedAsset {
     files: Vec<(FileKind, PathBuf)>,
 }
 
-fn assets_snapshot(scan: &RwLock<ScanResponse>) -> Result<Vec<PlannedAsset>, ReplicationError> {
+type AssetsAndMeta = (Vec<PlannedAsset>, HashMap<PathBuf, FileMeta>);
+
+fn assets_snapshot(scan: &RwLock<ScanResponse>) -> Result<AssetsAndMeta, ReplicationError> {
     let scan = scan
         .read()
         .map_err(|err| format!("scan store lock poisoned: {err}"))?;
@@ -323,7 +332,7 @@ fn assets_snapshot(scan: &RwLock<ScanResponse>) -> Result<Vec<PlannedAsset>, Rep
                 .push((collision.kind, collision.displaced.clone()));
         }
     }
-    Ok(assets)
+    Ok((assets, scan.file_meta.clone()))
 }
 
 fn safe_relative(path: PathBuf) -> Result<PathBuf, ReplicationError> {
@@ -356,9 +365,11 @@ struct Stat {
     modified: Option<SystemTime>,
 }
 
-/// Works out what an import will do. Statting happens with no lock held, and the
-/// order is stable: by capture time, then name, so a repeated plan numbers files the
-/// same way. RAW and JPEG of a pair share one sequence number.
+/// Works out what an import will do. It uses the sizes and dates the scan already
+/// has, so with a normal scan this touches no disk at all and a slow card can't hold
+/// it up. Only a file the scan has no data for is statted. The order is stable: by
+/// capture time, then name, so a repeated plan numbers files the same way. RAW and
+/// JPEG of a pair share one sequence number.
 pub fn plan_import(
     scan: &RwLock<ScanResponse>,
     source_root: &Path,
@@ -368,15 +379,23 @@ pub fn plan_import(
     let mut plan = ImportPlan::default();
     let mut assets = Vec::new();
 
-    for asset in assets_snapshot(scan)? {
+    let (snapshot, file_meta) = assets_snapshot(scan)?;
+    for asset in snapshot {
         let mut stats = Vec::with_capacity(asset.files.len());
         for (kind, path) in &asset.files {
-            match fs::metadata(path) {
-                Ok(metadata) => stats.push(Stat {
-                    path: path.clone(),
-                    kind: *kind,
+            let known = match file_meta.get(path) {
+                Some(meta) => Ok(*meta),
+                None => fs::metadata(path).map(|metadata| FileMeta {
                     size: metadata.len(),
                     modified: metadata.modified().ok(),
+                }),
+            };
+            match known {
+                Ok(meta) => stats.push(Stat {
+                    path: path.clone(),
+                    kind: *kind,
+                    size: meta.size,
+                    modified: meta.modified,
                 }),
                 Err(err) => plan.failures.push(ReplicationFailure {
                     source: Some(path.clone()),
@@ -387,13 +406,16 @@ pub fn plan_import(
         }
         // A frame with no EXIF date uses the file's own, which also comes from the
         // camera's clock.
-        let taken = asset.captured_at.or_else(|| {
-            stats
-                .iter()
-                .filter_map(|stat| stat.modified)
-                .min()
-                .map(|at| DateTime::<Local>::from(at).naive_local())
-        });
+        let file_date = stats
+            .iter()
+            .filter_map(|stat| stat.modified)
+            .min()
+            .map(|at| DateTime::<Local>::from(at).naive_local());
+        let taken = if options.use_file_dates {
+            file_date.or(asset.captured_at)
+        } else {
+            asset.captured_at.or(file_date)
+        };
         if let Some(taken) = taken {
             assets.push((taken, asset.key, stats));
         } else {
@@ -448,7 +470,7 @@ pub fn plan_import(
             }
 
             used_sequence = true;
-            match planned_path(&stat.path, source_root, options, sequence, taken) {
+            match planned_relative(&stat.path, source_root, options, sequence, taken) {
                 Ok(relative) => plan.files.push(PlannedFile {
                     source: stat.path,
                     relative,
@@ -467,10 +489,13 @@ pub fn plan_import(
             sequence += 1;
         }
     }
+    plan.next_number = sequence;
     Ok(plan)
 }
 
-fn planned_path(
+/// Where one file lands below a target's root. Pure: no disk access, so it is safe
+/// to call on every frame to show the destination.
+pub fn planned_relative(
     source: &Path,
     source_root: &Path,
     options: &ImportOptions,
@@ -531,8 +556,6 @@ fn planned_path(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use tempfile::{TempDir, tempdir};
 
     use super::*;
@@ -572,6 +595,7 @@ mod tests {
                 collisions: vec![],
                 errors: vec![],
                 ignored: vec![],
+                file_meta: HashMap::new(),
             }),
         )
     }
@@ -674,6 +698,80 @@ mod tests {
             assert!(plan.files.is_empty(), "{options:?}");
             assert_eq!(plan.failures.len(), 1, "{options:?}");
         }
+    }
+
+    #[test]
+    fn a_scanned_folder_plans_without_touching_the_disk_again() {
+        let tmp = tempdir().unwrap();
+        let card = tmp.path().join("card");
+        fs::create_dir_all(&card).unwrap();
+        fs::write(card.join("IMG_1.CR2"), b"12345").unwrap();
+        fs::write(card.join("IMG_1.JPG"), b"123").unwrap();
+        let scan = RwLock::new(crate::scan_source_dir(&card));
+
+        // With the card gone, only data from the scan can answer.
+        fs::remove_dir_all(&card).unwrap();
+        let options = ImportOptions {
+            organize: Organize::ByDate(DateFolders::default()),
+            use_file_dates: true,
+            ..Default::default()
+        };
+        let plan = plan_import(&scan, &card, &options, None).unwrap();
+
+        assert!(plan.failures.is_empty(), "{:?}", plan.failures);
+        assert_eq!(plan.files.len(), 2);
+        let total: u64 = plan.files.iter().map(|file| file.size).sum();
+        assert_eq!(total, 8);
+        assert_eq!(plan.next_number, 2);
+    }
+
+    #[test]
+    fn file_dates_win_over_exif_only_when_asked() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("IMG_1.JPG"), b"x").unwrap();
+        let mut response = crate::scan_source_dir(tmp.path());
+        response
+            .assets
+            .values_mut()
+            .next()
+            .unwrap()
+            .exif_data
+            .captured_at = Some(taken(22, 0));
+        let scan = RwLock::new(response);
+
+        let plan_with = |use_file_dates| {
+            let options = ImportOptions {
+                organize: Organize::ByDate(DateFolders::new(DateFolders::DATE).unwrap()),
+                use_file_dates,
+                ..Default::default()
+            };
+            relatives(&plan_import(&scan, tmp.path(), &options, None).unwrap())
+        };
+        assert_eq!(plan_with(false), ["2026-05-22/IMG_1.JPG"]);
+        assert_ne!(plan_with(true), ["2026-05-22/IMG_1.JPG"]);
+    }
+
+    #[test]
+    fn numbering_can_continue_for_files_added_later() {
+        let (tmp, scan) = card(&[
+            ("IMG_1.JPG", FileKind::Jpeg, taken(22, 0)),
+            ("IMG_2.JPG", FileKind::Jpeg, taken(22, 1)),
+        ]);
+        let pick = |name: &str, start| {
+            let options = ImportOptions {
+                rename: Some(NameTemplate::parse("{seq:2}").unwrap()),
+                start_number: start,
+                selection: Selection {
+                    paths: Some(HashSet::from([tmp.path().join(name)])),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            plan_import(&scan, tmp.path(), &options, None).unwrap()
+        };
+        let first = pick("IMG_2.JPG", 1);
+        assert_eq!(relatives(&first), ["01.JPG"]);
+        assert_eq!(relatives(&pick("IMG_1.JPG", first.next_number)), ["02.JPG"]);
     }
 
     #[test]

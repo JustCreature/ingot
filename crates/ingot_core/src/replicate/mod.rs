@@ -15,7 +15,7 @@ pub use gate::{CardGate, CardPermit};
 pub use local::LocalTarget;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::{OsStr, OsString},
     hash::Hash,
     path::{Path, PathBuf},
@@ -28,7 +28,7 @@ use tokio::{
     task::{self, JoinSet},
 };
 
-use crate::import::{ImportPlan, PlannedFile};
+use crate::import::{DuplicateKey, ImportPlan, PlannedFile};
 
 pub(crate) type ReplicationError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -118,7 +118,7 @@ pub enum ReplicaLocation {
 /// Proof that `source` is on `target` with a matching hash. Can only be built
 /// through `new`, which rejects mismatched hashes, and `new` is only reachable
 /// from this module and its target implementations.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct VerifiedReplica {
     source: PathBuf,
     target: TargetId,
@@ -245,6 +245,7 @@ pub enum ReplicationEvent {
         target: TargetId,
         size: u64,
         newly_written: bool,
+        replica: VerifiedReplica,
     },
     Failed {
         source: Option<PathBuf>,
@@ -282,6 +283,7 @@ impl ReplicationReport {
                         target,
                         size: replica.size(),
                         newly_written: replica.newly_written(),
+                        replica: replica.clone(),
                     });
                 }
                 self.verified.push(replica);
@@ -294,6 +296,89 @@ impl ReplicationReport {
                     error,
                 },
             ),
+        }
+    }
+}
+
+/// The files an import still has to read. It can change while the copy runs: a
+/// photographer ticks and unticks photos, and a file is only out of reach once its
+/// read has started.
+pub struct ImportQueue {
+    state: Mutex<QueueState>,
+    changed: Notify,
+}
+
+#[derive(Default)]
+struct QueueState {
+    waiting: VecDeque<PlannedFile>,
+    closed: bool,
+    duplicate_keys: HashMap<PathBuf, DuplicateKey>,
+}
+
+impl ImportQueue {
+    pub fn new() -> Arc<Self> {
+        Arc::new(ImportQueue {
+            state: Mutex::new(QueueState::default()),
+            changed: Notify::new(),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Adds a file, unless it is already waiting. Returns whether it was added; a
+    /// closed queue takes nothing.
+    pub fn push(&self, file: PlannedFile) -> bool {
+        let mut state = self.lock();
+        if state.closed || state.waiting.iter().any(|f| f.source == file.source) {
+            return false;
+        }
+        state
+            .duplicate_keys
+            .insert(file.source.clone(), file.duplicate_key.clone());
+        state.waiting.push_back(file);
+        self.changed.notify_one();
+        true
+    }
+
+    /// Takes a file back if its read hasn't started. Returns whether it was.
+    pub fn remove(&self, source: &Path) -> bool {
+        let mut state = self.lock();
+        let before = state.waiting.len();
+        state.waiting.retain(|file| file.source != source);
+        before != state.waiting.len()
+    }
+
+    /// No more files will come. What is already waiting still gets copied.
+    pub fn close(&self) {
+        self.lock().closed = true;
+        self.changed.notify_one();
+    }
+
+    pub fn waiting(&self) -> usize {
+        self.lock().waiting.len()
+    }
+
+    pub(crate) fn duplicate_key(&self, source: &Path) -> Option<DuplicateKey> {
+        self.lock().duplicate_keys.get(source).cloned()
+    }
+
+    /// The next file, waiting for one if need be. `None` once closed and empty.
+    async fn next(&self) -> Option<PlannedFile> {
+        loop {
+            {
+                let mut state = self.lock();
+                if let Some(file) = state.waiting.pop_front() {
+                    return Some(file);
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            // `notify_one` stores a wakeup when nobody is waiting yet, so a push
+            // between the check above and this await isn't lost.
+            self.changed.notified().await;
         }
     }
 }
@@ -585,22 +670,28 @@ impl CopyEngine {
     /// Reads every file once in the background. A slot is held from before the read
     /// until the bytes are in the channel, so a full channel stops further card
     /// reads, while the card itself stays free for previews during the wait.
-    fn start_read_stream(&self, files: Vec<PlannedFile>) -> mpsc::Receiver<ReadOutcome> {
+    fn start_read_stream(&self, queue: Arc<ImportQueue>) -> mpsc::Receiver<ReadOutcome> {
         let (tx, rx) = mpsc::channel(self.read_channel_depth);
         let buffers = Arc::new(Semaphore::new(READS_IN_PROGRESS));
         let card = Arc::clone(&self.card);
 
         tokio::spawn(async move {
-            for file in files {
+            loop {
                 let slot: OwnedSemaphorePermit = match Arc::clone(&buffers).acquire_owned().await {
                     Ok(slot) => slot,
                     Err(_) => return,
                 };
 
-                // Nobody is consuming, so stop reading the card.
-                if tx.is_closed() {
-                    return;
-                }
+                // Taken from the queue only now, so a file stays removable until the
+                // moment its read can really start. If nobody is consuming any more,
+                // stop reading the card.
+                let file = tokio::select! {
+                    file = queue.next() => match file {
+                        Some(file) => file,
+                        None => return,
+                    },
+                    _ = tx.closed() => return,
+                };
 
                 let (tx, card) = (tx.clone(), Arc::clone(&card));
                 tokio::spawn(async move {
@@ -619,12 +710,24 @@ impl CopyEngine {
     /// file when they don't. One bad file never stops the batch: its failure is
     /// recorded in the report.
     pub async fn replicate(&self, plan: ImportPlan) -> ReplicationReport {
-        let started = Instant::now();
-        let mut report = ReplicationReport::default();
+        let queue = ImportQueue::new();
+        for file in plan.files {
+            queue.push(file);
+        }
+        queue.close();
+        let mut report = self.replicate_queue(queue).await;
         for failure in plan.failures {
             report.record_failure(&self.progress, failure);
         }
-        let mut rx = self.start_read_stream(plan.files);
+        report
+    }
+
+    /// Copies whatever arrives on `queue`, until it is closed and empty. Files can be
+    /// added or taken back while this runs.
+    pub async fn replicate_queue(&self, queue: Arc<ImportQueue>) -> ReplicationReport {
+        let started = Instant::now();
+        let mut report = ReplicationReport::default();
+        let mut rx = self.start_read_stream(queue);
         let mut stores = StoreSet::new();
         let primary_id = self.primary_target.id();
         let max_stores = self.primary_target.max_concurrent_writes().max(1);
@@ -647,58 +750,59 @@ impl CopyEngine {
             ));
         }
 
-        while let Some(outcome) = rx.recv().await {
-            let msg = match outcome {
-                Ok(msg) => msg,
-                Err(failure) => {
-                    report.record_failure(&self.progress, failure);
-                    continue;
+        // Finished stores are settled as they finish, not just when the next file
+        // arrives: the queue may stay idle for a long time, and the secondaries and the
+        // progress display are waiting on them. While all write slots are busy nothing
+        // new is received, which is what passes backpressure on to the reader.
+        let mut reading = true;
+        loop {
+            tokio::select! {
+                biased;
+                finished = stores.next(), if !stores.is_empty() => {
+                    if let Some((pending, result)) = finished {
+                        settle_primary(
+                            &mut report,
+                            primary_id,
+                            &queues,
+                            &self.progress,
+                            pending,
+                            result,
+                        );
+                    }
                 }
-            };
+                outcome = rx.recv(), if reading && stores.len() < max_stores => {
+                    let msg = match outcome {
+                        Some(Ok(msg)) => msg,
+                        Some(Err(failure)) => {
+                            report.record_failure(&self.progress, failure);
+                            continue;
+                        }
+                        None => {
+                            reading = false;
+                            continue;
+                        }
+                    };
 
-            // Waiting here, rather than spawning and letting the target queue the
-            // work, is what passes backpressure on to the reader.
-            while stores.len() >= max_stores {
-                if let Some((pending, result)) = stores.next().await {
-                    settle_primary(
-                        &mut report,
-                        primary_id,
-                        &queues,
-                        &self.progress,
-                        pending,
-                        result,
+                    let deferred_to = queues
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, queue)| queue.hot.try_send(msg.clone()).is_err())
+                        .map(|(index, _)| index)
+                        .collect();
+
+                    let target = Arc::clone(&self.primary_target);
+                    let info = msg.info;
+                    let bytes = msg.bytes;
+                    stores.spawn(
+                        PendingStore {
+                            info: info.clone(),
+                            deferred_to,
+                        },
+                        async move { target.store(&info, bytes).await },
                     );
                 }
+                else => break,
             }
-
-            let deferred_to = queues
-                .iter()
-                .enumerate()
-                .filter(|(_, queue)| queue.hot.try_send(msg.clone()).is_err())
-                .map(|(index, _)| index)
-                .collect();
-
-            let target = Arc::clone(&self.primary_target);
-            let info = msg.info;
-            let bytes = msg.bytes;
-            stores.spawn(
-                PendingStore {
-                    info: info.clone(),
-                    deferred_to,
-                },
-                async move { target.store(&info, bytes).await },
-            );
-        }
-
-        while let Some((pending, result)) = stores.next().await {
-            settle_primary(
-                &mut report,
-                primary_id,
-                &queues,
-                &self.progress,
-                pending,
-                result,
-            );
         }
         report.primary_done_after = started.elapsed();
 
@@ -743,6 +847,15 @@ mod tests {
         TargetKind, plan_import,
     };
     use chrono::{Local, NaiveDate};
+
+    fn closed_queue(plan: ImportPlan) -> Arc<ImportQueue> {
+        let queue = ImportQueue::new();
+        for file in plan.files {
+            queue.push(file);
+        }
+        queue.close();
+        queue
+    }
 
     fn plan_of(scan: &RwLock<ScanResponse>) -> ImportPlan {
         let options = ImportOptions {
@@ -797,6 +910,7 @@ mod tests {
             collisions: vec![],
             errors: vec![],
             ignored: vec![],
+            file_meta: HashMap::new(),
         })
     }
 
@@ -1046,7 +1160,7 @@ mod tests {
 
         let gate = CardGate::new(1);
         let engine = CopyEngine::new(Arc::clone(&gate), 1, local_target(tmp.path(), 1));
-        let rx = engine.start_read_stream(plan_of(&scan).files);
+        let rx = engine.start_read_stream(closed_queue(plan_of(&scan)));
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Nothing is consuming, so the reader is stuck on the channel.
@@ -1056,6 +1170,135 @@ mod tests {
             .expect("a backed-up copy kept a preview read off the card")
             .unwrap();
         drop(rx);
+    }
+
+    /// Planned files for a card with these names, by name.
+    fn queue_fixture(tmp: &Path, names: &[&str]) -> HashMap<String, PlannedFile> {
+        let card = tmp.join("card");
+        let paths: Vec<PathBuf> = names
+            .iter()
+            .map(|name| write_source(&card, name, name.as_bytes()))
+            .collect();
+        let files: Vec<(&Path, FileKind)> =
+            paths.iter().map(|p| (p.as_path(), FileKind::Raw)).collect();
+        plan_of(&scan_of(&files, true))
+            .files
+            .into_iter()
+            .map(|file| {
+                let name = file
+                    .source
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                (name, file)
+            })
+            .collect()
+    }
+
+    async fn wait_for_entries(dir: &Path, count: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !dir.exists() || dir_entries(dir).len() < count {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{dir:?} never got {count} files"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_taken_back_before_its_read_is_never_copied() {
+        let tmp = tempdir().unwrap();
+        let mut files = queue_fixture(tmp.path(), &["IMG_1.CR2", "IMG_2.CR2", "IMG_3.CR2"]);
+        let root = tmp.path().join("target");
+        let queue = ImportQueue::new();
+        for name in ["IMG_1.CR2", "IMG_2.CR2", "IMG_3.CR2"] {
+            queue.push(files.remove(name).unwrap());
+        }
+        // Taken back before the copy starts, so it can't have been read.
+        assert!(queue.remove(&tmp.path().join("card/IMG_2.CR2")));
+        assert!(!queue.remove(&tmp.path().join("card/IMG_2.CR2")));
+        queue.close();
+
+        let engine = CopyEngine::new(CardGate::new(1), 4, local_target(&root, 2));
+        let report = engine.replicate_queue(queue).await;
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.verified.len(), 2);
+        assert_eq!(dir_entries(&dated_dir(&root)), ["IMG_1.CR2", "IMG_3.CR2"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drained_queue_stays_open_for_files_ticked_later() {
+        let tmp = tempdir().unwrap();
+        let mut files = queue_fixture(tmp.path(), &["IMG_1.CR2", "IMG_2.CR2"]);
+        let root = tmp.path().join("target");
+        let queue = ImportQueue::new();
+        queue.push(files.remove("IMG_1.CR2").unwrap());
+
+        let engine = Arc::new(CopyEngine::new(CardGate::new(1), 4, local_target(&root, 2)));
+        let running = {
+            let (engine, queue) = (Arc::clone(&engine), Arc::clone(&queue));
+            tokio::spawn(async move { engine.replicate_queue(queue).await })
+        };
+        wait_for_entries(&dated_dir(&root), 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(queue.waiting(), 0);
+        assert!(
+            !running.is_finished(),
+            "the copy ended while the queue was open"
+        );
+
+        queue.push(files.remove("IMG_2.CR2").unwrap());
+        wait_for_entries(&dated_dir(&root), 2).await;
+        queue.close();
+
+        let report = running.await.unwrap();
+        assert_eq!(report.verified.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn progress_arrives_while_the_queue_sits_idle() {
+        let tmp = tempdir().unwrap();
+        let mut files = queue_fixture(tmp.path(), &["IMG_1.CR2"]);
+        let queue = ImportQueue::new();
+        queue.push(files.remove("IMG_1.CR2").unwrap());
+        let (progress, events) = crossbeam_channel::unbounded();
+        let engine = Arc::new(
+            CopyEngine::new(CardGate::new(1), 4, local_target(&tmp.path().join("t"), 2))
+                .with_progress(progress),
+        );
+        let running = {
+            let (engine, queue) = (Arc::clone(&engine), Arc::clone(&queue));
+            tokio::spawn(async move { engine.replicate_queue(queue).await })
+        };
+
+        // The queue is still open and idle, and the file must still be reported.
+        let event =
+            tokio::task::spawn_blocking(move || events.recv_timeout(Duration::from_secs(10)))
+                .await
+                .unwrap()
+                .expect("no progress until the queue closed");
+        assert!(matches!(event, ReplicationEvent::Verified { .. }));
+
+        queue.close();
+        running.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_closed_queue_takes_nothing_and_a_waiting_file_is_not_queued_twice() {
+        let tmp = tempdir().unwrap();
+        let mut files = queue_fixture(tmp.path(), &["IMG_1.CR2", "IMG_2.CR2"]);
+        let queue = ImportQueue::new();
+        let first = files.remove("IMG_1.CR2").unwrap();
+        assert!(queue.push(first.clone()));
+        assert!(!queue.push(first));
+        assert_eq!(queue.waiting(), 1);
+        queue.close();
+        assert!(!queue.push(files.remove("IMG_2.CR2").unwrap()));
+        assert!(queue.next().await.is_some());
+        assert!(queue.next().await.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1073,7 +1316,7 @@ mod tests {
         let scan = scan_of(&files, true);
 
         let engine = CopyEngine::new(CardGate::new(1), DEPTH, local_target(tmp.path(), 1));
-        let mut rx = engine.start_read_stream(plan_of(&scan).files);
+        let mut rx = engine.start_read_stream(closed_queue(plan_of(&scan)));
 
         // Nothing is consuming. Any file the reader hasn't reached by the time it
         // is deleted fails, so the successes count exactly what was read.

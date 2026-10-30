@@ -1,9 +1,10 @@
 //! The window: everything drawn, and the background work it starts.
 
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, mpsc},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use eframe::egui::{
@@ -11,17 +12,19 @@ use eframe::egui::{
     StrokeKind, TextureHandle, TextureOptions, Vec2,
 };
 use ingot_core::{
-    AssetKey, DRIVE_ROOT_FOLDER, DateFolders, DriveConfig, DriveCredentials, DriveTarget, Engine,
-    EngineConfig, ExtensionCase, ImportHistory, ImportOptions, LocalTarget, NameTemplate, Organize,
-    ReplicationEvent, ReplicationReport, ReplicationTarget, ScanOptions, Target, TargetId,
-    TargetKind, TriageState, execute_sweep, plan_import, plan_sweep,
+    AssetKey, DEFAULT_SENSITIVITY, DRIVE_ROOT_FOLDER, DateFolders, DriveConfig, DriveCredentials,
+    DriveTarget, Engine, EngineConfig, ExtensionCase, Fingerprint, ImportHistory, ImportOptions,
+    ImportQueue, LocalTarget, NameTemplate, Organize, PlannedFile, ReplicationEvent,
+    ReplicationReport, ReplicationTarget, ScanOptions, Selection, SweepReport, Target, TargetId,
+    TargetKind, TriageState, VerifiedReplica, execute_sweep, plan_import, plan_sweep,
+    planned_relative, preview,
 };
 use ingot_develop::{DevelopParams, DevelopedImage, PreviewBase, WhiteBalance};
 
 use super::{
     AppPaths,
     images::{ImageCache, Tier, decode_jpeg},
-    library::{Command, Filter, Library, Photo, command_for},
+    library::{Command, Filter, ImportCounts, Library, Photo, command_for},
 };
 
 // Colors from docs/design/ingot_v2/styles.css.
@@ -38,6 +41,14 @@ const ACCENT: Color32 = Color32::from_rgb(0x3b, 0x82, 0xf6);
 const ACCEPT: Color32 = Color32::from_rgb(0x34, 0xd3, 0x99);
 const REJECT: Color32 = Color32::from_rgb(0xf0, 0x55, 0x6b);
 const STAR: Color32 = Color32::from_rgb(0xf5, 0xc4, 0x51);
+const CLUSTER_COLORS: [Color32; 6] = [
+    ACCENT,
+    ACCEPT,
+    STAR,
+    Color32::from_rgb(0xc0, 0x84, 0xfc),
+    Color32::from_rgb(0xfb, 0x92, 0x3c),
+    Color32::from_rgb(0x22, 0xd3, 0xee),
+];
 
 const PREVIEW_EDGE: usize = 1600;
 const DRIVE_TARGET_ID: u32 = 100;
@@ -45,21 +56,38 @@ const DRIVE_TARGET_ID: u32 = 100;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum View {
     Grid,
+    Clusters,
     Loupe,
     Develop,
 }
 
 enum Msg {
-    Ready(Arc<Engine>),
-    Preview,
+    Environment {
+        cards: Vec<PathBuf>,
+        gdrive: bool,
+    },
+    /// The folder's names are known. No photo has been opened.
+    Listed {
+        engine: Arc<Engine>,
+        already_imported: HashSet<PathBuf>,
+        ignored: usize,
+        errors: usize,
+    },
+    Header(AssetKey, Option<u16>, Option<chrono::NaiveDateTime>),
+    Preview(AssetKey),
     PreviewsDone,
-    ScanInfo { ignored: usize, errors: usize },
+    Hashed(AssetKey, Fingerprint, bool),
     Full(AssetKey, Result<egui::ColorImage, String>),
     Base(AssetKey, Result<Arc<PreviewBase>, String>),
     Rendered(AssetKey, Result<DevelopedImage, String>),
     Copy(ReplicationEvent),
     CopyDone(ReplicationReport),
     Exported(Result<String, String>),
+    SweepPlanned {
+        paths: Vec<PathBuf>,
+        left_in_cloud: usize,
+    },
+    SweepDone(Result<SweepReport, String>),
 }
 
 /// Slider renders: only the newest request matters, so a fast drag never queues up.
@@ -82,7 +110,6 @@ struct ImportForm {
     second_copy: String,
     gdrive: bool,
     only_new: bool,
-    previewed: Vec<String>,
     error: Option<String>,
 }
 
@@ -101,7 +128,6 @@ impl Default for ImportForm {
             second_copy: String::new(),
             gdrive: false,
             only_new: true,
-            previewed: vec![],
             error: None,
         }
     }
@@ -127,7 +153,10 @@ impl ImportForm {
             custom_text: self.custom_text.clone(),
             start_number: self.start_number,
             extension_case: self.extensions,
-            skip_suspected_duplicates: self.only_new,
+            // The ticks already say what comes in, and nothing has been opened yet to
+            // date a file by, so names and folders use the file's own date.
+            skip_suspected_duplicates: false,
+            use_file_dates: true,
             ..Default::default()
         })
     }
@@ -135,19 +164,30 @@ impl ImportForm {
 
 #[derive(Default)]
 struct CopyProgress {
-    running: bool,
-    total: usize,
-    done: usize,
-    failed: usize,
     bytes: u64,
+    failed: usize,
     started: Option<Instant>,
     last_errors: Vec<String>,
     summary: Option<String>,
 }
 
+/// A running import. It starts when the destination is confirmed and stays open for
+/// photos ticked later, until a new import starts.
+struct Session {
+    queue: Arc<ImportQueue>,
+    options: ImportOptions,
+    destination: PathBuf,
+    next_number: u64,
+    /// Each file keeps the name and number it was first given, even if it is unticked
+    /// and ticked again.
+    planned: HashMap<PathBuf, PlannedFile>,
+}
+
 struct SweepDialog {
     paths: Vec<PathBuf>,
     left_in_cloud: usize,
+    planning: bool,
+    running: bool,
 }
 
 pub struct IngotApp {
@@ -174,6 +214,7 @@ pub struct IngotApp {
     scroll_to_focus: bool,
     columns: usize,
     show_help: bool,
+    pending_tick: Option<usize>,
 
     zoomed: bool,
     pan: Vec2,
@@ -191,7 +232,10 @@ pub struct IngotApp {
     show_before: bool,
     render_requested: bool,
 
-    import_open: bool,
+    cards: Vec<PathBuf>,
+    gdrive_available: bool,
+    session: Option<Session>,
+    hashes: mpsc::Sender<(AssetKey, Vec<u8>, bool)>,
     form: ImportForm,
     copy: CopyProgress,
     sweep: Option<SweepDialog>,
@@ -207,6 +251,8 @@ impl IngotApp {
         let (tx, rx) = mpsc::channel();
         let render = Arc::new(RenderSlot::default());
         spawn_render_thread(Arc::clone(&render), tx.clone(), ctx.clone());
+        spawn_environment_thread(paths.gdrive.clone(), tx.clone(), ctx.clone());
+        let hashes = spawn_hash_thread(tx.clone(), ctx.clone());
         let mut app = IngotApp {
             paths,
             tx,
@@ -229,6 +275,7 @@ impl IngotApp {
             scroll_to_focus: false,
             columns: 1,
             show_help: false,
+            pending_tick: None,
             zoomed: false,
             pan: Vec2::ZERO,
             full: None,
@@ -243,7 +290,10 @@ impl IngotApp {
             clipboard: None,
             show_before: false,
             render_requested: false,
-            import_open: false,
+            cards: vec![],
+            gdrive_available: false,
+            session: None,
+            hashes,
             form: ImportForm::default(),
             copy: CopyProgress::default(),
             sweep: None,
@@ -254,10 +304,10 @@ impl IngotApp {
         app
     }
 
+    /// Lists a card or folder for the import screen. Walks names, sizes and dates only.
+    /// Opening a photo has to wait for a destination, since copying starts with it.
     fn open_folder(&mut self, folder: PathBuf) {
-        if self.copy.running {
-            self.status =
-                Some("Wait for the import to finish before opening a folder.".to_string());
+        if !self.leave_session() {
             return;
         }
         self.flush_params();
@@ -269,50 +319,345 @@ impl IngotApp {
         self.previews_ready = 0;
         self.view = View::Grid;
         self.status = None;
+        self.copy = CopyProgress::default();
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        let history_path = self.paths.history.clone();
         std::thread::spawn(move || {
             let mut engine = Engine::new(EngineConfig::default());
-            engine.scan_with(&folder, &ScanOptions::default());
-            {
+            engine.scan_names(&folder, &ScanOptions::default());
+            let (ignored, errors) = {
                 let scan = engine
                     .scan_response
                     .read()
                     .unwrap_or_else(|e| e.into_inner());
-                let _ = tx.send(Msg::ScanInfo {
-                    ignored: scan.ignored.len(),
-                    errors: scan.errors.len(),
-                });
-            }
-            let previews = engine.ingest();
-            let _ = tx.send(Msg::Ready(Arc::new(engine)));
+                (scan.ignored.len(), scan.errors.len())
+            };
+            let already_imported = ImportHistory::open(history_path)
+                .ok()
+                .and_then(|history| {
+                    let options = ImportOptions {
+                        use_file_dates: true,
+                        ..Default::default()
+                    };
+                    plan_import(&engine.scan_response, &folder, &options, Some(&history)).ok()
+                })
+                .map(|plan| plan.skipped_duplicates.into_iter().collect())
+                .unwrap_or_default();
+            let _ = tx.send(Msg::Listed {
+                engine: Arc::new(engine),
+                already_imported,
+                ignored,
+                errors,
+            });
             ctx.request_repaint();
-            for event in previews.iter() {
-                let ingot_core::IngestEvent::Preview(_) = event;
-                let _ = tx.send(Msg::Preview);
+        });
+    }
+
+    /// Ends the running import if everything has finished. Says no otherwise, so a
+    /// copy can't be walked away from by accident.
+    fn leave_session(&mut self) -> bool {
+        let pending = self
+            .library
+            .as_ref()
+            .map_or(0, |library| library.import_counts().pending());
+        if self.session.is_some() && pending > 0 {
+            self.status = Some("Wait for the import to finish before starting a new one.".into());
+            return false;
+        }
+        if let Some(session) = self.session.take() {
+            session.queue.close();
+        }
+        true
+    }
+
+    fn new_import(&mut self) {
+        if self.leave_session() {
+            self.library = None;
+            self.engine = None;
+            self.source = None;
+            self.copy = CopyProgress::default();
+            self.status = None;
+            self.view = View::Grid;
+        }
+    }
+
+    /// Confirms the destination. This is the moment the card is first touched, and the
+    /// copy, the headers and the previews all start together.
+    fn start_session(&mut self) -> Result<(), String> {
+        if self.session.is_some() {
+            return Err("An import is already running.".to_string());
+        }
+        let destination = self.form.destination.trim().to_string();
+        if destination.is_empty() {
+            return Err("Choose a destination folder.".to_string());
+        }
+        let engine = self.engine.clone().ok_or("The folder is still loading.")?;
+        let options = self.form.options()?;
+        let local = |id, root: &str| -> Arc<dyn ReplicationTarget> {
+            Arc::new(LocalTarget::new(
+                TargetId(id),
+                Target {
+                    root: PathBuf::from(root.trim()),
+                    kind: TargetKind::LocalNvme,
+                    write_permits: 4,
+                },
+            ))
+        };
+        let primary = local(1, &destination);
+        let mut secondaries = vec![];
+        if !self.form.second_copy.trim().is_empty() {
+            secondaries.push(local(2, &self.form.second_copy));
+        }
+        if self.form.gdrive {
+            let credentials = DriveCredentials::load(&self.paths.gdrive).map_err(io_err)?;
+            secondaries.push(Arc::new(
+                DriveTarget::new(
+                    TargetId(DRIVE_TARGET_ID),
+                    DriveConfig::default(),
+                    credentials,
+                )
+                .map_err(io_err)?,
+            ) as Arc<dyn ReplicationTarget>);
+        }
+        let history = ImportHistory::open(self.paths.history.clone()).map_err(io_err)?;
+
+        let target_count = secondaries.len() + 1;
+        let handle = engine.start_session(primary, secondaries, Some(history), vec![]);
+        self.session = Some(Session {
+            queue: Arc::clone(&handle.queue),
+            next_number: options.start_number,
+            options,
+            destination: PathBuf::from(destination),
+            planned: HashMap::new(),
+        });
+        self.copy = CopyProgress {
+            started: Some(Instant::now()),
+            ..Default::default()
+        };
+        if let Some(library) = &mut self.library {
+            library.target_count = target_count;
+        }
+        let ticked: Vec<usize> = self.library.as_ref().map_or(vec![], |library| {
+            (0..library.photos.len())
+                .filter(|index| library.ticked.contains(&library.photos[*index].key))
+                .collect()
+        });
+        self.queue_photos(&ticked);
+
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            for event in handle.progress.iter() {
+                let _ = tx.send(Msg::Copy(event));
+                ctx.request_repaint();
+            }
+            let _ = tx.send(Msg::CopyDone(handle.wait()));
+            ctx.request_repaint();
+        });
+
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            engine.enrich_streaming(|key, data| {
+                let _ = tx.send(Msg::Header(key.clone(), data.orientation, data.captured_at));
+                ctx.request_repaint();
+            });
+            for event in engine.ingest().iter() {
+                let ingot_core::IngestEvent::Preview(message) = event;
+                let _ = tx.send(Msg::Preview(message.key));
                 ctx.request_repaint();
             }
             let _ = tx.send(Msg::PreviewsDone);
             ctx.request_repaint();
         });
+        Ok(())
+    }
+
+    /// Puts photos' files on the copy queue. Uses only what the folder listing already
+    /// knows, so it's instant however slow the card is.
+    fn queue_photos(&mut self, indexes: &[usize]) {
+        let (Some(session), Some(library), Some(source)) =
+            (&mut self.session, &mut self.library, &self.source)
+        else {
+            return;
+        };
+        let mut wanted = HashSet::new();
+        for index in indexes {
+            for file in &library.photos[*index].files {
+                if !library.is_copied(file) {
+                    wanted.insert(file.clone());
+                }
+            }
+        }
+        let unplanned: HashSet<PathBuf> = wanted
+            .iter()
+            .filter(|file| !session.planned.contains_key(*file))
+            .cloned()
+            .collect();
+        if !unplanned.is_empty() {
+            let options = ImportOptions {
+                start_number: session.next_number,
+                selection: Selection {
+                    paths: Some(unplanned),
+                    ..Default::default()
+                },
+                ..session.options.clone()
+            };
+            match plan_import(&library.store, source, &options, None) {
+                Ok(plan) => {
+                    session.next_number = plan.next_number;
+                    for file in plan.files {
+                        session.planned.insert(file.source.clone(), file);
+                    }
+                    for failure in plan.failures {
+                        self.copy.failed += 1;
+                        self.copy.last_errors.push(failure.error.to_string());
+                        if let Some(source) = &failure.source {
+                            library.record_failure(source);
+                        }
+                    }
+                }
+                Err(err) => self.status = Some(err.to_string()),
+            }
+        }
+        for index in indexes {
+            for file in library.photos[*index].files.clone() {
+                if wanted.contains(&file)
+                    && let Some(planned) = session.planned.get(&file)
+                {
+                    library.clear_failure(&file);
+                    session.queue.push(planned.clone());
+                }
+            }
+        }
+    }
+
+    /// Ticks or unticks photos. During an import, a file whose read hasn't started
+    /// leaves the queue, and one already copied keeps its copy.
+    fn set_ticks(&mut self, indexes: &[usize], ticked: bool) {
+        let Some(library) = &mut self.library else {
+            return;
+        };
+        let keys: Vec<AssetKey> = indexes
+            .iter()
+            .map(|index| library.photos[*index].key.clone())
+            .collect();
+        for key in &keys {
+            library.set_ticked(key, ticked);
+        }
+        if ticked {
+            self.queue_photos(indexes);
+            return;
+        }
+        let Some(session) = &self.session else {
+            return;
+        };
+        let mut started = 0;
+        for index in indexes {
+            let photo = &library.photos[*index];
+            let mut any_started = false;
+            for file in &photo.files {
+                if !session.queue.remove(file) {
+                    any_started = true;
+                }
+            }
+            started += usize::from(any_started);
+        }
+        if started > 0 {
+            self.status = Some(if indexes.len() == 1 {
+                "Already copied or being copied, so that copy stays.".to_string()
+            } else {
+                format!("{started} photos already copied or being copied. Those copies stay.")
+            });
+        }
+    }
+
+    fn toggle_tick(&mut self, index: usize) {
+        let ticked = self
+            .library
+            .as_ref()
+            .is_some_and(|library| library.ticked.contains(&library.photos[index].key));
+        self.set_ticks(&[index], !ticked);
+    }
+
+    fn tick_all(&mut self) {
+        let skip = self.form.only_new && self.session.is_none();
+        let Some(library) = &mut self.library else {
+            return;
+        };
+        library.tick_all(skip);
+        let indexes: Vec<usize> = (0..library.photos.len())
+            .filter(|index| library.ticked.contains(&library.photos[*index].key))
+            .collect();
+        self.queue_photos(&indexes);
+    }
+
+    fn tick_none(&mut self) {
+        let count = self.library.as_ref().map_or(0, |l| l.photos.len());
+        let indexes: Vec<usize> = (0..count).collect();
+        self.set_ticks(&indexes, false);
+    }
+
+    /// Queues a photo's fingerprint from an image already in memory.
+    fn request_hash(&self, key: &AssetKey, from_thumb: bool) {
+        let Some(library) = &self.library else {
+            return;
+        };
+        if !from_thumb && library.has_fingerprint(key) {
+            return;
+        }
+        let bytes = {
+            let scan = library.store.read().unwrap_or_else(|e| e.into_inner());
+            scan.assets.get(key).and_then(|asset| {
+                if from_thumb {
+                    asset.image_data.thumb.clone()
+                } else {
+                    asset.exif_data.thumbnail.clone()
+                }
+            })
+        };
+        if let Some(bytes) = bytes {
+            let _ = self.hashes.send((key.clone(), bytes, from_thumb));
+        }
     }
 
     fn drain_messages(&mut self) {
         while let Ok(message) = self.rx.try_recv() {
             match message {
-                Msg::ScanInfo { ignored, errors } => {
+                Msg::Environment { cards, gdrive } => {
+                    self.cards = cards;
+                    self.gdrive_available = gdrive;
+                }
+                Msg::Listed {
+                    engine,
+                    already_imported,
+                    ignored,
+                    errors,
+                } => {
                     self.ignored = ignored;
                     self.scan_errors = errors;
-                }
-                Msg::Ready(engine) => {
-                    self.library = Some(Library::new(
-                        Arc::clone(&engine.scan_response),
-                        &self.paths.triage,
-                    ));
+                    let mut library =
+                        Library::new(Arc::clone(&engine.scan_response), &self.paths.triage);
+                    library.mark_already_imported(&already_imported);
+                    library.tick_all(self.form.only_new);
+                    self.library = Some(library);
                     self.engine = Some(engine);
                     self.scanning = false;
                 }
-                Msg::Preview => self.previews_ready += 1,
+                Msg::Header(key, orientation, captured) => {
+                    if let Some(library) = &mut self.library {
+                        library.apply_header(&key, orientation, captured);
+                    }
+                    self.request_hash(&key, false);
+                }
+                Msg::Preview(key) => {
+                    self.previews_ready += 1;
+                    self.request_hash(&key, true);
+                }
                 Msg::PreviewsDone => self.previews_done = true,
+                Msg::Hashed(key, print, from_thumb) => {
+                    if let Some(library) = &mut self.library {
+                        library.set_fingerprint(&key, print, from_thumb);
+                    }
+                }
                 Msg::Full(key, result) => {
                     self.full_loading = None;
                     match result {
@@ -351,15 +696,21 @@ impl IngotApp {
                     ReplicationEvent::Verified {
                         size,
                         newly_written,
+                        replica,
                         ..
                     } => {
-                        self.copy.done += 1;
                         if newly_written {
                             self.copy.bytes += size;
+                        }
+                        if let Some(library) = &mut self.library {
+                            library.add_replica(replica);
                         }
                     }
                     ReplicationEvent::Failed { source, error, .. } => {
                         self.copy.failed += 1;
+                        if let (Some(library), Some(source)) = (&mut self.library, &source) {
+                            library.record_failure(source);
+                        }
                         if self.copy.last_errors.len() < 20 {
                             let name = source
                                 .as_deref()
@@ -371,21 +722,11 @@ impl IngotApp {
                     }
                 },
                 Msg::CopyDone(report) => {
-                    self.copy.running = false;
-                    let seconds = self
-                        .copy
-                        .started
-                        .map_or(0.0, |started| started.elapsed().as_secs_f64());
                     self.copy.summary = Some(format!(
-                        "{} copies verified, {} failed, in {:.0} s (card done after {:.0} s)",
+                        "Last import: {} copies verified, {} failed",
                         report.verified.len(),
                         report.failures.len(),
-                        seconds,
-                        report.primary_done_after.as_secs_f64(),
                     ));
-                    if let Some(library) = &mut self.library {
-                        library.add_replicas(report.verified);
-                    }
                 }
                 Msg::Exported(result) => {
                     self.status = Some(match result {
@@ -393,11 +734,51 @@ impl IngotApp {
                         Err(err) => format!("Export failed: {err}"),
                     });
                 }
+                Msg::SweepPlanned {
+                    paths,
+                    left_in_cloud,
+                } => {
+                    self.sweep = Some(SweepDialog {
+                        paths,
+                        left_in_cloud,
+                        planning: false,
+                        running: false,
+                    });
+                }
+                Msg::SweepDone(result) => {
+                    self.sweep = None;
+                    match result {
+                        Ok(report) => {
+                            self.status = Some(format!(
+                                "{} copies moved to the Trash, {} kept",
+                                report.trashed.len(),
+                                report.failures.len()
+                            ));
+                            if let Some(library) = &mut self.library {
+                                for (path, why) in &report.failures {
+                                    library.warn(format!("{}: {why}", path.display()));
+                                }
+                                library.replicas.retain(|replica| match replica.location() {
+                                    ingot_core::ReplicaLocation::Local(path) => {
+                                        !report.trashed.contains(path)
+                                    }
+                                    ingot_core::ReplicaLocation::Remote(_) => true,
+                                });
+                            }
+                        }
+                        Err(err) => self.status = Some(err),
+                    }
+                }
             }
         }
     }
 
+    fn is_grid_view(&self) -> bool {
+        matches!(self.view, View::Grid | View::Clusters)
+    }
+
     fn run_command(&mut self, command: Command, shift: bool) {
+        let grid = self.is_grid_view();
         let Some(library) = &mut self.library else {
             if command == Command::Help {
                 self.show_help = !self.show_help;
@@ -413,23 +794,21 @@ impl IngotApp {
             Command::Unflag => library.flag(TriageState::Pending, shift),
             Command::Next => library.move_focus(1),
             Command::Previous => library.move_focus(-1),
-            Command::RowDown => library.move_focus(if self.view == View::Grid {
-                self.columns as isize
-            } else {
-                1
-            }),
-            Command::RowUp => library.move_focus(if self.view == View::Grid {
-                -(self.columns as isize)
-            } else {
-                -1
-            }),
+            Command::RowDown => library.move_focus(if grid { self.columns as isize } else { 1 }),
+            Command::RowUp => library.move_focus(if grid { -(self.columns as isize) } else { -1 }),
             Command::First => library.jump(0),
             Command::Last => library.jump(usize::MAX),
             Command::Grid => self.view = View::Grid,
             Command::Loupe => self.view = View::Loupe,
             Command::Develop => self.view = View::Develop,
+            Command::Clusters => self.view = View::Clusters,
+            Command::Tick => {
+                if let Some(index) = library.visible.get(library.focus).copied() {
+                    self.toggle_tick(index);
+                }
+            }
             Command::Zoom => {
-                if self.view == View::Grid {
+                if self.is_grid_view() {
                     self.view = View::Loupe;
                 }
                 self.zoomed = !self.zoomed;
@@ -438,7 +817,7 @@ impl IngotApp {
             Command::BeforeAfter => self.show_before = !self.show_before,
             Command::ToggleAutoAdvance => library.auto_advance = !library.auto_advance,
             Command::TogglePanels => self.show_panels = !self.show_panels,
-            Command::Import => self.import_open = true,
+            Command::Import => self.new_import(),
             Command::CopySettings => self.clipboard = Some(self.params),
             Command::PasteSettings => {
                 if let Some(pasted) = self.clipboard {
@@ -462,7 +841,8 @@ impl IngotApp {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.import_open || self.sweep.is_some() {
+        // Before an import starts there is nothing open to act on.
+        if ctx.egui_wants_keyboard_input() || self.session.is_none() || self.sweep.is_some() {
             return;
         }
         let pressed: Vec<(Key, egui::Modifiers)> = ctx.input(|input| {
@@ -646,85 +1026,51 @@ impl IngotApp {
         });
     }
 
-    fn import_plan(&self) -> Result<(ingot_core::ImportPlan, Option<ImportHistory>), String> {
-        let engine = self.engine.as_ref().ok_or("The folder is still loading.")?;
-        let source = self.source.as_ref().ok_or("No folder is open.")?;
-        let options = self.form.options()?;
-        let history = ImportHistory::open(self.paths.history.clone()).map_err(io_err)?;
-        let plan =
-            plan_import(&engine.scan_response, source, &options, Some(&history)).map_err(io_err)?;
-        Ok((plan, Some(history)))
-    }
-
-    fn start_import(&mut self) -> Result<(), String> {
-        if self.form.destination.trim().is_empty() {
-            return Err("Choose a destination folder.".to_string());
-        }
-        if self.copy.running {
-            return Err("An import is already running.".to_string());
-        }
-        let (plan, history) = self.import_plan()?;
-        let engine = self.engine.clone().ok_or("The folder is still loading.")?;
-
-        let local = |id, root: &str| -> Arc<dyn ReplicationTarget> {
-            Arc::new(LocalTarget::new(
-                TargetId(id),
-                Target {
-                    root: PathBuf::from(root.trim()),
-                    kind: TargetKind::LocalNvme,
-                    write_permits: 4,
-                },
-            ))
-        };
-        let primary = local(1, &self.form.destination);
-        let mut secondaries = vec![];
-        if !self.form.second_copy.trim().is_empty() {
-            secondaries.push(local(2, &self.form.second_copy));
-        }
-        if self.form.gdrive {
-            let credentials = DriveCredentials::load(&self.paths.gdrive).map_err(io_err)?;
-            secondaries.push(Arc::new(
-                DriveTarget::new(
-                    TargetId(DRIVE_TARGET_ID),
-                    DriveConfig::default(),
-                    credentials,
-                )
-                .map_err(io_err)?,
-            ) as Arc<dyn ReplicationTarget>);
-        }
-
-        self.copy = CopyProgress {
-            running: true,
-            total: plan.files.len() * (secondaries.len() + 1),
-            started: Some(Instant::now()),
-            ..Default::default()
-        };
-        let handle = engine.start_import(plan, primary, secondaries, history);
-        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
-        std::thread::spawn(move || {
-            for event in handle.progress.iter() {
-                let _ = tx.send(Msg::Copy(event));
-                ctx.request_repaint();
-            }
-            let _ = tx.send(Msg::CopyDone(handle.wait()));
-            ctx.request_repaint();
-        });
-        Ok(())
-    }
-
+    /// Plans in the background: it reads file state from disk and can be slow.
     fn open_sweep(&mut self) {
         let Some(library) = &self.library else {
             return;
         };
-        match plan_sweep(&library.store, &library.replicas) {
-            Ok(plan) => {
-                self.sweep = Some(SweepDialog {
+        self.sweep = Some(SweepDialog {
+            paths: vec![],
+            left_in_cloud: 0,
+            planning: true,
+            running: false,
+        });
+        let (store, replicas): (_, Vec<VerifiedReplica>) =
+            (Arc::clone(&library.store), library.replicas.clone());
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let message = match plan_sweep(&store, &replicas) {
+                Ok(plan) => Msg::SweepPlanned {
                     paths: plan.paths().iter().map(|p| p.to_path_buf()).collect(),
                     left_in_cloud: plan.left_in_cloud,
-                });
-            }
-            Err(err) => self.status = Some(err.to_string()),
+                },
+                Err(err) => Msg::SweepDone(Err(err.to_string())),
+            };
+            let _ = tx.send(message);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Hashes each file again before trashing it, so this never runs on the UI thread.
+    fn confirm_sweep(&mut self) {
+        let Some(library) = &self.library else {
+            return;
+        };
+        if let Some(dialog) = &mut self.sweep {
+            dialog.running = true;
         }
+        let (store, replicas): (_, Vec<VerifiedReplica>) =
+            (Arc::clone(&library.store), library.replicas.clone());
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let result = plan_sweep(&store, &replicas)
+                .map(|plan| execute_sweep(&plan))
+                .map_err(io_err);
+            let _ = tx.send(Msg::SweepDone(result));
+            ctx.request_repaint();
+        });
     }
 
     /// Draws one frame. Separate from `eframe::App` so tests can run it headless.
@@ -734,7 +1080,9 @@ impl IngotApp {
         self.drain_messages();
         self.images.collect(&ctx);
         self.handle_keys(&ctx);
-        self.sync_develop();
+        if self.session.is_some() {
+            self.sync_develop();
+        }
         if self.params_dirty && !ctx.input(|input| input.pointer.any_down()) {
             self.flush_params();
         }
@@ -746,17 +1094,21 @@ impl IngotApp {
         self.bottom_bar(ui);
         if self.library.is_none() {
             self.launchpad(ui);
+        } else if self.session.is_none() {
+            self.import_screen(ui);
         } else {
             if self.show_panels {
                 self.left_panel(ui);
                 self.right_panel(ui);
             }
-            if self.view != View::Grid {
+            if !self.is_grid_view() {
                 self.filmstrip(ui);
             }
             self.stage(ui);
         }
-        self.import_window(&ctx);
+        if let Some(index) = self.pending_tick.take() {
+            self.toggle_tick(index);
+        }
         self.sweep_window(&ctx);
         self.help_window(&ctx);
     }
@@ -773,30 +1125,23 @@ impl IngotApp {
                 ui.horizontal_centered(|ui| {
                     ui.label(RichText::new("INGOT").strong().color(INK).size(15.0));
                     ui.separator();
-                    if ui.button("Open folder…").clicked()
-                        && let Some(folder) = rfd::FileDialog::new().pick_folder()
-                    {
-                        self.open_folder(folder);
-                    }
-                    let can_import = self.library.is_some();
                     if ui
-                        .add_enabled(can_import, egui::Button::new("Import…"))
+                        .button("New import")
                         .on_hover_text("Cmd+Shift+I")
                         .clicked()
                     {
-                        self.import_open = true;
+                        self.new_import();
                     }
                     ui.separator();
+                    let open = self.session.is_some();
                     for (label, view, hint) in [
                         ("Grid", View::Grid, "G"),
+                        ("Clusters", View::Clusters, "L"),
                         ("Loupe", View::Loupe, "E"),
                         ("Develop", View::Develop, "D"),
                     ] {
                         if ui
-                            .add_enabled(
-                                can_import,
-                                egui::Button::selectable(self.view == view, label),
-                            )
+                            .add_enabled(open, egui::Button::selectable(self.view == view, label))
                             .on_hover_text(hint)
                             .clicked()
                         {
@@ -811,7 +1156,7 @@ impl IngotApp {
                         {
                             self.show_help = true;
                         }
-                        if let Some(library) = &self.library {
+                        if open && let Some(library) = &self.library {
                             let (total, picks, rejects) = library.counts();
                             ui.label(RichText::new(format!("{rejects} rejected")).color(REJECT));
                             ui.label(RichText::new(format!("{picks} picked")).color(ACCEPT));
@@ -822,7 +1167,11 @@ impl IngotApp {
             });
     }
 
+    /// The count and destination, on screen at all times from the moment a folder is
+    /// listed. Costs a little arithmetic per frame and never touches a disk.
     fn bottom_bar(&mut self, ui: &mut egui::Ui) {
+        let counts = self.library.as_ref().map(Library::import_counts);
+        let destination = self.destination_line(counts.unwrap_or_default());
         egui::Panel::bottom("ingest")
             .exact_size(46.0)
             .frame(
@@ -834,41 +1183,57 @@ impl IngotApp {
                 ui.horizontal_centered(|ui| {
                     if self.scanning {
                         ui.spinner();
-                        ui.label(RichText::new("Reading the folder…").color(INK_2));
-                    } else if self.library.is_some() && !self.previews_done {
-                        ui.spinner();
-                        ui.label(
-                            RichText::new(format!("Previews: {}", self.previews_ready))
-                                .color(INK_2),
-                        );
-                        ui.separator();
+                        ui.label(RichText::new("Listing the folder…").color(INK_2));
                     }
-                    if self.copy.running {
-                        let total = self.copy.total.max(1);
-                        let finished = self.copy.done + self.copy.failed;
-                        ui.add(
-                            egui::ProgressBar::new(finished as f32 / total as f32)
-                                .desired_width(220.0)
-                                .text(format!("{finished} / {total}")),
-                        );
-                        let seconds = self
-                            .copy
-                            .started
-                            .map_or(1.0, |started| started.elapsed().as_secs_f64())
-                            .max(0.001);
+                    if let Some(counts) = counts {
                         ui.label(
                             RichText::new(format!(
-                                "{:.0} MB/s",
-                                self.copy.bytes as f64 / 1e6 / seconds
+                                "{} photos, {} files, {} to import",
+                                counts.photos,
+                                counts.files,
+                                format_size(counts.bytes)
                             ))
-                            .color(INK_2),
+                            .color(INK)
+                            .strong(),
                         );
-                    } else if let Some(summary) = &self.copy.summary {
-                        ui.label(RichText::new(summary).color(if self.copy.failed > 0 {
-                            REJECT
-                        } else {
-                            ACCEPT
-                        }));
+                        if self.session.is_some() {
+                            let finished = counts.copied + counts.failed;
+                            ui.add(
+                                egui::ProgressBar::new(if counts.files == 0 {
+                                    1.0
+                                } else {
+                                    finished as f32 / counts.files as f32
+                                })
+                                .desired_width(160.0)
+                                .text(format!("{finished} / {}", counts.files)),
+                            );
+                            if counts.pending() > 0 {
+                                let seconds = self
+                                    .copy
+                                    .started
+                                    .map_or(1.0, |started| started.elapsed().as_secs_f64())
+                                    .max(0.001);
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{:.0} MB/s",
+                                        self.copy.bytes as f64 / 1e6 / seconds
+                                    ))
+                                    .color(INK_2),
+                                );
+                            } else if counts.files > 0 {
+                                ui.label(RichText::new("All copied").color(ACCEPT));
+                            }
+                            if counts.kept > 0 {
+                                ui.label(
+                                    RichText::new(format!("{} unticked, copies kept", counts.kept))
+                                        .color(INK_2),
+                                );
+                            }
+                        }
+                    }
+                    if let Some(line) = &destination {
+                        ui.separator();
+                        ui.label(RichText::new(line).color(INK_2).small());
                     }
                     if self.copy.failed > 0 {
                         let errors = self.copy.last_errors.join("\n");
@@ -882,6 +1247,13 @@ impl IngotApp {
                         ui.label(RichText::new(status).color(INK_2));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.session.is_some() && !self.previews_done {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new(format!("Previews {}", self.previews_ready))
+                                    .color(INK_3),
+                            );
+                        }
                         if self.ignored > 0 {
                             ui.label(
                                 RichText::new(format!("{} files not imported", self.ignored))
@@ -895,8 +1267,7 @@ impl IngotApp {
                                     .color(REJECT),
                             );
                         }
-                        if let Some(library) = &self.library
-                            && let Some(warning) = library.warnings.last()
+                        if let Some(warning) = self.library.as_ref().and_then(Library::last_warning)
                         {
                             ui.label(RichText::new("Warning").color(STAR))
                                 .on_hover_text(warning);
@@ -906,8 +1277,40 @@ impl IngotApp {
             });
     }
 
+    /// One example path and how many more. Instant, and works before any file is open.
+    fn destination_line(&self, counts: ImportCounts) -> Option<String> {
+        let library = self.library.as_ref()?;
+        let source = self.source.as_ref()?;
+        let (options, root) = match &self.session {
+            Some(session) => (session.options.clone(), session.destination.clone()),
+            None => {
+                let destination = self.form.destination.trim();
+                if destination.is_empty() {
+                    return Some("Choose a destination".to_string());
+                }
+                match self.form.options() {
+                    Ok(options) => (options, PathBuf::from(destination)),
+                    Err(err) => return Some(err),
+                }
+            }
+        };
+        let photo = library
+            .photos
+            .iter()
+            .find(|photo| library.ticked.contains(&photo.key))?;
+        let taken = photo.taken?;
+        let file = photo.files.first()?;
+        let relative =
+            planned_relative(file, source, &options, options.start_number, taken).ok()?;
+        let home = dirs::home_dir();
+        Some(destination_summary(
+            &root.join(relative),
+            counts.files,
+            home.as_deref(),
+        ))
+    }
+
     fn launchpad(&mut self, ui: &mut egui::Ui) {
-        let cards = find_cards(Path::new("/Volumes"));
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG))
             .show(ui, |ui| {
@@ -915,27 +1318,24 @@ impl IngotApp {
                     ui.add_space(ui.available_height() * 0.28);
                     if self.scanning {
                         ui.spinner();
-                        ui.label(RichText::new("Reading the folder…").color(INK_2));
+                        ui.label(RichText::new("Listing the folder…").color(INK_2));
                         return;
                     }
-                    ui.label(RichText::new("Start culling").size(26.0).color(INK));
+                    ui.label(RichText::new("New import").size(26.0).color(INK));
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new(
-                            "Open a card or folder. Rate photos right away while they copy.",
+                            "Pick a card or folder. Nothing is opened until you choose where it goes.",
                         )
                         .color(INK_3),
                     );
                     ui.add_space(18.0);
-                    for card in cards {
-                        if ui
-                            .button(format!("Open card: {}", card.display()))
-                            .clicked()
-                        {
+                    for card in self.cards.clone() {
+                        if ui.button(format!("Card: {}", card.display())).clicked() {
                             self.open_folder(card);
                         }
                     }
-                    if ui.button("Open folder…").clicked()
+                    if ui.button("Choose a folder…").clicked()
                         && let Some(folder) = rfd::FileDialog::new().pick_folder()
                     {
                         self.open_folder(folder);
@@ -944,7 +1344,137 @@ impl IngotApp {
             });
     }
 
+    /// Import mode: every photo by name with a tick, and where they will go. No photo
+    /// has been opened yet, so there are no thumbnails here. The photos appear as soon
+    /// as Start is pressed, and can still be ticked and unticked there.
+    fn import_screen(&mut self, ui: &mut egui::Ui) {
+        let mut start = false;
+        let counts = self
+            .library
+            .as_ref()
+            .map(Library::import_counts)
+            .unwrap_or_default();
+        egui::Panel::right("import_form")
+            .exact_size(400.0)
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(14))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.import_form(ui);
+                    ui.add_space(12.0);
+                    if let Some(error) = &self.form.error {
+                        ui.label(RichText::new(error).color(REJECT));
+                    }
+                    let ready = !self.form.destination.trim().is_empty() && counts.files > 0;
+                    let label = format!("Start: copy {} photos and cull", counts.photos);
+                    if ui
+                        .add_enabled(
+                            ready,
+                            egui::Button::new(RichText::new(label).color(Color32::WHITE))
+                                .fill(ACCENT),
+                        )
+                        .on_disabled_hover_text("Choose a destination and tick at least one photo.")
+                        .clicked()
+                    {
+                        start = true;
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Copying starts the moment the card is first read. You can cull, and change the ticks, while it runs.",
+                        )
+                        .color(INK_3)
+                        .small(),
+                    );
+                });
+            });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(STAGE).inner_margin(10))
+            .show(ui, |ui| {
+                // Truncated: a long path must not widen this panel over the form.
+                if let Some(source) = &self.source {
+                    ui.add(
+                        egui::Label::new(RichText::new(source.display().to_string()).color(INK_2))
+                            .truncate(),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Select all").clicked() {
+                        self.tick_all();
+                    }
+                    if ui.button("Select none").clicked() {
+                        self.tick_none();
+                    }
+                });
+                ui.add_space(6.0);
+                self.name_list(ui);
+            });
+        if start {
+            match self.start_session() {
+                Ok(()) => self.form.error = None,
+                Err(err) => self.form.error = Some(err),
+            }
+        }
+    }
+
+    fn name_list(&mut self, ui: &mut egui::Ui) {
+        let Some(library) = &self.library else {
+            return;
+        };
+        let count = library.photos.len();
+        if count == 0 {
+            ui.label(RichText::new("No photos in this folder.").color(INK_3));
+            return;
+        }
+        let cell = 240.0;
+        let columns = ((ui.available_width() / cell) as usize).max(1);
+        let rows = count.div_ceil(columns);
+        let mut toggled = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show_rows(ui, 22.0, rows, |ui, range| {
+                for row in range {
+                    ui.horizontal(|ui| {
+                        for column in 0..columns {
+                            let index = row * columns + column;
+                            let Some(photo) = library.photos.get(index) else {
+                                break;
+                            };
+                            let mut ticked = library.ticked.contains(&photo.key);
+                            let already = library.already_imported.contains(&photo.key);
+                            ui.allocate_ui(Vec2::new(cell - 8.0, 20.0), |ui| {
+                                ui.set_width(cell - 8.0);
+                                let label = RichText::new(format!(
+                                    "{}{}  {}",
+                                    photo.name,
+                                    if photo.raw.is_some() && photo.has_jpeg {
+                                        " + JPG"
+                                    } else {
+                                        ""
+                                    },
+                                    format_size(photo.size)
+                                ))
+                                .color(if already { INK_3 } else { INK_2 })
+                                .small();
+                                let response = ui.checkbox(&mut ticked, label);
+                                if already {
+                                    response.clone().on_hover_text("Already imported");
+                                }
+                                if response.changed() {
+                                    toggled = Some(index);
+                                }
+                            });
+                        }
+                    });
+                }
+            });
+        if let Some(index) = toggled {
+            self.toggle_tick(index);
+        }
+    }
+
     fn left_panel(&mut self, ui: &mut egui::Ui) {
+        let mut sweep = false;
+        let (mut all, mut none) = (false, false);
         let Some(library) = &mut self.library else {
             return;
         };
@@ -961,10 +1491,23 @@ impl IngotApp {
                     );
                 }
                 ui.add_space(12.0);
+                section(ui, "IMPORT");
+                ui.horizontal(|ui| {
+                    all = ui.button("All").clicked();
+                    none = ui.button("None").clicked();
+                });
+                ui.label(
+                    RichText::new("T ticks the current photo")
+                        .color(INK_3)
+                        .small(),
+                );
+                ui.add_space(12.0);
                 section(ui, "SHOW");
                 let current = library.filter;
                 for (label, filter) in [
                     ("All photos", Filter::All),
+                    ("Ticked", Filter::Ticked),
+                    ("Not ticked", Filter::NotTicked),
                     ("Picked", Filter::Picked),
                     ("Rejected", Filter::Rejected),
                     ("Unflagged", Filter::Unflagged),
@@ -980,32 +1523,28 @@ impl IngotApp {
                 section(ui, "CULLING");
                 ui.checkbox(&mut library.auto_advance, "Move on after a flag")
                     .on_hover_text("A");
-                if self.view == View::Grid {
+                if matches!(self.view, View::Grid | View::Clusters) {
                     ui.add_space(8.0);
                     ui.label(RichText::new("Thumbnail size").color(INK_3).small());
                     ui.add(egui::Slider::new(&mut self.cell, 110.0..=420.0).show_value(false));
                 }
                 ui.add_space(12.0);
                 section(ui, "CLEAN UP");
-                if ui
+                sweep = ui
                     .add_enabled(
                         !library.replicas.is_empty(),
                         egui::Button::new("Trash rejected copies…"),
                     )
-                    .on_disabled_hover_text("Available after an import in this session.")
-                    .clicked()
-                {
-                    self.sweep = Some(SweepDialog {
-                        paths: vec![],
-                        left_in_cloud: usize::MAX,
-                    });
-                }
+                    .on_disabled_hover_text("Available once something has been copied.")
+                    .clicked();
             });
-        if self
-            .sweep
-            .as_ref()
-            .is_some_and(|s| s.left_in_cloud == usize::MAX)
-        {
+        if all {
+            self.tick_all();
+        }
+        if none {
+            self.tick_none();
+        }
+        if sweep {
             self.open_sweep();
         }
     }
@@ -1049,7 +1588,7 @@ impl IngotApp {
         if photo.raw.is_some() && photo.has_jpeg {
             ui.label(RichText::new("RAW + JPEG").color(INK_3).small());
         }
-        if let Some(taken) = photo.taken {
+        if let Some(taken) = photo.captured.or(photo.taken) {
             ui.label(
                 RichText::new(taken.format("%Y-%m-%d %H:%M:%S").to_string())
                     .color(INK_2)
@@ -1185,6 +1724,7 @@ impl IngotApp {
             .frame(egui::Frame::new().fill(STAGE))
             .show(ui, |ui| match self.view {
                 View::Grid => self.grid(ui),
+                View::Clusters => self.clusters_view(ui),
                 View::Loupe => self.loupe(ui),
                 View::Develop => self.develop_stage(ui),
             });
@@ -1316,6 +1856,8 @@ impl IngotApp {
         let photo = library.photos[index].clone();
         let focused = library.focus == position;
         let (rating, state) = library.decisions(&photo.key);
+        let ticked = library.ticked.contains(&photo.key);
+        let copied = library.photo_copied(&photo);
         let texture = self.texture_for(&photo, false);
 
         let painter = ui.painter_at(rect);
@@ -1326,12 +1868,35 @@ impl IngotApp {
             rect.max - Vec2::new(4.0, 4.0 + label_height),
         );
         if let Some(texture) = texture {
-            let tint = if state == TriageState::Rejected {
+            let tint = if state == TriageState::Rejected || !ticked {
                 Color32::from_gray(90)
             } else {
                 Color32::WHITE
             };
             draw_fit(&painter, &texture, image_area, tint);
+        }
+        if copied {
+            painter.text(
+                image_area.left_bottom() + Vec2::new(4.0, -4.0),
+                Align2::LEFT_BOTTOM,
+                if ticked { "copied" } else { "copy kept" },
+                FontId::proportional(10.0),
+                ACCEPT,
+            );
+        }
+        // On top of the cell, so a click here ticks rather than selects.
+        let tick_rect = Rect::from_center_size(
+            Pos2::new(rect.max.x - 12.0, rect.min.y + 12.0),
+            Vec2::splat(16.0),
+        );
+        paint_tick(&painter, tick_rect, ticked);
+        let tick = ui.interact(
+            tick_rect.expand(3.0),
+            ui.scope_id().with(("tick", index)),
+            Sense::click(),
+        );
+        if tick.on_hover_text("Import this photo (T)").clicked() {
+            self.pending_tick = Some(index);
         }
         painter.text(
             Pos2::new(rect.min.x + 6.0, rect.max.y - 5.0),
@@ -1347,8 +1912,10 @@ impl IngotApp {
             } else {
                 rect.max.y - 11.0
             };
+            // Stars on top sit to the left of the tick box.
+            let right = if width < 150.0 { 26.0 } else { 0.0 };
             for star in 0..rating {
-                let center = Pos2::new(rect.max.x - 10.0 - star as f32 * 12.0, y);
+                let center = Pos2::new(rect.max.x - 10.0 - right - star as f32 * 12.0, y);
                 paint_star(&painter, center, 5.5, STAR);
             }
         }
@@ -1369,6 +1936,218 @@ impl IngotApp {
             );
         }
         response
+    }
+
+    /// Groups of similar photos, with the sensitivity slider. Positions are the same
+    /// as in the grid because groups run in capture order, so all the culling keys and
+    /// the rest of the app behave identically here.
+    fn clusters_view(&mut self, ui: &mut egui::Ui) {
+        let Some(library) = &mut self.library else {
+            return;
+        };
+        let mut sensitivity = library.sensitivity;
+        let ranges = library.clusters().to_vec();
+        let hashed = library.fingerprint_count();
+        let total_photos = library.photos.len();
+        let groups: Vec<std::ops::Range<usize>> = ranges
+            .iter()
+            .map(|range| {
+                let start = library.visible.partition_point(|i| *i < range.start);
+                let end = library.visible.partition_point(|i| *i < range.end);
+                start..end
+            })
+            .filter(|group| !group.is_empty())
+            .collect();
+        let visible = library.visible.len();
+        let focus = library.focus;
+
+        egui::Frame::new()
+            .fill(PANEL_2)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{} groups", groups.len()))
+                            .color(INK)
+                            .strong(),
+                    );
+                    ui.label(RichText::new(format!("from {visible} photos")).color(INK_3));
+                    if hashed < total_photos {
+                        ui.label(
+                            RichText::new(format!("{hashed} of {total_photos} analyzed"))
+                                .color(INK_3)
+                                .small(),
+                        );
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Sensitivity").color(INK_2));
+                    ui.label(RichText::new("scene only").color(INK_3).small());
+                    let response = ui.add(
+                        egui::Slider::new(&mut sensitivity, 0.0..=100.0)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    );
+                    ui.label(RichText::new("+ subject position").color(INK_3).small());
+                    ui.label(RichText::new(format!("{sensitivity:.0}")).color(ACCENT));
+                    if response.double_clicked() {
+                        sensitivity = DEFAULT_SENSITIVITY;
+                    }
+                });
+            });
+        if let Some(library) = &mut self.library
+            && library.sensitivity != sensitivity
+        {
+            library.set_sensitivity(sensitivity);
+        }
+        if groups.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new("No photos match this filter.").color(INK_3));
+            });
+            return;
+        }
+
+        let spacing = 8.0;
+        let header = 30.0;
+        let width = ui.available_width() - 16.0;
+        let columns = (((width + spacing) / (self.cell + spacing)) as usize).max(1);
+        self.columns = columns;
+        let cell = (width - spacing * (columns - 1) as f32) / columns as f32;
+        let row_height = cell * 0.78 + spacing;
+
+        // Where each group starts, so only what is on screen gets drawn.
+        let mut tops = Vec::with_capacity(groups.len());
+        let mut total = 0.0;
+        for group in &groups {
+            tops.push(total);
+            total += header + group.len().div_ceil(columns) as f32 * row_height + spacing;
+        }
+
+        let mut area = egui::ScrollArea::vertical().auto_shrink(false);
+        if self.scroll_to_focus {
+            if let Some(index) = groups.iter().position(|group| group.contains(&focus)) {
+                let row = (focus - groups[index].start) / columns;
+                let y = tops[index] + header + row as f32 * row_height;
+                area = area.vertical_scroll_offset(
+                    (y + row_height / 2.0 - ui.available_height() / 2.0).max(0.0),
+                );
+            }
+            self.scroll_to_focus = false;
+        }
+
+        let (mut clicked, mut opened) = (None, None);
+        area.show_viewport(ui, |ui, viewport| {
+            let origin = ui.max_rect().min;
+            ui.allocate_rect(
+                Rect::from_min_size(origin, Vec2::new(width, total)),
+                Sense::hover(),
+            );
+            ui.spacing_mut().item_spacing = Vec2::splat(spacing);
+            for (number, group) in groups.iter().enumerate() {
+                let top = tops[number];
+                let height = header + group.len().div_ceil(columns) as f32 * row_height;
+                if top > viewport.max.y || top + height < viewport.min.y {
+                    continue;
+                }
+                self.cluster_header(ui, origin + Vec2::new(8.0, top), width, number, group);
+                let rows = group.len().div_ceil(columns);
+                for row in 0..rows {
+                    let y = top + header + row as f32 * row_height;
+                    if y > viewport.max.y || y + row_height < viewport.min.y {
+                        continue;
+                    }
+                    let rect = Rect::from_min_size(
+                        origin + Vec2::new(8.0, y),
+                        Vec2::new(width, row_height),
+                    );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                        ui.horizontal(|ui| {
+                            for column in 0..columns {
+                                let position = group.start + row * columns + column;
+                                if position >= group.end {
+                                    break;
+                                }
+                                let Some(index) = self
+                                    .library
+                                    .as_ref()
+                                    .and_then(|library| library.visible.get(position).copied())
+                                else {
+                                    break;
+                                };
+                                let response =
+                                    self.grid_cell(ui, index, position, cell, row_height - spacing);
+                                if response.double_clicked() {
+                                    opened = Some(position);
+                                } else if response.clicked() {
+                                    clicked = Some(position);
+                                }
+                            }
+                        });
+                    });
+                }
+            }
+        });
+        if let Some(library) = &mut self.library {
+            if let Some(position) = clicked {
+                library.jump(position);
+            }
+            if let Some(position) = opened {
+                library.jump(position);
+                self.view = View::Loupe;
+            }
+        }
+    }
+
+    fn cluster_header(
+        &self,
+        ui: &egui::Ui,
+        top_left: Pos2,
+        width: f32,
+        number: usize,
+        group: &std::ops::Range<usize>,
+    ) {
+        let Some(library) = &self.library else {
+            return;
+        };
+        let first = &library.photos[library.visible[group.start]];
+        let picks = group
+            .clone()
+            .filter(|position| {
+                let photo = &library.photos[library.visible[*position]];
+                library.decisions(&photo.key).1 == TriageState::Accepted
+            })
+            .count();
+        let when = first
+            .captured
+            .or(first.taken)
+            .map(|taken| taken.format("%H:%M:%S").to_string())
+            .unwrap_or_default();
+        let painter = ui.painter();
+        let y = top_left.y + 14.0;
+        painter.circle_filled(
+            Pos2::new(top_left.x + 6.0, y),
+            5.0,
+            CLUSTER_COLORS[number % CLUSTER_COLORS.len()],
+        );
+        painter.text(
+            Pos2::new(top_left.x + 18.0, y),
+            Align2::LEFT_CENTER,
+            format!("{when}  {}", first.name),
+            FontId::proportional(13.0),
+            INK,
+        );
+        painter.text(
+            Pos2::new(top_left.x + width - 8.0, y),
+            Align2::RIGHT_CENTER,
+            format!(
+                "{} {}   {picks} {}",
+                group.len(),
+                if group.len() == 1 { "frame" } else { "frames" },
+                if picks == 1 { "pick" } else { "picks" },
+            ),
+            FontId::proportional(11.0),
+            INK_3,
+        );
     }
 
     fn loupe(&mut self, ui: &mut egui::Ui) {
@@ -1551,166 +2330,104 @@ impl IngotApp {
         }
     }
 
-    fn import_window(&mut self, ctx: &egui::Context) {
-        if !self.import_open {
-            return;
-        }
-        let mut open = true;
-        let mut start = false;
-        let mut preview = false;
-        let credentials_exist = self.paths.gdrive.exists();
-        egui::Window::new("Import")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(520.0)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                let form = &mut self.form;
-                if let Some(source) = &self.source {
-                    ui.label(RichText::new(format!("From  {}", source.display())).color(INK_2));
-                }
-                ui.add_space(6.0);
-                section(ui, "DESTINATION");
-                folder_field(ui, "To", &mut form.destination);
-                ui.horizontal(|ui| {
-                    ui.label("Into subfolder");
-                    ui.text_edit_singleline(&mut form.subfolder);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Organize");
-                    egui::ComboBox::from_id_salt("organize")
-                        .selected_text(
-                            ["Into one folder", "By original folders", "By date"][form.organize],
-                        )
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut form.organize, 0, "Into one folder");
-                            ui.selectable_value(&mut form.organize, 1, "By original folders");
-                            ui.selectable_value(&mut form.organize, 2, "By date");
-                        });
-                });
-                if form.organize == 2 {
-                    ui.horizontal(|ui| {
-                        ui.label("Date format");
-                        egui::ComboBox::from_id_salt("date_format")
-                            .selected_text(form.date_format.clone())
-                            .show_ui(ui, |ui| {
-                                for format in [
-                                    DateFolders::YEAR_DATE,
-                                    DateFolders::YEAR_MONTH_DAY,
-                                    DateFolders::YEAR_MONTHDAY,
-                                    DateFolders::YEAR_MONTH_NAME_DAY,
-                                    DateFolders::DATE,
-                                    DateFolders::COMPACT,
-                                ] {
-                                    ui.selectable_value(
-                                        &mut form.date_format,
-                                        format.to_string(),
-                                        format,
-                                    );
-                                }
-                            });
-                    });
-                }
-                ui.add_space(6.0);
-                section(ui, "FILE RENAMING");
-                ui.checkbox(&mut form.rename, "Rename files");
-                if form.rename {
-                    ui.horizontal(|ui| {
-                        ui.label("Template");
-                        ui.text_edit_singleline(&mut form.template);
-                    });
-                    ui.label(
-                        RichText::new("{name} {folder} {custom} {filenum} {seq:4} {date:%Y%m%d}")
-                            .color(INK_3)
-                            .small(),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label("Custom text");
-                        ui.text_edit_singleline(&mut form.custom_text);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Start number");
-                        ui.add(egui::DragValue::new(&mut form.start_number).range(0..=9_999_999));
-                    });
-                }
-                ui.horizontal(|ui| {
-                    ui.label("Extensions");
-                    for (label, case) in [
-                        ("As is", ExtensionCase::AsIs),
-                        ("lower", ExtensionCase::Lower),
-                        ("UPPER", ExtensionCase::Upper),
-                    ] {
-                        ui.selectable_value(&mut form.extensions, case, label);
-                    }
-                });
-                ui.add_space(6.0);
-                section(ui, "FILE HANDLING");
-                ui.checkbox(&mut form.only_new, "Don't import suspected duplicates");
-                folder_field(ui, "Second copy to", &mut form.second_copy);
-                ui.add_enabled(
-                    credentials_exist,
-                    egui::Checkbox::new(
-                        &mut form.gdrive,
-                        format!("Back up to Google Drive ({DRIVE_ROOT_FOLDER})"),
-                    ),
-                )
-                .on_disabled_hover_text("Run `ingot gdrive-login` first.");
-                ui.add_space(8.0);
-                if let Some(error) = &form.error {
-                    ui.label(RichText::new(error).color(REJECT));
-                }
-                for line in &form.previewed {
-                    ui.label(RichText::new(line).color(INK_2).small());
-                }
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Show where files go").clicked() {
-                        preview = true;
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("Import").color(Color32::WHITE))
-                                .fill(ACCENT),
-                        )
-                        .clicked()
-                    {
-                        start = true;
-                    }
-                });
+    /// The options chosen before anything is opened.
+    fn import_form(&mut self, ui: &mut egui::Ui) {
+        let credentials_exist = self.gdrive_available;
+        let form = &mut self.form;
+        section(ui, "DESTINATION");
+        folder_field(ui, "To", &mut form.destination);
+        ui.horizontal(|ui| {
+            let label = ui.label("Into subfolder");
+            ui.add(egui::TextEdit::singleline(&mut form.subfolder).desired_width(220.0))
+                .labelled_by(label.id);
+        });
+        ui.horizontal(|ui| {
+            let label = ui.label("Organize");
+            egui::ComboBox::from_id_salt("organize")
+                .selected_text(["Into one folder", "By original folders", "By date"][form.organize])
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut form.organize, 0, "Into one folder");
+                    ui.selectable_value(&mut form.organize, 1, "By original folders");
+                    ui.selectable_value(&mut form.organize, 2, "By date");
+                })
+                .response
+                .labelled_by(label.id);
+        });
+        if form.organize == 2 {
+            ui.horizontal(|ui| {
+                let label = ui.label("Date format");
+                egui::ComboBox::from_id_salt("date_format")
+                    .selected_text(form.date_format.clone())
+                    .show_ui(ui, |ui| {
+                        for format in [
+                            DateFolders::YEAR_DATE,
+                            DateFolders::YEAR_MONTH_DAY,
+                            DateFolders::YEAR_MONTHDAY,
+                            DateFolders::YEAR_MONTH_NAME_DAY,
+                            DateFolders::DATE,
+                            DateFolders::COMPACT,
+                        ] {
+                            ui.selectable_value(&mut form.date_format, format.to_string(), format);
+                        }
+                    })
+                    .response
+                    .labelled_by(label.id);
             });
-        if preview {
-            match self.import_plan() {
-                Ok((plan, _)) => {
-                    let mut lines: Vec<String> = plan
-                        .files
-                        .iter()
-                        .take(6)
-                        .map(|file| file.relative.display().to_string())
-                        .collect();
-                    lines.push(format!(
-                        "{} files, {} already imported, {} can't be planned",
-                        plan.files.len(),
-                        plan.skipped_duplicates.len(),
-                        plan.failures.len()
-                    ));
-                    self.form.previewed = lines;
-                    self.form.error = None;
-                }
-                Err(err) => self.form.error = Some(err),
-            }
         }
-        if start {
-            match self.start_import() {
-                Ok(()) => {
-                    self.form.error = None;
-                    self.import_open = false;
-                }
-                Err(err) => self.form.error = Some(err),
-            }
+        ui.add_space(8.0);
+        section(ui, "FILE RENAMING");
+        ui.checkbox(&mut form.rename, "Rename files");
+        if form.rename {
+            ui.horizontal(|ui| {
+                let label = ui.label("Template");
+                ui.text_edit_singleline(&mut form.template)
+                    .labelled_by(label.id);
+            });
+            ui.label(
+                RichText::new("{name} {folder} {custom} {filenum} {seq:4} {date:%Y%m%d}")
+                    .color(INK_3)
+                    .small(),
+            );
+            ui.horizontal(|ui| {
+                let label = ui.label("Custom text");
+                ui.text_edit_singleline(&mut form.custom_text)
+                    .labelled_by(label.id);
+            });
+            ui.horizontal(|ui| {
+                let label = ui.label("Start number");
+                ui.add(egui::DragValue::new(&mut form.start_number).range(0..=9_999_999))
+                    .labelled_by(label.id);
+            });
         }
-        if !open {
-            self.import_open = false;
+        ui.horizontal(|ui| {
+            ui.label("Extensions");
+            for (label, case) in [
+                ("As is", ExtensionCase::AsIs),
+                ("lower", ExtensionCase::Lower),
+                ("UPPER", ExtensionCase::Upper),
+            ] {
+                ui.selectable_value(&mut form.extensions, case, label);
+            }
+        });
+        ui.add_space(8.0);
+        section(ui, "FILE HANDLING");
+        let only_new_changed = ui
+            .checkbox(&mut form.only_new, "Don't import suspected duplicates")
+            .changed();
+        folder_field(ui, "Second copy to", &mut form.second_copy);
+        ui.add_enabled(
+            credentials_exist,
+            egui::Checkbox::new(
+                &mut form.gdrive,
+                format!("Back up to Google Drive ({DRIVE_ROOT_FOLDER})"),
+            ),
+        )
+        .on_disabled_hover_text("Run `ingot gdrive-login` first.");
+        if only_new_changed {
+            let only_new = form.only_new;
+            if let Some(library) = &mut self.library {
+                library.tick_all(only_new);
+            }
         }
     }
 
@@ -1725,6 +2442,11 @@ impl IngotApp {
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
+                if dialog.planning {
+                    ui.spinner();
+                    ui.label(RichText::new("Checking the copies…").color(INK_2));
+                    return;
+                }
                 ui.label(format!("{} copies go to the Trash:", dialog.paths.len()));
                 egui::ScrollArea::vertical()
                     .max_height(240.0)
@@ -1760,7 +2482,7 @@ impl IngotApp {
                     }
                     if ui
                         .add_enabled(
-                            !dialog.paths.is_empty(),
+                            !dialog.paths.is_empty() && !dialog.running,
                             egui::Button::new(RichText::new("Move to Trash").color(Color32::WHITE))
                                 .fill(REJECT),
                         )
@@ -1770,32 +2492,8 @@ impl IngotApp {
                     }
                 });
             });
-        if confirm && let Some(library) = &mut self.library {
-            let outcome = match plan_sweep(&library.store, &library.replicas) {
-                Ok(plan) => Ok(execute_sweep(&plan)),
-                Err(err) => Err(err.to_string()),
-            };
-            match outcome {
-                Ok(report) => {
-                    self.status = Some(format!(
-                        "{} copies moved to the Trash, {} kept",
-                        report.trashed.len(),
-                        report.failures.len()
-                    ));
-                    library.warnings.extend(
-                        report
-                            .failures
-                            .iter()
-                            .map(|(path, why)| format!("{}: {why}", path.display())),
-                    );
-                    library.replicas.retain(|replica| match replica.location() {
-                        ingot_core::ReplicaLocation::Local(path) => !report.trashed.contains(path),
-                        ingot_core::ReplicaLocation::Remote(_) => true,
-                    });
-                }
-                Err(err) => self.status = Some(err),
-            }
-            close = true;
+        if confirm {
+            self.confirm_sweep();
         }
         if close {
             self.sweep = None;
@@ -1823,10 +2521,12 @@ impl IngotApp {
                         ("G", "Grid"),
                         ("E or Enter", "Loupe"),
                         ("D", "Develop"),
+                        ("L", "Clusters"),
+                        ("T", "Tick or untick for import"),
                         ("Z", "Zoom to 1:1"),
                         ("\\", "Before and after"),
                         ("Cmd+Shift+C / V", "Copy / paste develop settings"),
-                        ("Cmd+Shift+I", "Import"),
+                        ("Cmd+Shift+I", "New import"),
                         ("Tab", "Hide panels"),
                         ("Esc", "Back"),
                         ("/", "This list"),
@@ -1846,6 +2546,87 @@ impl IngotApp {
 impl eframe::App for IngotApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.show(ui);
+    }
+}
+
+/// Watches for cards in the background: a stat on a slow or sleeping volume must not
+/// hold up a frame. Reports only changes.
+fn spawn_environment_thread(gdrive: PathBuf, tx: mpsc::Sender<Msg>, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        let mut last = None;
+        loop {
+            let now = (find_cards(Path::new("/Volumes")), gdrive.exists());
+            if last.as_ref() != Some(&now) {
+                let message = Msg::Environment {
+                    cards: now.0.clone(),
+                    gdrive: now.1,
+                };
+                if tx.send(message).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+                last = Some(now);
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
+}
+
+/// Fingerprints images already in memory, so clustering never adds a card read.
+fn spawn_hash_thread(
+    tx: mpsc::Sender<Msg>,
+    ctx: egui::Context,
+) -> mpsc::Sender<(AssetKey, Vec<u8>, bool)> {
+    let (jobs, rx) = mpsc::channel::<(AssetKey, Vec<u8>, bool)>();
+    std::thread::spawn(move || {
+        for (key, bytes, from_thumb) in rx {
+            let Ok(image) = preview::decompress(&bytes, 64) else {
+                continue;
+            };
+            let Some(print) = Fingerprint::from_rgb(&image.pixels, image.width, image.height)
+            else {
+                continue;
+            };
+            if tx.send(Msg::Hashed(key, print, from_thumb)).is_err() {
+                return;
+            }
+            ctx.request_repaint();
+        }
+    });
+    jobs
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1e9)
+    } else {
+        format!("{:.0} MB", bytes as f64 / 1e6)
+    }
+}
+
+/// A short form of where the files go: `~/Photos/2026/IMG_1.CR2 … (879 files)`. Long
+/// paths lose their middle, since the start and the end are what you recognise.
+fn destination_summary(example: &Path, files: usize, home: Option<&Path>) -> String {
+    const LONGEST: usize = 64;
+    let mut path = match home.and_then(|home| example.strip_prefix(home).ok()) {
+        Some(inside) => format!("~/{}", inside.display()),
+        None => example.display().to_string(),
+    };
+    if path.chars().count() > LONGEST {
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() > 4 {
+            path = format!(
+                "{}/{}/…/{}/{}",
+                parts[0],
+                parts[1],
+                parts[parts.len() - 2],
+                parts[parts.len() - 1]
+            );
+        }
+    }
+    match files {
+        0 | 1 => path,
+        _ => format!("{path} … ({files} files)"),
     }
 }
 
@@ -1910,8 +2691,9 @@ fn slider(
 
 fn folder_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.horizontal(|ui| {
-        ui.label(label);
-        ui.add(egui::TextEdit::singleline(value).desired_width(300.0));
+        let label = ui.label(label);
+        ui.add(egui::TextEdit::singleline(value).desired_width(180.0))
+            .labelled_by(label.id);
         if ui.button("Choose…").clicked()
             && let Some(folder) = rfd::FileDialog::new().pick_folder()
         {
@@ -1959,6 +2741,20 @@ fn paint_star(painter: &egui::Painter, center: Pos2, radius: f32, color: Color32
             color,
             Stroke::NONE,
         ));
+    }
+}
+
+fn paint_tick(painter: &egui::Painter, rect: Rect, ticked: bool) {
+    let radius = CornerRadius::same(3);
+    if ticked {
+        painter.rect_filled(rect, radius, ACCENT);
+        let stroke = Stroke::new(2.0, Color32::WHITE);
+        let at = |x: f32, y: f32| rect.min + Vec2::new(x, y) * rect.width();
+        painter.line_segment([at(0.22, 0.52), at(0.42, 0.72)], stroke);
+        painter.line_segment([at(0.42, 0.72), at(0.78, 0.30)], stroke);
+    } else {
+        painter.rect_filled(rect, radius, Color32::from_black_alpha(140));
+        painter.rect_stroke(rect, radius, Stroke::new(1.5, INK_2), StrokeKind::Inside);
     }
 }
 
@@ -2040,19 +2836,219 @@ mod tests {
             .build_ui_state(|ui, app: &mut IngotApp| app.show(ui), app)
     }
 
+    /// A harness on the import screen, with the folder listed.
+    fn listed(tmp: &TempDir) -> Harness<'static, IngotApp> {
+        let mut harness = harness(tmp, Some(fixture()));
+        wait_until(&mut harness, "listing", |app| app.library.is_some());
+        harness
+    }
+
+    fn start(harness: &mut Harness<'static, IngotApp>, dest: &Path) {
+        harness.state_mut().form.destination = dest.display().to_string();
+        harness.state_mut().start_session().unwrap();
+        harness.step();
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .filter(|name| !name.ends_with(".tmp"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn index_named(harness: &Harness<'static, IngotApp>, name: &str) -> usize {
+        let library = harness.state().library.as_ref().unwrap();
+        library.photos.iter().position(|p| p.name == name).unwrap()
+    }
+
     #[test]
-    fn launchpad_appears_with_no_folder() {
+    fn the_first_screen_asks_for_a_source() {
         let tmp = tempfile::tempdir().unwrap();
         let mut harness = harness(&tmp, None);
         harness.step();
-        harness.get_by_label("Start culling");
+        harness.get_by_label_contains("Pick a card or folder");
+    }
+
+    #[test]
+    fn no_photo_is_opened_until_a_destination_is_chosen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut harness = listed(&tmp);
+        for _ in 0..20 {
+            harness.step();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        {
+            let app = harness.state();
+            let library = app.library.as_ref().unwrap();
+            assert_eq!(library.photos.len(), 3);
+            // Names and sizes are known, and not one byte of a photo has been read.
+            assert_eq!(library.import_counts().files, 4);
+            assert!(library.import_counts().bytes > 1_000_000);
+            let scan = library.store.read().unwrap();
+            assert!(scan.assets.values().all(|asset| {
+                asset.exif_data.captured_at.is_none()
+                    && asset.exif_data.thumbnail.is_none()
+                    && asset.image_data.thumb.is_none()
+            }));
+            assert_eq!(library.fingerprint_count(), 0);
+        }
+
+        // Keys do nothing yet, and a missing destination stops the start.
+        harness.key_press(Key::E);
+        harness.step();
+        assert_eq!(harness.state().view, View::Grid);
+        assert!(harness.state_mut().start_session().is_err());
+        assert!(harness.state().session.is_none());
+    }
+
+    #[test]
+    fn the_count_and_destination_are_on_screen_before_starting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut harness = listed(&tmp);
+        harness.state_mut().form.destination = "/Volumes/Photos".to_string();
+        harness.state_mut().form.subfolder = "Wedding".to_string();
+        harness.step();
+        harness.step();
+
+        let line = {
+            let app = harness.state();
+            let counts = app.library.as_ref().unwrap().import_counts();
+            app.destination_line(counts).unwrap()
+        };
+        assert!(line.starts_with("/Volumes/Photos/Wedding/"), "{line}");
+        assert!(line.ends_with("… (4 files)"), "{line}");
+        harness.get_by_label_contains("3 photos, 4 files");
+        harness.get_by_label_contains(&line);
+    }
+
+    #[test]
+    fn only_ticked_photos_are_copied_and_ticks_can_change_during_the_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("photos");
+        let mut harness = listed(&tmp);
+
+        // Unticked in import mode, before anything has been read.
+        let cows = index_named(&harness, "IMG_1868.JPG");
+        harness.state_mut().toggle_tick(cows);
+        assert_eq!(
+            harness
+                .state()
+                .library
+                .as_ref()
+                .unwrap()
+                .import_counts()
+                .photos,
+            2
+        );
+
+        start(&mut harness, &dest);
+        wait_until(&mut harness, "the ticked files", |app| {
+            let counts = app.library.as_ref().unwrap().import_counts();
+            counts.files > 0 && counts.pending() == 0
+        });
+        assert_eq!(
+            files_in(&dest),
+            ["IMG_1800.CR2", "IMG_1800.JPG", "IMG_1939.CR2"]
+        );
+        assert_eq!(harness.state().copy.failed, 0);
+
+        // Ticked after the queue has drained, and it still comes in.
+        harness.state_mut().toggle_tick(cows);
+        wait_until(&mut harness, "the file ticked later", |app| {
+            app.library.as_ref().unwrap().import_counts().pending() == 0
+        });
+        assert_eq!(files_in(&dest).len(), 4);
+
+        // Unticked after copying: the copy stays, and the app says so.
+        let person = index_named(&harness, "IMG_1939.CR2");
+        harness.state_mut().toggle_tick(person);
+        let counts = harness.state().library.as_ref().unwrap().import_counts();
+        assert_eq!(counts.kept, 1);
+        assert_eq!(counts.photos, 2);
+        assert!(harness.state().status.as_ref().unwrap().contains("stays"));
+        assert_eq!(files_in(&dest).len(), 4);
+
+        // Ticked again: nothing is copied twice.
+        harness.state_mut().toggle_tick(person);
+        assert_eq!(files_in(&dest).len(), 4);
+    }
+
+    #[test]
+    fn select_none_then_all_works_during_the_import_screen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut harness = listed(&tmp);
+        harness.state_mut().tick_none();
+        assert_eq!(
+            harness
+                .state()
+                .library
+                .as_ref()
+                .unwrap()
+                .import_counts()
+                .files,
+            0
+        );
+        harness.state_mut().tick_all();
+        assert_eq!(
+            harness
+                .state()
+                .library
+                .as_ref()
+                .unwrap()
+                .import_counts()
+                .files,
+            4
+        );
+    }
+
+    #[test]
+    fn a_second_import_leaves_what_was_imported_unticked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("photos");
+        let mut harness = listed(&tmp);
+        start(&mut harness, &dest);
+        wait_until(&mut harness, "first import", |app| {
+            app.library.as_ref().unwrap().import_counts().pending() == 0
+        });
+        // The history is written just after the proof reaches the app.
+        std::thread::sleep(Duration::from_millis(200));
+
+        harness.state_mut().new_import();
+        assert!(harness.state().library.is_none());
+        harness.state_mut().open_folder(fixture());
+        wait_until(&mut harness, "second listing", |app| app.library.is_some());
+
+        let library = harness.state().library.as_ref().unwrap();
+        assert_eq!(library.already_imported.len(), 3);
+        assert_eq!(library.import_counts().photos, 0);
+    }
+
+    #[test]
+    fn a_new_import_is_refused_while_files_are_still_copying() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("photos");
+        let mut harness = listed(&tmp);
+        start(&mut harness, &dest);
+        // Files have been queued this very frame, so they can't all be verified yet.
+        harness.state_mut().new_import();
+        assert!(harness.state().session.is_some());
+        assert!(harness.state().status.is_some());
     }
 
     #[test]
     fn culling_works_while_previews_arrive_and_develop_renders() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut harness = harness(&tmp, Some(fixture()));
-        wait_until(&mut harness, "library", |app| app.library.is_some());
+        let dest = tmp.path().join("photos");
+        let mut harness = listed(&tmp);
+        start(&mut harness, &dest);
 
         // Rate before previews or copies have finished.
         harness.key_press(Key::Num4);
@@ -2078,13 +3074,6 @@ mod tests {
         harness.key_press(Key::Escape);
         harness.step();
 
-        // Move to a RAW and develop it.
-        harness
-            .state_mut()
-            .library
-            .as_mut()
-            .unwrap()
-            .set_filter(Filter::All);
         let raw_position = {
             let library = harness.state().library.as_ref().unwrap();
             library
@@ -2121,49 +3110,102 @@ mod tests {
     }
 
     #[test]
-    fn import_dialog_copies_and_sweep_trashes_nothing_unrejected() {
+    fn clusters_regroup_on_the_slider_and_keys_still_cull() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("photos");
-        let mut harness = harness(&tmp, Some(fixture()));
-        wait_until(&mut harness, "library", |app| app.library.is_some());
+        let mut harness = listed(&tmp);
+        start(&mut harness, &dest);
+        wait_until(&mut harness, "every fingerprint", |app| {
+            app.library.as_ref().unwrap().fingerprint_count() == 3
+        });
 
-        harness.state_mut().form.destination = dest.display().to_string();
+        harness.key_press(Key::L);
+        harness.step();
+        assert_eq!(harness.state().view, View::Clusters);
+        harness.get_by_label("Sensitivity");
+
+        let groups_at = |harness: &mut Harness<'static, IngotApp>, sensitivity: f32| {
+            let library = harness.state_mut().library.as_mut().unwrap();
+            library.set_sensitivity(sensitivity);
+            library.clusters().len()
+        };
+        let low = groups_at(&mut harness, 0.0);
+        let high = groups_at(&mut harness, 100.0);
+        assert!(low <= high, "{low} {high}");
+        assert_eq!(high, 3);
+        assert_eq!(
+            harness
+                .state()
+                .library
+                .as_ref()
+                .unwrap()
+                .fingerprint_count(),
+            3
+        );
+        harness.step();
+
+        harness.key_press(Key::Num3);
+        harness.step();
+        let library = harness.state().library.as_ref().unwrap();
+        let key = library.focused().unwrap().key.clone();
+        assert_eq!(library.decisions(&key).0, 3);
+    }
+
+    #[test]
+    fn ratings_after_the_import_reach_a_sidecar_next_to_the_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("photos");
+        let mut harness = listed(&tmp);
         harness.state_mut().form.subfolder = "Wedding".to_string();
-        harness.state_mut().import_open = true;
-        for _ in 0..5 {
-            harness.step();
-        }
-        // The window's title has the same text, and the button comes after it.
-        harness.get_all_by_label("Import").last().unwrap().click();
+        start(&mut harness, &dest);
         wait_until(&mut harness, "import finished", |app| {
-            !app.copy.running && app.copy.summary.is_some()
+            app.library.as_ref().unwrap().import_counts().pending() == 0
         });
 
         assert_eq!(harness.state().copy.failed, 0);
-        let copied = std::fs::read_dir(dest.join("Wedding")).unwrap().count();
-        assert_eq!(copied, 4);
+        assert_eq!(files_in(&dest.join("Wedding")).len(), 4);
 
-        // Ratings after the import reach a sidecar next to the copies.
         harness.state_mut().library.as_mut().unwrap().jump(0);
         harness.state_mut().library.as_mut().unwrap().rate(5, false);
-        let sidecars = std::fs::read_dir(dest.join("Wedding"))
-            .unwrap()
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|x| x == "xmp"))
-            .count();
-        assert_eq!(sidecars, 1);
+        // Written off the UI thread.
+        let wedding = dest.join("Wedding");
+        wait_until(&mut harness, "sidecar", |_| {
+            files_in(&wedding).iter().any(|name| name.ends_with(".xmp"))
+        });
 
         // Nothing is rejected, so the sweep offers nothing.
         harness.state_mut().open_sweep();
+        wait_until(&mut harness, "sweep plan", |app| {
+            app.sweep.as_ref().is_some_and(|sweep| !sweep.planning)
+        });
         assert!(harness.state().sweep.as_ref().unwrap().paths.is_empty());
     }
 
     #[test]
-    fn import_needs_a_destination() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut harness = harness(&tmp, Some(fixture()));
-        wait_until(&mut harness, "library", |app| app.library.is_some());
-        assert!(harness.state_mut().start_import().is_err());
+    fn destination_summary_abbreviates_home_and_long_paths() {
+        let home = Path::new("/Users/anna");
+        let path = Path::new("/Users/anna/Photos/Wedding/2026/2026-05-22/IMG_0001.CR2");
+        assert_eq!(
+            destination_summary(path, 879, Some(home)),
+            "~/Photos/Wedding/2026/2026-05-22/IMG_0001.CR2 … (879 files)"
+        );
+        assert_eq!(
+            destination_summary(path, 1, Some(home)),
+            "~/Photos/Wedding/2026/2026-05-22/IMG_0001.CR2"
+        );
+        let long = Path::new(
+            "/Volumes/Backup/Clients/2026/A very long client name/Wedding/Second day/IMG_0001.CR2",
+        );
+        assert_eq!(
+            destination_summary(long, 2, None),
+            "/Volumes/…/Second day/IMG_0001.CR2 … (2 files)"
+        );
+    }
+
+    #[test]
+    fn sizes_read_naturally() {
+        assert_eq!(format_size(500_000_000), "500 MB");
+        assert_eq!(format_size(30_500_000_000), "30.5 GB");
     }
 
     #[test]
@@ -2180,8 +3222,8 @@ mod tests {
     fn render_views() {
         let dir = PathBuf::from(std::env::var("INGOT_SHOTS").unwrap());
         let tmp = tempfile::tempdir().unwrap();
-        let mut harness = harness(&tmp, Some(fixture()));
-        wait_until(&mut harness, "previews", |app| app.previews_done);
+        let dest = tmp.path().join("photos");
+        let mut harness = listed(&tmp);
         let shoot = |harness: &mut Harness<'_, IngotApp>, name: &str| {
             for _ in 0..30 {
                 harness.step();
@@ -2190,11 +3232,20 @@ mod tests {
             let image = harness.render().unwrap();
             image.save(dir.join(format!("{name}.png"))).unwrap();
         };
+        harness.state_mut().form.destination = dest.display().to_string();
+        harness.state_mut().form.subfolder = "Wedding".to_string();
+        harness.state_mut().form.organize = 2;
+        let cows = index_named(&harness, "IMG_1868.JPG");
+        harness.state_mut().toggle_tick(cows);
+        shoot(&mut harness, "import");
+
+        start(&mut harness, &dest);
+        wait_until(&mut harness, "previews", |app| app.previews_done);
         harness.key_press(Key::Num4);
         harness.key_press(Key::P);
-        harness.key_press(Key::Num2);
-        harness.key_press(Key::X);
         shoot(&mut harness, "grid");
+        harness.key_press(Key::L);
+        shoot(&mut harness, "clusters");
         harness.state_mut().library.as_mut().unwrap().jump(0);
         harness.key_press(Key::E);
         shoot(&mut harness, "loupe");
@@ -2210,11 +3261,6 @@ mod tests {
         harness.key_press(Key::D);
         wait_until(&mut harness, "develop", |app| app.rendered.is_some());
         shoot(&mut harness, "develop");
-        harness.key_press(Key::G);
-        harness.state_mut().form.rename = true;
-        harness.state_mut().form.organize = 2;
-        harness.state_mut().import_open = true;
-        shoot(&mut harness, "import");
     }
 
     #[test]
