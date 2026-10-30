@@ -10,7 +10,7 @@ use std::{
     time::Instant,
 };
 
-use cli::{Command as CliCommand, ImportArgs, Usage};
+use cli::{Command as CliCommand, DevelopArgs, ImportArgs, Usage};
 use ingot_core::{
     DriveConfig, DriveCredentials, DriveTarget, Engine, EngineConfig, ImportHistory, LocalTarget,
     ReplicationEvent, ReplicationTarget, ScanOptions, Target, TargetId, TargetKind, plan_import,
@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         }
         CliCommand::Import(import) => run_import(*import),
         CliCommand::GdriveLogin => run_gdrive_login(),
+        CliCommand::Develop(develop) => run_develop(*develop),
     };
     outcome.unwrap_or_else(|err| {
         eprintln!("error: {err}");
@@ -61,6 +62,30 @@ fn run_gdrive_login() -> AppResult {
             },
         ))?;
     println!("Signed in. Saved to {}", path.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Never replaces an existing file: the output is created new.
+fn run_develop(args: DevelopArgs) -> AppResult {
+    let started = Instant::now();
+    let image = ingot_develop::develop_file(&args.raw, &args.params)?;
+    let jpeg = ingot_core::preview::compress(turbojpeg::Image {
+        pixels: image.rgb,
+        width: image.width,
+        pitch: image.width * 3,
+        height: image.height,
+        format: turbojpeg::PixelFormat::RGB,
+    })?;
+    let mut file = std::fs::File::create_new(&args.output)
+        .map_err(|err| format!("could not create {}: {err}", args.output.display()))?;
+    std::io::Write::write_all(&mut file, &jpeg)?;
+    println!(
+        "{}: {}x{} in {:.2?}",
+        args.output.display(),
+        image.width,
+        image.height,
+        started.elapsed()
+    );
     Ok(ExitCode::SUCCESS)
 }
 
