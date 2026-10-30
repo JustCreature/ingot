@@ -4,7 +4,9 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use ingot_core::{CopyEngine, Engine, EngineConfig, LocalTarget, Target, TargetId, TargetKind};
+use ingot_core::{
+    CardGate, CopyEngine, Engine, EngineConfig, LocalTarget, Target, TargetId, TargetKind,
+};
 
 // Replication throughput: reads every scanned file once and copies it to a local
 // primary target and, optionally, a secondary one. Reports wall time and MB/s, and
@@ -54,7 +56,7 @@ async fn main() {
             write_permits,
         },
     );
-    let mut copy = CopyEngine::new(read_permits, depth, Arc::new(target));
+    let mut copy = CopyEngine::new(CardGate::new(read_permits), depth, Arc::new(target));
     let secondary_dir =
         secondary_root.map(|root| Path::new(&root).join(format!("ingot-bench-{nanos}")));
     if let Some(root) = &secondary_dir {
@@ -79,8 +81,7 @@ async fn main() {
         .verified
         .iter()
         .filter(|r| r.target() == TargetId(1))
-        .filter_map(|r| std::fs::metadata(r.source()).ok())
-        .map(|m| m.len())
+        .map(|r| r.size())
         .sum();
 
     println!("read={read_permits} depth={depth} write={write_permits}");

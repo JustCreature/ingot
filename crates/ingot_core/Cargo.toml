@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1.89"
-blake3 = { version = "1.8.5", features = ["mmap", "rayon"] }
+blake3 = { version = "1.8.5", features = ["mmap"] }
 chrono = "0.4.45"
 crossbeam-channel = "0.5.15"
 fast_image_resize = "6.0.0"

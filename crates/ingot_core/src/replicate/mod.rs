@@ -4,21 +4,25 @@
 //! primary target through a bounded channel, so the number of file buffers in
 //! RAM stays bounded no matter how slow the primary is.
 
+mod gate;
 mod local;
 
+pub use gate::{CardGate, CardPermit};
 pub use local::LocalTarget;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
+    hash::Hash,
+    io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
-    time::{Duration, Instant},
+    sync::{Arc, Mutex, PoisonError, RwLock},
+    time::{Duration, Instant, SystemTime},
 };
 
-use chrono::NaiveDate;
+use chrono::{DateTime, Local, NaiveDate};
 use tokio::{
-    sync::{Semaphore, mpsc},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc},
     task::{self, JoinSet},
 };
 
@@ -26,14 +30,99 @@ use crate::ScanResponse;
 
 pub(crate) type ReplicationError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Proof that `source` was written to `target` and read back with a matching
-/// hash. Can only be built through `new`, which rejects mismatched hashes, and
-/// `new` is only reachable from this module and its target implementations.
+/// How many numbered names to try before giving up on a file: `IMG_1.CR2`,
+/// `IMG_1-2.CR2`, and so on.
+pub(crate) const MAX_NAME_ATTEMPTS: u32 = 1000;
+
+/// The name to try on `attempt`, counted from 1. Keeping the extension last means
+/// the numbered copy still opens as what it is.
+pub(crate) fn candidate_name(file_name: &OsStr, attempt: u32) -> OsString {
+    if attempt <= 1 {
+        return file_name.to_os_string();
+    }
+    let path = Path::new(file_name);
+    let mut name = path.file_stem().unwrap_or(file_name).to_os_string();
+    name.push(format!("-{attempt}"));
+    if let Some(extension) = path.extension() {
+        name.push(".");
+        name.push(extension);
+    }
+    name
+}
+
+/// Destinations being worked on right now, by any key that names one. Two source
+/// files can route to the same name (same name and date in different folders).
+pub(crate) struct DestinationClaims<K = PathBuf> {
+    in_flight: Mutex<HashSet<K>>,
+    released: Notify,
+}
+
+impl<K> Default for DestinationClaims<K> {
+    fn default() -> Self {
+        DestinationClaims {
+            in_flight: Mutex::new(HashSet::new()),
+            released: Notify::new(),
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone> DestinationClaims<K> {
+    /// Waits until nobody else holds `key`. Waiting rather than moving on to the
+    /// next name matters on a re-run, where the file that belongs under this name
+    /// must find it, not a duplicate of itself under another.
+    pub(crate) async fn claim(&self, key: K) -> DestinationClaim<'_, K> {
+        loop {
+            let released = self.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            {
+                let mut in_flight = self
+                    .in_flight
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if in_flight.insert(key.clone()) {
+                    return DestinationClaim { claims: self, key };
+                }
+            }
+            released.await;
+        }
+    }
+}
+
+pub(crate) struct DestinationClaim<'a, K: Eq + Hash> {
+    claims: &'a DestinationClaims<K>,
+    key: K,
+}
+
+impl<K: Eq + Hash> Drop for DestinationClaim<'_, K> {
+    fn drop(&mut self) {
+        self.claims
+            .in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.key);
+        self.claims.released.notify_waiters();
+    }
+}
+
+/// Where a verified copy lives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplicaLocation {
+    Local(PathBuf),
+    /// A file on Google Drive, by its Drive file id.
+    Remote(String),
+}
+
+/// Proof that `source` is on `target` with a matching hash. Can only be built
+/// through `new`, which rejects mismatched hashes, and `new` is only reachable
+/// from this module and its target implementations.
 #[derive(Debug)]
 pub struct VerifiedReplica {
     source: PathBuf,
     target: TargetId,
-    location: PathBuf,
+    location: ReplicaLocation,
+    size: u64,
+    newly_written: bool,
     hash: blake3::Hash,
 }
 
@@ -41,7 +130,9 @@ impl VerifiedReplica {
     fn new(
         source: PathBuf,
         target: TargetId,
-        location: PathBuf,
+        location: ReplicaLocation,
+        size: u64,
+        newly_written: bool,
         expected: blake3::Hash,
         observed: blake3::Hash,
     ) -> Result<Self, ReplicationError> {
@@ -55,6 +146,8 @@ impl VerifiedReplica {
             source,
             target,
             location,
+            size,
+            newly_written,
             hash: expected,
         })
     }
@@ -68,8 +161,17 @@ impl VerifiedReplica {
     }
 
     /// Where the verified copy lives on the target.
-    pub fn location(&self) -> &Path {
+    pub fn location(&self) -> &ReplicaLocation {
         &self.location
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// False when an identical file was already on the target.
+    pub fn newly_written(&self) -> bool {
+        self.newly_written
     }
 
     pub fn hash(&self) -> blake3::Hash {
@@ -80,6 +182,19 @@ impl VerifiedReplica {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TargetId(pub u32);
 
+/// One source file on its way to the targets.
+#[derive(Clone, Debug)]
+pub struct FileInfo {
+    /// Identifies the file for the proof only. Targets must never open it: the
+    /// bytes were already read from it once.
+    pub source: PathBuf,
+    pub file_name: OsString,
+    pub captured_at: NaiveDate,
+    /// The source's modified time, kept on the copy where the target supports it.
+    pub modified: Option<SystemTime>,
+    pub src_hash: blake3::Hash,
+}
+
 #[async_trait::async_trait]
 pub trait ReplicationTarget: Send + Sync {
     fn id(&self) -> TargetId;
@@ -89,16 +204,12 @@ pub trait ReplicationTarget: Send + Sync {
     /// its file buffer in RAM.
     fn max_concurrent_writes(&self) -> usize;
 
-    /// Writes `bytes` to this target, verifies them against `src_hash`, and
-    /// returns the proof. `source` identifies the file for the proof only and must
-    /// never be opened: the bytes were already read from it once.
+    /// Puts `bytes` on this target, verifies them against `file.src_hash`, and
+    /// returns the proof. Never replaces anything already on the target.
     async fn store(
         &self,
-        file_name: &OsStr,
-        source: &Path,
-        captured_at: NaiveDate,
+        file: &FileInfo,
         bytes: Arc<[u8]>,
-        src_hash: blake3::Hash,
     ) -> Result<VerifiedReplica, ReplicationError>;
 }
 
@@ -141,19 +252,15 @@ impl ReplicationReport {
     }
 }
 
+/// Files allowed to be mid-read at once on top of the channel depth. The card gate
+/// decides how many actually touch the card; this only has to keep it supplied.
+const READS_IN_PROGRESS: usize = 2;
+
 pub struct CopyEngine {
-    source_read: Arc<Semaphore>,
+    card: Arc<CardGate>,
     read_channel_depth: usize,
     primary_target: Arc<dyn ReplicationTarget>,
     secondary_targets: Vec<Arc<dyn ReplicationTarget>>,
-}
-
-#[derive(Clone)]
-struct FileInfo {
-    source: PathBuf,
-    file_name: OsString,
-    captured_at: NaiveDate,
-    src_hash: blake3::Hash,
 }
 
 #[derive(Clone)]
@@ -170,7 +277,11 @@ struct DeferredFile {
 }
 
 type ReadOutcome = Result<CopyMessage, ReplicationFailure>;
-type FileToRead = Result<(PathBuf, NaiveDate), ReplicationFailure>;
+
+struct FileToRead {
+    source: PathBuf,
+    captured_at: Option<NaiveDate>,
+}
 
 fn read_failure(source: PathBuf, error: ReplicationError) -> ReplicationFailure {
     ReplicationFailure {
@@ -180,8 +291,9 @@ fn read_failure(source: PathBuf, error: ReplicationError) -> ReplicationFailure 
     }
 }
 
-/// Snapshots the files to copy so that no lock is held during I/O. A frame with
-/// no capture date can't be routed, so it becomes a recorded failure.
+/// Snapshots the files to copy so that no lock is held during I/O. A file the
+/// scanner displaced from its asset is still a photo on the card, so it is copied
+/// with the rest.
 fn list_files(scan: &RwLock<ScanResponse>) -> Result<Vec<FileToRead>, ReplicationError> {
     let scan = scan
         .read()
@@ -190,42 +302,75 @@ fn list_files(scan: &RwLock<ScanResponse>) -> Result<Vec<FileToRead>, Replicatio
     let mut files = vec![];
     for asset in scan.assets.values() {
         for (_, path) in asset.files.get_all() {
-            files.push(match asset.exif_data.captured_at {
-                Some(captured_at) => Ok((path.clone(), captured_at.date())),
-                None => Err(read_failure(
-                    path.clone(),
-                    ReplicationError::from(format!("no capture date for {}", path.display())),
-                )),
+            files.push(FileToRead {
+                source: path.clone(),
+                captured_at: asset.exif_data.captured_at.map(|at| at.date()),
             });
         }
+    }
+    for collision in &scan.collisions {
+        files.push(FileToRead {
+            source: collision.displaced.clone(),
+            captured_at: scan
+                .assets
+                .get(&collision.key)
+                .and_then(|asset| asset.exif_data.captured_at)
+                .map(|at| at.date()),
+        });
     }
     Ok(files)
 }
 
-async fn read_file(source: PathBuf, captured_at: NaiveDate) -> ReadOutcome {
+/// Reads one file. The card slot is released as soon as the bytes are in RAM, so
+/// hashing and any wait for a slow target never keep a preview read off the card.
+fn read_file_blocking(
+    permit: CardPermit,
+    file: FileToRead,
+    file_name: OsString,
+) -> Result<CopyMessage, ReplicationError> {
+    let source = file.source;
+    let opened = std::fs::File::open(&source)?;
+    let metadata = opened.metadata()?;
+    let modified = metadata.modified().ok();
+    let size = metadata.len() as usize;
+    let mut opened = opened;
+    let mut bytes = Vec::with_capacity(size);
+    opened.read_to_end(&mut bytes)?;
+    drop(permit);
+
+    // A frame with no EXIF date is still routed: the file's own date comes from
+    // the camera's clock too.
+    let captured_at = file
+        .captured_at
+        .or_else(|| modified.map(|at| DateTime::<Local>::from(at).date_naive()))
+        .ok_or("no capture date and no file date")?;
+
+    let src_hash = blake3::hash(&bytes);
+    Ok(CopyMessage {
+        info: FileInfo {
+            source,
+            file_name,
+            captured_at,
+            modified,
+            src_hash,
+        },
+        bytes: Arc::from(bytes),
+    })
+}
+
+async fn read_file(gate: Arc<CardGate>, file: FileToRead) -> ReadOutcome {
+    let source = file.source.clone();
     let Some(file_name) = source.file_name().map(OsStr::to_os_string) else {
         let error = ReplicationError::from(format!("no file name in {}", source.display()));
         return Err(read_failure(source, error));
     };
 
-    let path = source.clone();
-    let read = tokio::task::spawn_blocking(move || -> Result<_, std::io::Error> {
-        let bytes: Arc<[u8]> = Arc::from(std::fs::read(path)?);
-        let src_hash = blake3::hash(&bytes);
-        Ok((bytes, src_hash))
-    })
-    .await;
+    let permit = gate.acquire_background().await;
+    let read =
+        tokio::task::spawn_blocking(move || read_file_blocking(permit, file, file_name)).await;
 
     match read {
-        Ok(Ok((bytes, src_hash))) => Ok(CopyMessage {
-            info: FileInfo {
-                source,
-                file_name,
-                captured_at,
-                src_hash,
-            },
-            bytes,
-        }),
+        Ok(Ok(message)) => Ok(message),
         Ok(Err(err)) => {
             let error =
                 ReplicationError::from(format!("failed to read {}: {err}", source.display()));
@@ -304,16 +449,7 @@ async fn store_from_primary(
                 file.primary_location.display()
             )
         })?;
-    let info = file.info;
-    target
-        .store(
-            &info.file_name,
-            &info.source,
-            info.captured_at,
-            Arc::from(bytes),
-            info.src_hash,
-        )
-        .await
+    target.store(&file.info, Arc::from(bytes)).await
 }
 
 /// Works through one secondary's RAM hand-offs and deferred files. While all its
@@ -349,15 +485,7 @@ async fn run_secondary(
                     stores.spawn(
                         PendingStore { info: msg.info, deferred_to: vec![] },
                         async move {
-                            target
-                                .store(
-                                    &info.file_name,
-                                    &info.source,
-                                    info.captured_at,
-                                    msg.bytes,
-                                    info.src_hash,
-                                )
-                                .await
+                            target.store(&info, msg.bytes).await
                         },
                     );
                 }
@@ -401,13 +529,18 @@ fn settle_primary(
     for index in deferred_to {
         let queue = &queues[index];
         let queued = match &result {
-            Ok(replica) => queue
-                .deferred
-                .send(DeferredFile {
-                    info: info.clone(),
-                    primary_location: replica.location().to_path_buf(),
-                })
-                .map_err(|_| ReplicationError::from("secondary target worker stopped")),
+            Ok(replica) => match replica.location() {
+                ReplicaLocation::Local(path) => queue
+                    .deferred
+                    .send(DeferredFile {
+                        info: info.clone(),
+                        primary_location: path.clone(),
+                    })
+                    .map_err(|_| ReplicationError::from("secondary target worker stopped")),
+                ReplicaLocation::Remote(_) => Err(ReplicationError::from(
+                    "not copied: file missed the RAM hand-off and the primary is not local",
+                )),
+            },
             Err(_) => Err(ReplicationError::from(
                 "not copied: file missed the RAM hand-off and the primary copy failed",
             )),
@@ -427,16 +560,16 @@ fn settle_primary(
 
 impl CopyEngine {
     /// `read_channel_depth` is the memory governor: at most
-    /// `read_channel_depth + card_read_permits` files are buffered ahead of the
+    /// `read_channel_depth + READS_IN_PROGRESS` files are buffered ahead of the
     /// primary target's writes, and each secondary can hold another
     /// `read_channel_depth` files plus its own concurrent writes.
     pub fn new(
-        card_read_permits: usize,
+        card: Arc<CardGate>,
         read_channel_depth: usize,
         primary_target: Arc<dyn ReplicationTarget>,
     ) -> Self {
         CopyEngine {
-            source_read: Arc::new(Semaphore::new(card_read_permits.max(1))),
+            card,
             read_channel_depth: read_channel_depth.max(1),
             primary_target,
             secondary_targets: vec![],
@@ -448,38 +581,23 @@ impl CopyEngine {
         self
     }
 
-    /// Reads every file once in the background. A read permit is held until the
-    /// bytes are in the channel, so a full channel stops further card reads.
+    /// Reads every file once in the background. A slot is held from before the read
+    /// until the bytes are in the channel, so a full channel stops further card
+    /// reads, while the card itself stays free for previews during the wait.
     fn start_read_stream(
         &self,
         scan: &RwLock<ScanResponse>,
     ) -> Result<mpsc::Receiver<ReadOutcome>, ReplicationError> {
         let files = list_files(scan)?;
         let (tx, rx) = mpsc::channel(self.read_channel_depth);
-        let source_read = Arc::clone(&self.source_read);
+        let buffers = Arc::new(Semaphore::new(READS_IN_PROGRESS));
+        let card = Arc::clone(&self.card);
 
         tokio::spawn(async move {
             for file in files {
-                let (source, captured_at) = match file {
-                    Ok(file) => file,
-                    Err(failure) => {
-                        if tx.send(Err(failure)).await.is_err() {
-                            return;
-                        }
-                        continue;
-                    }
-                };
-
-                let permit = match Arc::clone(&source_read).acquire_owned().await {
-                    Ok(permit) => permit,
-                    Err(err) => {
-                        let error =
-                            ReplicationError::from(format!("read permit unavailable: {err}"));
-                        if tx.send(Err(read_failure(source, error))).await.is_err() {
-                            return;
-                        }
-                        continue;
-                    }
+                let slot: OwnedSemaphorePermit = match Arc::clone(&buffers).acquire_owned().await {
+                    Ok(slot) => slot,
+                    Err(_) => return,
                 };
 
                 // Nobody is consuming, so stop reading the card.
@@ -487,10 +605,10 @@ impl CopyEngine {
                     return;
                 }
 
-                let tx = tx.clone();
+                let (tx, card) = (tx.clone(), Arc::clone(&card));
                 tokio::spawn(async move {
-                    let _permit = permit;
-                    let outcome = read_file(source, captured_at).await;
+                    let _slot = slot;
+                    let outcome = read_file(card, file).await;
                     let _ = tx.send(outcome).await;
                 });
             }
@@ -559,17 +677,7 @@ impl CopyEngine {
                     info: info.clone(),
                     deferred_to,
                 },
-                async move {
-                    target
-                        .store(
-                            &info.file_name,
-                            &info.source,
-                            info.captured_at,
-                            bytes,
-                            info.src_hash,
-                        )
-                        .await
-                },
+                async move { target.store(&info, bytes).await },
             );
         }
 
@@ -610,6 +718,16 @@ mod tests {
 
     use super::*;
     use crate::{AssetKey, FileKind, PhotoAsset, Target, TargetKind};
+
+    fn file_info(name: &str, src_hash: blake3::Hash) -> FileInfo {
+        FileInfo {
+            source: Path::new("card").join(name),
+            file_name: name.into(),
+            captured_at: date(),
+            modified: None,
+            src_hash,
+        }
+    }
 
     const DATE: (i32, u32, u32) = (2026, 5, 22);
 
@@ -682,7 +800,7 @@ mod tests {
         let scan = scan_of(&[(&raw, FileKind::Raw), (&jpg, FileKind::Jpeg)], true);
         let root = tmp.path().join("target");
 
-        let engine = CopyEngine::new(2, 4, local_target(&root, 4));
+        let engine = CopyEngine::new(CardGate::new(2), 4, local_target(&root, 4));
         let report = engine.replicate(&scan).await.unwrap();
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -701,7 +819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_destination_is_left_untouched() {
+    async fn different_file_under_the_same_name_is_kept_beside_it() {
         let tmp = tempdir().unwrap();
         let card = tmp.path().join("card");
         let raw = write_source(&card, "IMG_0001.CR2", b"new bytes");
@@ -709,14 +827,61 @@ mod tests {
         let root = tmp.path().join("target");
         let existing = write_source(&dated_dir(&root), "IMG_0001.CR2", b"existing bytes");
 
-        let engine = CopyEngine::new(1, 4, local_target(&root, 4));
+        let engine = CopyEngine::new(CardGate::new(1), 4, local_target(&root, 4));
         let report = engine.replicate(&scan).await.unwrap();
 
-        assert!(report.verified.is_empty());
-        assert_eq!(report.failures.len(), 1);
-        assert_eq!(report.failures[0].source.as_deref(), Some(raw.as_path()));
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert_eq!(fs::read(&existing).unwrap(), b"existing bytes");
-        assert_eq!(dir_entries(&dated_dir(&root)), ["IMG_0001.CR2"]);
+        assert_eq!(
+            fs::read(dated_dir(&root).join("IMG_0001-2.CR2")).unwrap(),
+            b"new bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn running_again_counts_copied_files_as_done_and_writes_nothing() {
+        let tmp = tempdir().unwrap();
+        let first = write_source(&tmp.path().join("100CANON"), "IMG_0001.CR2", b"first");
+        let second = write_source(&tmp.path().join("101CANON"), "IMG_0001.CR2", b"second");
+        let scan = scan_of(&[(&first, FileKind::Raw), (&second, FileKind::Raw)], true);
+        let root = tmp.path().join("target");
+
+        let engine = CopyEngine::new(CardGate::new(2), 4, local_target(&root, 4));
+        let report = engine.replicate(&scan).await.unwrap();
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(report.verified.iter().all(|r| r.newly_written()));
+
+        let report = engine.replicate(&scan).await.unwrap();
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.verified.len(), 2);
+        assert!(report.verified.iter().all(|r| !r.newly_written()));
+        assert_eq!(
+            dir_entries(&dated_dir(&root)),
+            ["IMG_0001-2.CR2", "IMG_0001.CR2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_keeps_the_source_modified_time() {
+        let tmp = tempdir().unwrap();
+        let raw = write_source(&tmp.path().join("card"), "IMG_0001.CR2", b"bytes");
+        let shot = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&raw)
+            .unwrap()
+            .set_modified(shot)
+            .unwrap();
+        let root = tmp.path().join("target");
+
+        let engine = CopyEngine::new(CardGate::new(1), 4, local_target(&root, 1));
+        engine
+            .replicate(&scan_of(&[(&raw, FileKind::Raw)], true))
+            .await
+            .unwrap();
+
+        let copied = fs::metadata(dated_dir(&root).join("IMG_0001.CR2")).unwrap();
+        assert_eq!(copied.modified().unwrap(), shot);
     }
 
     #[tokio::test]
@@ -727,11 +892,8 @@ mod tests {
 
         let result = target
             .store(
-                OsStr::new("IMG_0001.CR2"),
-                Path::new("card/IMG_0001.CR2"),
-                date(),
+                &file_info("IMG_0001.CR2", blake3::hash(b"bytes the card held")),
                 Arc::from(&b"bytes that landed"[..]),
-                blake3::hash(b"bytes the card held"),
             )
             .await;
 
@@ -740,7 +902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_name_from_two_folders_keeps_one_intact_copy() {
+    async fn same_name_from_two_folders_keeps_both_intact() {
         let tmp = tempdir().unwrap();
         let first = write_source(
             &tmp.path().join("100CANON"),
@@ -755,37 +917,60 @@ mod tests {
         let scan = scan_of(&[(&first, FileKind::Raw), (&second, FileKind::Raw)], true);
         let root = tmp.path().join("target");
 
-        let engine = CopyEngine::new(2, 4, local_target(&root, 4));
+        let engine = CopyEngine::new(CardGate::new(2), 4, local_target(&root, 4));
         let report = engine.replicate(&scan).await.unwrap();
 
-        assert_eq!(report.verified.len(), 1);
-        assert_eq!(report.failures.len(), 1);
-        let kept = fs::read(dated_dir(&root).join("IMG_0001.CR2")).unwrap();
-        assert_eq!(kept, fs::read(report.verified[0].source()).unwrap());
-        assert_eq!(dir_entries(&dated_dir(&root)), ["IMG_0001.CR2"]);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.verified.len(), 2);
+        assert_eq!(
+            dir_entries(&dated_dir(&root)),
+            ["IMG_0001-2.CR2", "IMG_0001.CR2"]
+        );
+        for replica in &report.verified {
+            let ReplicaLocation::Local(copied) = replica.location() else {
+                panic!("expected a local copy");
+            };
+            assert_eq!(
+                fs::read(copied).unwrap(),
+                fs::read(replica.source()).unwrap()
+            );
+        }
     }
 
     #[tokio::test]
-    async fn undated_and_missing_files_are_recorded() {
+    async fn undated_frame_is_routed_by_its_file_date() {
         let tmp = tempdir().unwrap();
-        let card = tmp.path().join("card");
-        let undated = write_source(&card, "IMG_0001.CR2", b"bytes");
-        let missing = card.join("IMG_0002.CR2");
+        let undated = write_source(&tmp.path().join("card"), "IMG_0001.CR2", b"bytes");
         let root = tmp.path().join("target");
 
-        let engine = CopyEngine::new(1, 4, local_target(&root, 4));
-
+        let engine = CopyEngine::new(CardGate::new(1), 4, local_target(&root, 4));
         let report = engine
             .replicate(&scan_of(&[(&undated, FileKind::Raw)], false))
             .await
             .unwrap();
-        assert_eq!(report.failures.len(), 1);
-        assert!(report.verified.is_empty());
 
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        let today = Local::now().date_naive();
+        assert!(
+            root.join(today.format("%Y").to_string())
+                .join(today.format("%Y-%m-%d").to_string())
+                .join("IMG_0001.CR2")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_file_is_recorded() {
+        let tmp = tempdir().unwrap();
+        let missing = tmp.path().join("card").join("IMG_0002.CR2");
+        let root = tmp.path().join("target");
+
+        let engine = CopyEngine::new(CardGate::new(1), 4, local_target(&root, 4));
         let report = engine
             .replicate(&scan_of(&[(&missing, FileKind::Raw)], true))
             .await
             .unwrap();
+
         assert_eq!(report.failures.len(), 1);
         assert_eq!(
             report.failures[0].source.as_deref(),
@@ -793,11 +978,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn file_displaced_by_a_scan_collision_is_still_copied() {
+        let tmp = tempdir().unwrap();
+        let card = tmp.path().join("card");
+        let kept = write_source(&card, "IMG_0001.JPG", b"kept");
+        let displaced = write_source(&card, "IMG_0001.JPEG", b"displaced");
+        let scan = scan_of(&[(&kept, FileKind::Jpeg)], true);
+        let key = scan.read().unwrap().assets.keys().next().unwrap().clone();
+        scan.write().unwrap().collisions.push(crate::Collision {
+            key,
+            kind: FileKind::Jpeg,
+            kept: kept.clone(),
+            displaced,
+        });
+        let root = tmp.path().join("target");
+
+        let engine = CopyEngine::new(CardGate::new(1), 4, local_target(&root, 4));
+        let report = engine.replicate(&scan).await.unwrap();
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(
+            dir_entries(&dated_dir(&root)),
+            ["IMG_0001.JPEG", "IMG_0001.JPG"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn waiting_on_a_full_channel_leaves_the_card_free_for_previews() {
+        let tmp = tempdir().unwrap();
+        let paths: Vec<PathBuf> = (0..10)
+            .map(|i| write_source(tmp.path(), &format!("IMG_{i:04}.CR2"), b"bytes"))
+            .collect();
+        let files: Vec<(&Path, FileKind)> =
+            paths.iter().map(|p| (p.as_path(), FileKind::Raw)).collect();
+        let scan = scan_of(&files, true);
+
+        let gate = CardGate::new(1);
+        let engine = CopyEngine::new(Arc::clone(&gate), 1, local_target(tmp.path(), 1));
+        let rx = engine.start_read_stream(&scan).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Nothing is consuming, so the reader is stuck on the channel.
+        let preview = tokio::task::spawn_blocking(move || gate.acquire_priority());
+        tokio::time::timeout(Duration::from_secs(5), preview)
+            .await
+            .expect("a backed-up copy kept a preview read off the card")
+            .unwrap();
+        drop(rx);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn full_channel_stops_card_reads() {
         const FILES: usize = 20;
         const DEPTH: usize = 2;
-        const READ_PERMITS: usize = 1;
 
         let tmp = tempdir().unwrap();
         let card = tmp.path().join("card");
@@ -808,7 +1042,7 @@ mod tests {
             paths.iter().map(|p| (p.as_path(), FileKind::Raw)).collect();
         let scan = scan_of(&files, true);
 
-        let engine = CopyEngine::new(READ_PERMITS, DEPTH, local_target(tmp.path(), 1));
+        let engine = CopyEngine::new(CardGate::new(1), DEPTH, local_target(tmp.path(), 1));
         let mut rx = engine.start_read_stream(&scan).unwrap();
 
         // Nothing is consuming. Any file the reader hasn't reached by the time it
@@ -825,7 +1059,7 @@ mod tests {
         }
         assert!(read >= 1);
         assert!(
-            read <= DEPTH + READ_PERMITS,
+            read <= DEPTH + READS_IN_PROGRESS,
             "read {read} files ahead of the consumer"
         );
         assert_eq!(read + failed, FILES);
@@ -850,21 +1084,20 @@ mod tests {
 
         async fn store(
             &self,
-            _file_name: &OsStr,
-            source: &Path,
-            _captured_at: NaiveDate,
+            file: &FileInfo,
             bytes: Arc<[u8]>,
-            src_hash: blake3::Hash,
         ) -> Result<VerifiedReplica, ReplicationError> {
             let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(running, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(5)).await;
             self.running.fetch_sub(1, Ordering::SeqCst);
             VerifiedReplica::new(
-                source.to_path_buf(),
+                file.source.clone(),
                 self.id(),
-                source.to_path_buf(),
-                src_hash,
+                ReplicaLocation::Local(file.source.clone()),
+                bytes.len() as u64,
+                true,
+                file.src_hash,
                 blake3::hash(&bytes),
             )
         }
@@ -884,7 +1117,7 @@ mod tests {
             peak: AtomicUsize::new(0),
         });
 
-        let engine = CopyEngine::new(4, 8, target.clone());
+        let engine = CopyEngine::new(CardGate::new(4), 8, target.clone());
         let report = engine.replicate(&scan_of(&files, true)).await.unwrap();
 
         assert_eq!(report.verified.len(), 30);
@@ -909,16 +1142,11 @@ mod tests {
 
         async fn store(
             &self,
-            file_name: &OsStr,
-            source: &Path,
-            captured_at: NaiveDate,
+            file: &FileInfo,
             bytes: Arc<[u8]>,
-            src_hash: blake3::Hash,
         ) -> Result<VerifiedReplica, ReplicationError> {
             let _open = self.gate.acquire().await?;
-            self.inner
-                .store(file_name, source, captured_at, bytes, src_hash)
-                .await
+            self.inner.store(file, bytes).await
         }
     }
 
@@ -943,7 +1171,7 @@ mod tests {
             gate: Arc::clone(&gate),
         };
         let engine = Arc::new(
-            CopyEngine::new(1, 1, local_target(&primary_root, 2))
+            CopyEngine::new(CardGate::new(1), 1, local_target(&primary_root, 2))
                 .with_secondary(Arc::new(secondary)),
         );
 
@@ -990,12 +1218,7 @@ mod tests {
         let result = store_from_primary(
             &*target,
             DeferredFile {
-                info: FileInfo {
-                    source: "card/IMG_0001.CR2".into(),
-                    file_name: "IMG_0001.CR2".into(),
-                    captured_at: date(),
-                    src_hash: blake3::hash(b"what the card held"),
-                },
+                info: file_info("IMG_0001.CR2", blake3::hash(b"what the card held")),
                 primary_location: primary_copy,
             },
         )
@@ -1011,8 +1234,8 @@ mod tests {
         let card = tmp.path().join("card");
         let raw = write_source(&card, "IMG_0001.CR2", b"new bytes");
         let scan = scan_of(&[(&raw, FileKind::Raw)], true);
-        let primary_root = tmp.path().join("primary");
-        let existing = write_source(&dated_dir(&primary_root), "IMG_0001.CR2", b"existing");
+        // A file where the root should be makes every primary store fail.
+        let primary_root = write_source(tmp.path(), "not-a-directory", b"");
         let secondary_root = tmp.path().join("secondary");
         let secondary = Arc::new(LocalTarget::new(
             TargetId(9),
@@ -1023,15 +1246,14 @@ mod tests {
             },
         ));
 
-        let engine =
-            CopyEngine::new(1, 4, local_target(&primary_root, 1)).with_secondary(secondary);
+        let engine = CopyEngine::new(CardGate::new(1), 4, local_target(&primary_root, 1))
+            .with_secondary(secondary);
         let report = engine.replicate(&scan).await.unwrap();
 
         // The secondary had room, so it still got its copy from RAM.
         assert_eq!(report.verified.len(), 1);
         assert_eq!(report.verified[0].target(), TargetId(9));
         assert_eq!(report.failures.len(), 1);
-        assert_eq!(fs::read(&existing).unwrap(), b"existing");
         assert_eq!(
             fs::read(dated_dir(&secondary_root).join("IMG_0001.CR2")).unwrap(),
             b"new bytes"

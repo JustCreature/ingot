@@ -65,7 +65,6 @@ dependencies = [
  "constant_time_eq",
  "cpufeatures",
  "memmap2",
- "rayon-core",
 ]
 
 [[package]]
