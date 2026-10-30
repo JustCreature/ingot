@@ -5,7 +5,8 @@ use std::{
 };
 
 use ingot_core::{
-    CardGate, CopyEngine, Engine, EngineConfig, LocalTarget, Target, TargetId, TargetKind,
+    CardGate, CopyEngine, DateFolders, Engine, EngineConfig, ImportOptions, LocalTarget, Organize,
+    Target, TargetId, TargetKind, plan_import,
 };
 
 // Replication throughput: reads every scanned file once and copies it to a local
@@ -71,10 +72,17 @@ async fn main() {
     }
 
     let t = Instant::now();
-    let report = copy
-        .replicate(&engine.scan_response)
-        .await
-        .expect("replication could not start");
+    let plan = plan_import(
+        &engine.scan_response,
+        Path::new(&source),
+        &ImportOptions {
+            organize: Organize::ByDate(DateFolders::default()),
+            ..Default::default()
+        },
+        None,
+    )
+    .expect("plan failed");
+    let report = copy.replicate(plan).await;
     let elapsed = t.elapsed();
 
     let bytes: u64 = report

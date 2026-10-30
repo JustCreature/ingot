@@ -15,7 +15,7 @@ use std::{
 
 use crate::replicate::ReplicationTarget;
 use crate::{
-    Target, build_destination_path,
+    Target,
     replicate::{
         DestinationClaims, FileInfo, MAX_NAME_ATTEMPTS, ReplicaLocation, ReplicationError,
         TargetId, VerifiedReplica, candidate_name,
@@ -176,28 +176,18 @@ impl ReplicationTarget for LocalTarget {
     ) -> Result<VerifiedReplica, ReplicationError> {
         let _permit = self.write.acquire().await?;
 
-        // TODO: probably build_destination_path should return error instead of None?
-        let routed =
-            build_destination_path(&self.config, file.captured_at, Path::new(&file.file_name))
-                .ok_or_else(|| {
-                    ReplicationError::from(format!(
-                        "failed to route destination for {}",
-                        file.file_name.to_string_lossy()
-                    ))
-                })?;
-        let dir = routed
-            .parent()
-            .ok_or_else(|| {
-                ReplicationError::from(format!(
-                    "destination has no parent directory: {}",
-                    routed.display()
-                ))
-            })?
-            .to_path_buf();
+        let routed = self.config.root.join(&file.relative);
+        let (Some(dir), Some(file_name)) = (routed.parent(), routed.file_name()) else {
+            return Err(ReplicationError::from(format!(
+                "not a file path: {}",
+                routed.display()
+            )));
+        };
+        let dir = dir.to_path_buf();
         tokio::fs::create_dir_all(&dir).await?;
 
         for attempt in 1..=MAX_NAME_ATTEMPTS {
-            let dst: PathBuf = dir.join(candidate_name(&file.file_name, attempt));
+            let dst: PathBuf = dir.join(candidate_name(file_name, attempt));
             // Held across the check and the write, so two source files routed to
             // one name take turns and share neither a name nor a temp file.
             let _claim = self.claims.claim(dst.clone()).await;

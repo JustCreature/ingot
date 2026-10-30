@@ -12,8 +12,13 @@ use std::sync::{Arc, RwLock};
 use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
 
 use crate::asset::{AssetKey, ImageProcessingError};
+use crate::import::{DuplicateKey, ImportHistory, ImportPlan};
 use crate::preview::{make_preview_from_jpeg_bytes, make_thumbnail_from_jpeg_bytes};
-use crate::scan::{ScanResponse, scan_source_dir};
+use crate::replicate::{
+    CardGate, CopyEngine, ReplicationEvent, ReplicationFailure, ReplicationReport,
+    ReplicationTarget,
+};
+use crate::scan::{ScanOptions, ScanResponse, scan_source};
 use crate::{FileKind, PreviewStrip, enrich_assets, read_embedded_preview};
 
 /// Tunable engine policy. Construct via `..Default::default()` and override what
@@ -36,6 +41,8 @@ pub struct EngineConfig {
     /// reader tier over a bounded channel. Defaults to the machine's available
     /// parallelism (CPU-bound work scales with cores).
     pub cpu_threads: usize,
+    /// How many files may wait in RAM for the primary target during an import.
+    pub read_channel_depth: usize,
 }
 
 impl Default for EngineConfig {
@@ -48,6 +55,7 @@ impl Default for EngineConfig {
             cpu_threads: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
+            read_channel_depth: 4,
         }
     }
 }
@@ -70,16 +78,45 @@ pub enum IngestEvent {
 pub struct Engine {
     config: EngineConfig,
     pub scan_response: Arc<RwLock<ScanResponse>>,
+    card: Arc<CardGate>,
+}
+
+/// A running import. It carries on in the background whether or not anyone reads
+/// its progress.
+pub struct ImportHandle {
+    pub progress: crossbeam_channel::Receiver<ReplicationEvent>,
+    finished: std::thread::JoinHandle<ReplicationReport>,
+}
+
+impl ImportHandle {
+    /// Waits for the import to end and returns its report.
+    pub fn wait(self) -> ReplicationReport {
+        match self.finished.join() {
+            Ok(report) => report,
+            Err(_) => {
+                let mut report = ReplicationReport::default();
+                report.failures.push(ReplicationFailure {
+                    source: None,
+                    target: None,
+                    error: "import worker panicked".into(),
+                });
+                report
+            }
+        }
+    }
 }
 
 impl Engine {
     pub fn new(config: EngineConfig) -> Self {
+        let card = CardGate::new(config.card_read_permits);
         Engine {
+            card,
             config,
             scan_response: Arc::new(RwLock::new(ScanResponse {
                 assets: HashMap::new(),
                 collisions: vec![],
                 errors: vec![],
+                ignored: vec![],
             })),
         }
     }
@@ -91,11 +128,86 @@ impl Engine {
     /// Fast enumeration: walk + pair, no file-content reads. Gives the UI its
     /// grid skeleton immediately.
     pub fn scan(&mut self, source: &Path) -> Arc<RwLock<ScanResponse>> {
-        let response = scan_source_dir(source);
-        let mut writable_scan_response = self.scan_response.write().unwrap();
-        *writable_scan_response = response;
-        enrich_assets(&mut writable_scan_response.assets);
+        self.scan_with(source, &ScanOptions::default())
+    }
+
+    /// Builds the new skeleton with no lock held, then swaps it in, so readers of
+    /// the store are never kept waiting on card I/O.
+    pub fn scan_with(&mut self, source: &Path, options: &ScanOptions) -> Arc<RwLock<ScanResponse>> {
+        let mut response = scan_source(source, options);
+        enrich_assets(&mut response.assets);
+        *self.scan_response.write().unwrap() = response;
         Arc::clone(&self.scan_response)
+    }
+
+    /// Starts copying `plan` in the background and returns at once. Holds no lock
+    /// on the store, and previews go first on the card, so triage is never waiting
+    /// on the copy. `primary` paces the card and should be the fastest local disk.
+    /// Files that reached every target are added to `history`.
+    pub fn start_import(
+        &self,
+        plan: ImportPlan,
+        primary: Arc<dyn ReplicationTarget>,
+        secondaries: Vec<Arc<dyn ReplicationTarget>>,
+        history: Option<ImportHistory>,
+    ) -> ImportHandle {
+        let (progress_tx, progress) = crossbeam_channel::unbounded();
+        let target_count = secondaries.len() + 1;
+        let mut copy = CopyEngine::new(
+            Arc::clone(&self.card),
+            self.config.read_channel_depth,
+            primary,
+        )
+        .with_progress(progress_tx);
+        for secondary in secondaries {
+            copy = copy.with_secondary(secondary);
+        }
+
+        let finished = std::thread::spawn(move || {
+            let keys: HashMap<PathBuf, DuplicateKey> = plan
+                .files
+                .iter()
+                .map(|file| (file.source.clone(), file.duplicate_key.clone()))
+                .collect();
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    let mut report = ReplicationReport::default();
+                    report.failures.push(ReplicationFailure {
+                        source: None,
+                        target: None,
+                        error: format!("could not start the import runtime: {err}").into(),
+                    });
+                    return report;
+                }
+            };
+            let mut report = runtime.block_on(copy.replicate(plan));
+
+            if let Some(mut history) = history {
+                let mut copies: HashMap<&Path, usize> = HashMap::new();
+                for replica in &report.verified {
+                    *copies.entry(replica.source()).or_default() += 1;
+                }
+                let done: Vec<DuplicateKey> = copies
+                    .into_iter()
+                    .filter(|(_, count)| *count == target_count)
+                    .filter_map(|(source, _)| keys.get(source).cloned())
+                    .collect();
+                if let Err(error) = history.record(done) {
+                    report.failures.push(ReplicationFailure {
+                        source: None,
+                        target: None,
+                        error: format!("could not update the import history: {error}").into(),
+                    });
+                }
+            }
+            report
+        });
+
+        ImportHandle { progress, finished }
     }
 
     pub fn ingest(&mut self) -> crossbeam_channel::Receiver<IngestEvent> {
@@ -108,8 +220,10 @@ impl Engine {
         let read_threads = self.config.card_read_permits.max(1);
         let cpu_threads = self.config.cpu_threads.max(1);
 
+        let card = Arc::clone(&self.card);
+
         std::thread::spawn(move || {
-            Engine::run_processing_worker(cloned_scan_response, tx, read_threads, cpu_threads)
+            Engine::run_processing_worker(cloned_scan_response, tx, card, read_threads, cpu_threads)
         });
 
         rx
@@ -125,6 +239,7 @@ impl Engine {
     fn run_processing_worker(
         scan_response: Arc<RwLock<ScanResponse>>,
         tx: crossbeam_channel::Sender<IngestEvent>,
+        card: Arc<CardGate>,
         read_threads: usize,
         cpu_threads: usize,
     ) {
@@ -172,7 +287,10 @@ impl Engine {
                     work_items
                         .into_par_iter()
                         .for_each(|(key, kind, path, strip)| {
+                            // The slot covers only the read, not the wait on the channel.
+                            let permit = card.acquire_priority();
                             let bytes = read_source_bytes(kind, &path, strip);
+                            drop(permit);
                             let _ = raw_tx.send((key, bytes));
                         });
                 });
@@ -254,6 +372,10 @@ fn read_source_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        FileInfo, ImportOptions, LocalTarget, Target, TargetId, TargetKind, TriageState,
+        VerifiedReplica, plan_import,
+    };
 
     #[test]
     fn default_config_has_phase2_locked_values() {
@@ -262,6 +384,147 @@ mod tests {
         assert_eq!(c.thumb_long_edge, 512);
         assert_eq!(c.jpeg_quality, 85);
         assert!(c.cpu_threads >= 1);
+    }
+
+    /// Wraps a real target and holds every store until `gate` opens.
+    struct StalledTarget {
+        inner: LocalTarget,
+        gate: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl ReplicationTarget for StalledTarget {
+        fn id(&self) -> TargetId {
+            self.inner.id()
+        }
+
+        fn max_concurrent_writes(&self) -> usize {
+            1
+        }
+
+        async fn store(
+            &self,
+            file: &FileInfo,
+            bytes: Arc<[u8]>,
+        ) -> Result<VerifiedReplica, Box<dyn std::error::Error + Send + Sync>> {
+            let _open = self.gate.acquire().await?;
+            self.inner.store(file, bytes).await
+        }
+    }
+
+    #[test]
+    fn triage_and_previews_finish_while_the_copy_is_stalled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/test_exif_read");
+        let mut engine = Engine::new(EngineConfig {
+            card_read_permits: 1,
+            ..Default::default()
+        });
+        engine.scan(&source);
+        let total_assets = engine.scan_response.read().unwrap().assets.len();
+        assert!(total_assets > 0);
+
+        let plan = plan_import(
+            &engine.scan_response,
+            &source,
+            &ImportOptions::default(),
+            None,
+        )
+        .unwrap();
+        let file_count = plan.files.len();
+        let target = Arc::new(StalledTarget {
+            inner: LocalTarget::new(
+                TargetId(1),
+                Target {
+                    root: tmp.path().to_path_buf(),
+                    kind: TargetKind::LocalNvme,
+                    write_permits: 1,
+                },
+            ),
+            gate: tokio::sync::Semaphore::new(0),
+        });
+        let import = engine.start_import(plan, target.clone(), vec![], None);
+
+        // No file can reach the target, yet every preview still arrives.
+        let previews = engine.ingest();
+        let mut arrived = 0;
+        while previews
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .is_ok()
+        {
+            arrived += 1;
+        }
+        assert_eq!(arrived, total_assets);
+        assert_eq!(import.progress.try_iter().count(), 0);
+
+        // The store is free for a rating while files are still in flight.
+        {
+            let mut store = engine.scan_response.write().unwrap();
+            let asset = store.assets.values_mut().next().unwrap();
+            asset.rating = 5;
+            asset.state = TriageState::Accepted;
+        }
+
+        target.gate.add_permits(file_count);
+        let report = import.wait();
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.verified.len(), file_count);
+    }
+
+    #[test]
+    fn history_only_records_files_on_every_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let card = tmp.path().join("card");
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::write(card.join("IMG_1.JPG"), b"not really a jpeg").unwrap();
+
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.scan(&card);
+        let options = ImportOptions::default();
+        let history_path = tmp.path().join("history.jsonl");
+        let target_at = |id, root: PathBuf| -> Arc<dyn ReplicationTarget> {
+            Arc::new(LocalTarget::new(
+                TargetId(id),
+                Target {
+                    root,
+                    kind: TargetKind::LocalNvme,
+                    write_permits: 1,
+                },
+            ))
+        };
+
+        // A file where the secondary root should be makes that target fail.
+        let broken = tmp.path().join("broken");
+        std::fs::write(&broken, b"").unwrap();
+        let history = ImportHistory::open(history_path.clone()).unwrap();
+        let plan = plan_import(&engine.scan_response, &card, &options, Some(&history)).unwrap();
+        let report = engine
+            .start_import(
+                plan,
+                target_at(1, tmp.path().join("a")),
+                vec![target_at(2, broken)],
+                Some(history),
+            )
+            .wait();
+        assert_eq!(report.failures.len(), 1);
+
+        let history = ImportHistory::open(history_path.clone()).unwrap();
+        let plan = plan_import(&engine.scan_response, &card, &options, Some(&history)).unwrap();
+        assert_eq!(plan.files.len(), 1, "a retry must still see the file");
+        let report = engine
+            .start_import(
+                plan,
+                target_at(1, tmp.path().join("a")),
+                vec![target_at(2, tmp.path().join("b"))],
+                Some(history),
+            )
+            .wait();
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+
+        let history = ImportHistory::open(history_path).unwrap();
+        let plan = plan_import(&engine.scan_response, &card, &options, Some(&history)).unwrap();
+        assert!(plan.files.is_empty());
+        assert_eq!(plan.skipped_duplicates.len(), 1);
     }
 
     #[test]
