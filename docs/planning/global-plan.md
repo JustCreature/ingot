@@ -186,7 +186,7 @@ Calling `tokio::fs::copy(src, dest)` once per target reads the source **N times*
 ```rust
 /// Read the source ONCE under the source-read semaphore, hashing as we go.
 /// Fan out to each target under that target's write semaphore.
-/// Write to `dest.part`, fsync, rename to `dest`, then verify size + checksum.
+/// Write to `dest.tmp`, fsync, verify the checksum, rename to `dest`, fsync the directory.
 async fn replicate(
     src: &Path,
     targets: &[Target],
@@ -194,14 +194,38 @@ async fn replicate(
 ) -> Result<ReplicationReport, IoError> {
     let _read = engine.source_read.acquire().await?;
     let (bytes, src_hash) = read_with_checksum(src).await?;   // one read off the card
-    // for each target: acquire write permit -> write .part -> fsync -> rename
-    //                  -> re-read/compare size, then checksum == src_hash
+    // for each target: acquire write permit -> write .tmp -> fsync
+    //                  -> checksum == src_hash -> rename -> fsync directory
     // collect per-target VerifiedReplica on success
     todo!()
 }
 ```
 
 Verification for irreplaceable data should be at minimum a size match, ideally a full checksum (BLAKE3 is fast). Compute the source hash during the single read so verification is cheap.
+
+### Step 2b — Primary-paced streaming fan-out (the real architecture)
+
+The naive `spawn one task per target` fan-out (Step 2) has a flaw: it ties the card to the **slowest** target. If a network target is in the fan-out set, the source buffer stays alive — and the card stays engaged — until even the slow target drains it. The goal is the opposite: **read the card exactly once, paced to the fastest *local* sink, then disconnect the source and let the slow tail replicate from the local copy.** Card *residency time* is the thing to minimize (Phase 2 proved the card is a fixed ~20 MB/s wall).
+
+**The shape (two stages, built and measured in that order):**
+
+- **Stage 1 — reader + primary, source-connected.** A single reader task reads each source file once (under the `source_read` permit), produces `Arc<[u8]>`, and **blocking-sends it to the PRIMARY target's bounded queue**. The blocking send is the whole trick: backpressure throttles card reads to exactly the primary's write rate, so the card runs *at the speed of the fastest local target*, for free, via one bounded channel. One designated **primary** (`LocalTarget` by default) writes + verifies against `src_hash`; on success it emits `(file_id, primary_path)` — the moment the source is "done" with that file.
+- **Stage 2 — secondaries, source-free.** Each secondary (network, slow disk) gets the `Arc<[u8]>` via a **non-blocking `try_send`**: if its bounded queue has room it *hot-replicates from RAM*; if full (it's behind), the file is recorded on that secondary's **deferred** list and later replicated **from `primary_path`** on the fast local disk — never the card again. So slow targets *never* throttle the card.
+
+**Key design decisions / invariants:**
+
+- **`Arc` refcounting *is* the eviction mechanism.** No manual "mark acked/skipped, count to N-1, remove from channel" — channels are one-way ownership conveyors, they don't support in-place marking, multi-consumer fan-out, or item withdrawal. The buffer frees itself the instant its last accepting holder (primary + any hot secondaries) drops its clone. Slow secondaries never receive a clone, so they never extend its lifetime. Memory is bounded by the reader channel depth × file size × in-flight hot writers, and is self-evicting and race-free.
+- **No broadcast channel fits.** `tokio::sync::broadcast` is lossy (lagging receivers silently drop messages → data loss). `async_broadcast` (backpressured broadcast) makes the *slowest* receiver stall the sender → throttles the card, the exact thing to avoid. The correct pattern is **per-target bounded queues** with a blocking send to primary and `try_send` to secondaries.
+- **The proof chain stays anchored to the card: thread `src_hash` everywhere.** A deferred secondary re-reads from `primary_path` but verifies against the **original card hash**, never a fresh hash of the primary. That keeps the chain `card == primary == secondary`, all tied to the one hash computed at the single card read. Re-hashing the primary as a new baseline would let a silent primary corruption propagate "verified" to every secondary.
+- **Source disconnect is gated on primary *verify*, not primary *attempt*.** If the primary fails verification, the bytes must still be reachable (RAM buffer, or a card re-read) for a fallback — so eviction only fires on primary success. Failure policy (abort-and-surface vs keep card-sourced) is an explicit decision.
+- **The one legitimate shared-state ledger** is the `ReplicationReport` registry that aggregates per-`(file, target)` `VerifiedReplica`s + failures to know when a whole **asset** (RAW+JPG × N targets) is fully replicated — which is what gates deletion safety. That lives in shared state (`Mutex<HashMap<…>>` / a result-collecting `JoinSet`), distinct from the data channels.
+
+**Built (2026-10-30) in `replicate/`.** Decisions made during implementation:
+
+- **Verify before publish.** The temp file is hashed *before* the rename, so a destination path only ever holds verified bytes and the code never has to remove a destination file.
+- **Never overwrite.** An existing destination is a recorded failure. Each `LocalTarget` also claims a destination while writing it, so two source files routed to the same path can't race. This only protects against other writers in the same process.
+- **In-flight stores are capped at `max_concurrent_writes()`.** Spawning a store per message would drain the channel into tasks queued on the write semaphore, each holding a file buffer, which removes both the backpressure and the RAM bound.
+- **Read permits are held until the bytes are in the channel**, so a full channel stops card reads.
 
 ### Step 3 — Safe deletion sweep
 

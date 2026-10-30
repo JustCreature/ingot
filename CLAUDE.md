@@ -1,5 +1,3 @@
-⛔ NEVER write code, edit files, or run commands without explicitly announcing Code Exception Mode first. This is a learning project — guide, don't implement.
-
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
@@ -15,28 +13,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-**Ingot** — a high-performance RAW+JPEG photo ingestion and triage engine, intended to be written in **Rust**. It competes with Photo Mechanic / FastRawViewer: ingest a camera card fast, let the photographer rate and cull *immediately* while files replicate to multiple storage targets in the background.
+**Ingot** — a high-performance RAW+JPEG photo ingestion and triage engine, written in **Rust**. It competes with Photo Mechanic / FastRawViewer: ingest a camera card fast, let the photographer rate and cull *immediately* while files replicate to multiple storage targets in the background.
 
-**This is a learning project, not a delivery project.** The point is for the user to learn by implementing it themselves. There is no source code in the repo yet — only the design and the architectural plan. Do not scaffold a Cargo project, write modules, or run build/test commands unless the user explicitly grants a Code Exception (see below).
+## Working on this repo
 
-## Operating mode (governed by the `learning-guide` skill)
-
-The `learning-guide` skill (`.claude/skills/learning-guide/`) is always active for this repo and is the source of truth for *how* to work here. Read it before doing anything substantive. The essentials:
-
-- **Guide, never implement.** Explain *why* at the hardware/systems level (cache lines, device saturation, semaphore tiers, ownership/type-state). Point direction and suggest experiments. Do not produce code.
-- **Code Exception Mode** is the *only* way code gets written, and it requires explicit user phrasing ("just write it", "make an exception", "write the code now", "let's implement together"). You must announce you are entering it first. If unsure whether the user wants code, ask — do not write it.
-- **Measurement over intuition.** "Which is faster?" is answered by naming the counters to measure, not by guessing.
-- Shorthand commands handled by the skill: `--R` (generate reports), `--|` (save session), `--|--` (restore session), `--s` (status), `--v` (finalise phase), `--v--FORCE` (force finalise). Phase status, artifacts, and measured numbers are tracked in a `## Status` section of this file (added once Phase 1 work begins).
+- Implement changes directly: write code, run builds and tests, and verify the result.
+- **Measurement over intuition.** Performance questions are settled with benchmarks (`crates/ingot_core/examples/`), not guesses. Optimal I/O concurrency is a device property.
+- Phase status, artifacts, and measured numbers are tracked in the `## Status` section of this file.
 
 ## Where things live
 
 - `docs/planning/global-plan.md` — **the architectural plan (v2). Read this first** for the full phase breakdown, data structures, crate choices, and rationale. (Note: the empty `global-plan.md` at repo root is a stray file; the real plan is under `docs/planning/`.)
 - `docs/design/` — the UI design. **Rely on the standalone `docs/design/html_Ingot_v2.html`.** The unpacked `docs/design/ingot_v2/` (`.jsx`, `styles.css`, `data.js`, images) is the source bundle — consult it only on the first pass or when you need a specific detail.
-- `docs/sessions/phase-N/` and `docs/lessons/phase-N/` — created by the skill as the project progresses (session logs and learning reports). Absent until work starts.
+- `docs/sessions/phase-N/` and `docs/lessons/phase-N/` — historical session logs and reports from earlier phases.
 
-## Architecture invariants (from the plan — preserve these in any guidance)
+## Architecture invariants (from the plan)
 
-These are deliberate design decisions, not suggestions. When discussing implementation, hold the user to them:
+These are deliberate design decisions, not suggestions. Preserve them in any implementation:
 
 - **Asset pairing is keyed on `(dir, stem)`, case-normalized — never stem alone.** Canon rolls `IMG_9999 → IMG_0001`, and separate folders/cards reuse names; a flat stem-keyed map silently merges unrelated frames.
 - **Zero RAW decoding for previews.** Previews come from the parallel `.JPG` or the JPEG embedded in the RAW — never from decoding RAW pixel data.
@@ -54,9 +47,13 @@ These are deliberate design decisions, not suggestions. When discussing implemen
 
 ## Status
 
-**Current phase:** Phase 3 — Asynchronous I/O Engine (replication: read-once fan-out + BLAKE3 verify; type-gated deletion sweep). **Not started.** Phase 2 finalised 2026-06-14 via `--v--FORCE` (steps 1–4 complete + measured; 7 items carried forward — see Phase 2 record below).
+**Current phase:** Phase 3 — Asynchronous I/O Engine. **In progress:** replication is built and tested on synthetic data (2026-10-30). The deletion sweep, engine integration, and a real-card measurement remain. Nothing from this work is committed yet.
 
-**Last session:** 2026-06-14 — **Step 4 built + Phase-2 measured.** Engine now owns the data (`Arc<RwLock<ScanResponse>>`); `ingest()` spawns a background worker (snapshot → lock-free read+decode+encode → brief per-asset write → `send`), streams `IngestEvent` over a bounded crossbeam channel. Seek machinery: stage-1 128 KiB header read (`read_exif_header`, 264× faster than the slurp) + stage-2 `read_embedded_preview` seek-read (~2 MB, file-len-bounded). Project-wide error pattern: `Result<_, Box<dyn Error+Send+Sync>>`, errors recorded on `image_data.errors`, never silent `None` (documented at top of CLAUDE.md). **Measured (879-asset card): pipeline is read-bound** — cold ingest 154 s (6 fps) ≈ cold read-only, 2≈8 threads ≈ 20 MB/s card ceiling; warm/CPU floor ~26 s (33 fps). `cargo test --workspace` 11 green, clippy clean.
+**Built (`crates/ingot_core/src/replicate/`):** `ReplicationTarget` trait, `LocalTarget`, `VerifiedReplica`, `CopyEngine::replicate`, `ReplicationReport`; `examples/bench_replicate.rs`. Details in global-plan Phase 3 Step 2b. `cargo test --workspace` 21 green, clippy clean.
+
+**Measured (40 × 30 MB synthetic files, warm cache, source and target on the same internal SSD; not a card number):** read=2, write=4: depth 1 → 247 MB peak, 4 → 305 MB, 16 → 546 MB, with throughput 450–570 MB/s and no trend. Depth controls RAM, not speed, so 4 is the default in the bench.
+
+**Open decisions:** (1) same filename and date from different folders or cards: the second file is reported as failed, not copied; (2) re-running an import reports every copied file as a failure instead of treating a matching hash as done; (3) undated frames are reported as failed, not routed.
 
 **Project layout:** Cargo workspace. `/Cargo.toml` = workspace root **and** the `ingot` binary package; `/src/main.rs` = the app (constructs an `Engine`, drains `ingest()`). `crates/ingot_core/` = the engine library (UI-dep-free). Public API: `Engine`/`EngineConfig`/`IngestEvent` + `scan_source_dir`/`enrich_assets`/`get_embedded_preview_location`/`read_embedded_preview`/`build_destination_path` + model types (`PreviewStrip` etc.). Run app: `cargo run`; tests: `cargo test --workspace`; benches: `cargo run --release -p ingot_core --example bench_{enrich,preview,ingest,read_threads}` (ingest/read_threads default to `/Volumes/EOS_DIGITAL/DCIM`).
 
@@ -66,7 +63,7 @@ These are deliberate design decisions, not suggestions. When discussing implemen
 
 ### Phase 1 — Asset Pairing & Core Data Structures — ✅ COMPLETE (2026-06-11)
 
-**Learning objectives (met):**
+**Objectives (met):**
 - Why `(dir, stem)` case-normalized is the only safe asset key (filename rollover, multi-folder DCIM, multi-card collisions).
 - Modeling RAW/JPEG presence so the empty asset is unrepresentable, with RAW-only as a first-class asset.
 - A pure, I/O-free date-based ISO routing function.
@@ -92,7 +89,7 @@ These are deliberate design decisions, not suggestions. When discussing implemen
 
 ### Phase 2 — CPU-Bound Processing & Streaming — ✅ COMPLETE (finalised 2026-06-14, `--v--FORCE`)
 
-**Learning objectives (met):**
+**Objectives (met):**
 - I/O-bound vs CPU-bound, and why parallelism helps one and hurts the other (measured both directions, both flip by device).
 - Reading *only the bytes you need*: bounded EXIF header read + targeted embedded-preview seek-read (vs whole-file slurp).
 - Streaming ingest with **engine-owned state** + correct lock discipline (no lock held during heavy work).
@@ -169,7 +166,7 @@ Two compressed-JPEG outputs per asset, streamed (not stored on `PhotoAsset`): fr
 
 #### Step 4 — streaming ingest — ✅ DONE + MEASURED (2026-06-14)
 
-Built (Code Exception). Full design in global-plan Phase 2 §"three read stages" + §"Streaming channel (engine owns the data)"; full numbers in `docs/sessions/phase-2/main-session.md` (2026-06-14).
+Full design in global-plan Phase 2 §"three read stages" + §"Streaming channel (engine owns the data)"; full numbers in `docs/sessions/phase-2/main-session.md` (2026-06-14).
 
 - **Engine owns the data:** `Engine.scan_response: Arc<RwLock<ScanResponse>>`; UI borrows to present. (Reversed the earlier app-owns/engine-stateless plan — later phases re-process heavy owned data.) `scan()` = synchronous stage-1 skeleton (walk + `enrich_assets`: date + 160×120 thumb + cached IFD0 strip ref). `ingest()` spawns a background worker, returns bounded `crossbeam_channel::Receiver<IngestEvent>`, streams **lean notifications** (`IngestEvent::Preview { key, error }`) — the UI reads the data from the store by key.
 - **Lock discipline:** worker snapshots inputs (brief read lock) → **read + decode + encode lock-free** → brief per-asset write lock to store → `send` after release. No lock held while blocked on the channel → no deadlock.

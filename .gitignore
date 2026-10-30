@@ -26,3 +26,6 @@ photodata/
 
 # macOS Finder metadata
 .DS_Store
+
+# Written by the old demo main.rs
+ingot_bench_preview.JPG

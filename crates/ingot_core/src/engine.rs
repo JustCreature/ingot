@@ -153,7 +153,7 @@ impl Engine {
         let (raw_tx, raw_rx) = crossbeam_channel::bounded::<(
             AssetKey,
             Result<Vec<u8>, ImageProcessingError>,
-        )>(cpu_threads);
+        )>(cpu_threads * 10);
 
         let read_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(read_threads)

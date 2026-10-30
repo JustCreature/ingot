@@ -4,11 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-trait = "0.1.89"
+blake3 = { version = "1.8.5", features = ["mmap", "rayon"] }
 chrono = "0.4.45"
 crossbeam-channel = "0.5.15"
 fast_image_resize = "6.0.0"
 kamadak-exif = "0.6.1"
 rayon = "1.12.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "fs", "sync", "macros", "io-util", "time"] }
 turbojpeg = "1.4.0"
 walkdir = "2.5.0"
 
